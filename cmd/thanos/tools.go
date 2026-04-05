@@ -28,6 +28,7 @@ func registerTools(app *extkingpin.App) {
 
 	registerBucket(cmd)
 	registerCheckRules(cmd)
+	registerRulesBackfill(cmd)
 }
 
 func (tc *checkRulesConfig) registerFlag(cmd extkingpin.FlagClause) *checkRulesConfig {

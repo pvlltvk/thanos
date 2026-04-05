@@ -45,6 +45,7 @@ const (
 	BucketRewriteSource   SourceType = "bucket.rewrite"
 	BucketUploadSource    SourceType = "bucket.upload"
 	TestSource            SourceType = "test"
+	RulesBackfillSource   SourceType = "rules.backfill"
 )
 
 const (

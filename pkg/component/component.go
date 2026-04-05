@@ -90,6 +90,7 @@ var (
 	UnknownStoreAPI = storeAPI{component: component{name: "unknown-store-api"}}
 	Query           = storeAPI{component: component{name: "query"}}
 	ParquetGateway  = storeAPI{component: component{name: "parquet-gateway"}}
+	RulesBackfill   = source{component: component{name: "rules-backfill"}}
 
 	All = []Component{
 		Bucket,
@@ -110,5 +111,6 @@ var (
 		UnknownStoreAPI,
 		Query,
 		ParquetGateway,
+		RulesBackfill,
 	}
 )
