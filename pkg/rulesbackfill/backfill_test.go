@@ -1165,9 +1165,13 @@ groups:
       - record: slow_metric
         expr: count(up)
 `
-	var steps []int64
+	type call struct {
+		start int64
+		step  int64
+	}
+	var calls []call
 	queryFunc := func(_ context.Context, _ string, startTime, endTime, step int64) (model.Matrix, []string, error) {
-		steps = append(steps, step)
+		calls = append(calls, call{start: startTime, step: step})
 		ts := model.Time(startTime + 1)
 		return model.Matrix{
 			{
@@ -1194,10 +1198,12 @@ groups:
 	ids, err := b.Run(context.Background(), []string{ruleFile}, start, end)
 	testutil.Ok(t, err)
 	testutil.Equals(t, 1, len(ids))
-	testutil.Equals(t, 2, len(steps))
+	testutil.Equals(t, 2, len(calls))
 	// fast_group should use 10s, slow_group should use 120s.
-	testutil.Equals(t, int64(10), steps[0])
-	testutil.Equals(t, int64(120), steps[1])
+	testutil.Equals(t, int64(10), calls[0].step)
+	testutil.Equals(t, int64(120), calls[1].step)
+	testutil.Equals(t, alignEvalStart(start.UnixMilli(), 10*time.Second, ruleFile, "fast_group"), calls[0].start)
+	testutil.Equals(t, alignEvalStart(start.UnixMilli(), 120*time.Second, ruleFile, "slow_group"), calls[1].start)
 }
 
 // TestRun_RecoveryAfterFailedWindow verifies that a re-run after a failed window
@@ -1239,4 +1245,44 @@ func TestRun_RecoveryAfterFailedWindow(t *testing.T) {
 	testutil.Ok(t, err)
 	testutil.Equals(t, 1, len(ids2))
 	testutil.Assert(t, countBucketBlocks(bkt) >= 1, "expected block after recovery")
+}
+
+func TestRun_AdjacentWindowsDoNotOverlapAtBoundary(t *testing.T) {
+	t.Parallel()
+
+	type call struct {
+		start int64
+		end   int64
+	}
+	var calls []call
+	queryFunc := func(_ context.Context, _ string, startTime, endTime, step int64) (model.Matrix, []string, error) {
+		calls = append(calls, call{start: startTime, end: endTime})
+		ts := model.Time(startTime + 1)
+		return model.Matrix{
+			{
+				Metric: model.Metric{model.MetricNameLabel: "test_metric"},
+				Values: []model.SamplePair{{Timestamp: ts, Value: 1.0}},
+			},
+		}, nil, nil
+	}
+
+	bkt := objstore.NewInMemBucket()
+	ruleFile := writeRuleFile(t, simpleRecordingRuleYAML)
+	start := time.Unix(0, 0).UTC()
+	end := start.Add(4 * time.Hour)
+
+	b := New(
+		newTestLogger(),
+		queryFunc,
+		bkt,
+		newTestLabels(),
+		t.TempDir(),
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+	)
+	ids, err := b.Run(context.Background(), []string{ruleFile}, start, end)
+	testutil.Ok(t, err)
+	testutil.Equals(t, 2, len(ids))
+	testutil.Equals(t, 2, len(calls))
+	testutil.Assert(t, calls[0].end < calls[1].start,
+		"adjacent windows overlap: first [%d,%d], second [%d,%d]", calls[0].start, calls[0].end, calls[1].start, calls[1].end)
 }

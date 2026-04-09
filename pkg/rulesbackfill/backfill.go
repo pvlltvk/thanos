@@ -123,6 +123,7 @@ type recordingRule struct {
 // ruleGroup holds a group name and its recording rules.
 type ruleGroup struct {
 	Name     string
+	File     string
 	Interval time.Duration // Per-group evaluation interval; 0 means use the global default.
 	Rules    []recordingRule
 }
@@ -261,18 +262,19 @@ func (b *Backfiller) parseRuleFiles(patterns []string) ([]ruleGroup, error) {
 						Labels: r.Labels,
 					})
 				}
-				if len(rules) > 0 {
-					var groupInterval time.Duration
-					if rg.Interval != 0 {
-						groupInterval = time.Duration(rg.Interval)
+					if len(rules) > 0 {
+						var groupInterval time.Duration
+						if rg.Interval != 0 {
+							groupInterval = time.Duration(rg.Interval)
+						}
+						groups = append(groups, ruleGroup{
+							Name:     rg.Name,
+							File:     file,
+							Interval: groupInterval,
+							Rules:    rules,
+						})
 					}
-					groups = append(groups, ruleGroup{
-						Name:     rg.Name,
-						Interval: groupInterval,
-						Rules:    rules,
-					})
 				}
-			}
 		}
 	}
 	return groups, nil
@@ -283,18 +285,15 @@ func (b *Backfiller) parseRuleFiles(patterns []string) ([]ruleGroup, error) {
 // the query range so we never query data outside the requested interval.
 func (b *Backfiller) processWindow(ctx context.Context, groups []ruleGroup, windowStart, windowEnd, blockDurMs, requestedStart, requestedEnd int64) (ulid.ULID, error) {
 	// Clamp query range to the user-requested interval.
-	queryStart := windowStart
-	if requestedStart > queryStart {
-		queryStart = requestedStart
-	}
-	queryEnd := windowEnd
-	if requestedEnd < queryEnd {
-		queryEnd = requestedEnd
-	}
-	if queryStart >= queryEnd {
+	queryStart := maxInt64(windowStart, requestedStart)
+	queryEndExclusive := minInt64(windowEnd, requestedEnd)
+	if queryStart >= queryEndExclusive {
 		level.Debug(b.logger).Log("msg", "clamped window is empty, skipping", "window_start", windowStart, "window_end", windowEnd)
 		return ulid.ULID{}, nil
 	}
+	// PromQL query_range end is inclusive while our planned windows are half-open [start, end).
+	// Convert to an inclusive end here so adjacent windows do not duplicate boundary samples.
+	queryEndInclusive := queryEndExclusive - 1
 
 	slogLogger := logutil.GoKitLogToSlog(b.logger)
 	// Use 2*blockDurMs for the writer range. BlockWriter rejects samples older than
@@ -318,6 +317,17 @@ func (b *Backfiller) processWindow(ctx context.Context, groups []ruleGroup, wind
 			evalInterval = group.Interval
 		}
 		stepSeconds := int64(evalInterval.Seconds())
+		alignedStart := alignEvalStart(queryStart, evalInterval, group.File, group.Name)
+		if alignedStart > queryEndInclusive {
+			level.Debug(b.logger).Log(
+				"msg", "aligned query range is empty for group, skipping",
+				"group", group.Name,
+				"query_start", queryStart,
+				"aligned_start", alignedStart,
+				"query_end", queryEndInclusive,
+			)
+			continue
+		}
 
 		for _, rule := range group.Rules {
 			if ctx.Err() != nil {
@@ -333,12 +343,12 @@ func (b *Backfiller) processWindow(ctx context.Context, groups []ruleGroup, wind
 				"group", group.Name,
 				"rule", rule.Name,
 				"expr", rule.Expr,
-				"query_start", queryStart,
-				"query_end", queryEnd,
+				"query_start", alignedStart,
+				"query_end", queryEndInclusive,
 				"step", stepSeconds,
 			)
 
-			matrix, warnings, queryErr := b.queryFunc(ctx, rule.Expr, queryStart, queryEnd, stepSeconds)
+			matrix, warnings, queryErr := b.queryFunc(ctx, rule.Expr, alignedStart, queryEndInclusive, stepSeconds)
 			if queryErr != nil {
 				// Fail the entire window on any rule query failure.
 				if rollbackErr := app.Rollback(); rollbackErr != nil {
@@ -527,4 +537,41 @@ func getCompatibleBlockDuration(maxDurMs int64) int64 {
 		}
 	}
 	return result
+}
+
+func alignEvalStart(queryStartMs int64, interval time.Duration, file, group string) int64 {
+	if interval <= 0 {
+		return queryStartMs
+	}
+
+	intervalNs := int64(interval)
+	offset := int64(labels.New(
+		labels.Label{Name: "name", Value: group},
+		labels.Label{Name: "file", Value: file},
+	).Hash() % uint64(intervalNs))
+
+	startNs := time.UnixMilli(queryStartMs).UTC().UnixNano()
+	adjNow := startNs - offset
+	base := adjNow - (adjNow % intervalNs)
+	next := base + offset
+
+	aligned := time.Unix(0, next).UTC()
+	for aligned.UnixMilli() < queryStartMs {
+		aligned = aligned.Add(interval)
+	}
+	return aligned.UnixMilli()
+}
+
+func minInt64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
