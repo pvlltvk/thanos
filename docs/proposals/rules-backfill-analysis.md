@@ -16,6 +16,7 @@
 6. [Risks and Mitigations](#6-risks-and-mitigations)
 7. [Implementation Plan](#7-implementation-plan)
 8. [Label Strategy and Idempotency](#8-label-strategy-and-idempotency)
+9. [Implementation Review Follow-up](#9-implementation-review-follow-up)
 
 ---
 
@@ -979,3 +980,16 @@ Writes `deletion-mark.json` for each listed ULID. Compactor's `BlocksCleaner` de
 3. Execute PromQL query covering backfilled time range — verify non-zero results
 4. Check compactor logs for halt errors
 5. Monitor `thanos_compact_group_compactions_failures_total` for 1 hour post-backfill
+
+---
+
+## 9. Implementation Review Follow-up
+
+The implementation has now been reviewed against the code in `feature/rules-backfill`.
+
+The review findings and the recommended remediation plan are maintained in:
+
+- [Implementation Review Follow-up](./rules-backfill-implementation-review.md)
+
+This follow-up should be treated as the source of truth for code-level fixes that must
+be completed before the feature is considered production-safe.
