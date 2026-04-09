@@ -437,7 +437,7 @@ func TestRun_EmptyMatrix_NoBlockCreated(t *testing.T) {
 	testutil.Equals(t, 0, countBucketBlocks(bkt))
 }
 
-func TestRun_QueryError_ContinuesAndReturnsNoBlock(t *testing.T) {
+func TestRun_QueryError_FailsWindowAndReturnsError(t *testing.T) {
 	t.Parallel()
 
 	bkt := objstore.NewInMemBucket()
@@ -454,9 +454,9 @@ func TestRun_QueryError_ContinuesAndReturnsNoBlock(t *testing.T) {
 		t.TempDir(),
 		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
 	)
-	// processWindow continues on per-rule query errors; no block should be created.
+	// Query errors now fail the entire window and propagate as an error.
 	ids, err := b.Run(context.Background(), []string{ruleFile}, start, end)
-	testutil.Ok(t, err) // top-level error is nil; rule errors are logged
+	testutil.NotOk(t, err)
 	testutil.Equals(t, 0, len(ids))
 	testutil.Equals(t, 0, countBucketBlocks(bkt))
 }
@@ -1007,4 +1007,236 @@ groups:
 	// The block should have been created; label overriding is tested at the
 	// processWindow level by verifying the block is actually written.
 	testutil.Assert(t, countBucketBlocks(bkt) == 1, "expected one block in bucket")
+}
+
+// --- Regression tests for implementation review findings --------------------
+
+// TestRun_MultiSeriesAppendOrdering verifies that out-of-order timestamps across
+// different series within the same window succeed with the 2x writer range.
+func TestRun_MultiSeriesAppendOrdering(t *testing.T) {
+	t.Parallel()
+
+	// Construct a query result where series A has a late timestamp and series B
+	// has an earlier timestamp. With a 1x writer range this would hit ErrOutOfBounds.
+	queryFunc := func(_ context.Context, _ string, startTime, endTime, step int64) (model.Matrix, []string, error) {
+		mid := (startTime + endTime) / 2
+		return model.Matrix{
+			{
+				Metric: model.Metric{model.MetricNameLabel: "series_a"},
+				Values: []model.SamplePair{
+					{Timestamp: model.Time(mid + 1000), Value: 1.0}, // late timestamp first
+				},
+			},
+			{
+				Metric: model.Metric{model.MetricNameLabel: "series_b"},
+				Values: []model.SamplePair{
+					{Timestamp: model.Time(startTime + 1), Value: 2.0}, // earlier timestamp second
+				},
+			},
+		}, nil, nil
+	}
+
+	bkt := objstore.NewInMemBucket()
+	ruleFile := writeRuleFile(t, simpleRecordingRuleYAML)
+	start := time.Unix(0, 0).UTC()
+	end := start.Add(2 * time.Hour)
+
+	b := New(
+		newTestLogger(),
+		queryFunc,
+		bkt,
+		newTestLabels(),
+		t.TempDir(),
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+	)
+	ids, err := b.Run(context.Background(), []string{ruleFile}, start, end)
+	testutil.Ok(t, err)
+	testutil.Equals(t, 1, len(ids))
+	testutil.Assert(t, countBucketBlocks(bkt) == 1, "expected one block")
+}
+
+// TestRun_PartialRuleFailure_NoBlockUploaded verifies that when one rule succeeds
+// and another fails, no block is uploaded and the window is not considered covered.
+func TestRun_PartialRuleFailure_NoBlockUploaded(t *testing.T) {
+	t.Parallel()
+
+	twoRulesYAML := `
+groups:
+  - name: mixed
+    rules:
+      - record: good_metric
+        expr: sum(rate(http_requests_total[5m]))
+      - record: bad_metric
+        expr: will_fail
+`
+	callCount := 0
+	queryFunc := func(_ context.Context, query string, startTime, endTime, step int64) (model.Matrix, []string, error) {
+		callCount++
+		if callCount%2 == 0 {
+			// Second rule fails.
+			return nil, nil, fmt.Errorf("simulated query failure")
+		}
+		ts := model.Time(startTime + 1)
+		return model.Matrix{
+			{
+				Metric: model.Metric{model.MetricNameLabel: "good_metric"},
+				Values: []model.SamplePair{{Timestamp: ts, Value: 1.0}},
+			},
+		}, nil, nil
+	}
+
+	bkt := objstore.NewInMemBucket()
+	ruleFile := writeRuleFile(t, twoRulesYAML)
+	start := time.Unix(0, 0).UTC()
+	end := start.Add(2 * time.Hour)
+
+	b := New(
+		newTestLogger(),
+		queryFunc,
+		bkt,
+		newTestLabels(),
+		t.TempDir(),
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+	)
+	ids, err := b.Run(context.Background(), []string{ruleFile}, start, end)
+	testutil.NotOk(t, err)
+	testutil.Equals(t, 0, len(ids))
+	testutil.Equals(t, 0, countBucketBlocks(bkt))
+}
+
+// TestRun_NonAlignedStart_QueriesClamped verifies that when --start falls in the
+// middle of a block boundary, the query does not extend before --start.
+func TestRun_NonAlignedStart_QueriesClamped(t *testing.T) {
+	t.Parallel()
+
+	blockDur := 2 * time.Hour
+	// Start 30 minutes into the first block boundary.
+	start := time.Unix(int64(30*time.Minute/time.Second), 0).UTC()
+	end := start.Add(blockDur)
+
+	startMs := start.UnixMilli()
+	var queriedStart int64
+
+	queryFunc := func(_ context.Context, _ string, startTime, endTime, step int64) (model.Matrix, []string, error) {
+		queriedStart = startTime
+		ts := model.Time(startTime + 1)
+		return model.Matrix{
+			{
+				Metric: model.Metric{model.MetricNameLabel: "test_metric"},
+				Values: []model.SamplePair{{Timestamp: ts, Value: 1.0}},
+			},
+		}, nil, nil
+	}
+
+	bkt := objstore.NewInMemBucket()
+	ruleFile := writeRuleFile(t, simpleRecordingRuleYAML)
+
+	b := New(
+		newTestLogger(),
+		queryFunc,
+		bkt,
+		newTestLabels(),
+		t.TempDir(),
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+	)
+	_, err := b.Run(context.Background(), []string{ruleFile}, start, end)
+	testutil.Ok(t, err)
+
+	// The query start must be clamped to the requested start, not the aligned boundary.
+	testutil.Assert(t, queriedStart >= startMs,
+		"query started at %d, expected >= %d (requested start)", queriedStart, startMs)
+}
+
+// TestRun_GroupInterval_UsedPerGroup verifies that per-group intervals from rule
+// files are used as the query step rather than the global default.
+func TestRun_GroupInterval_UsedPerGroup(t *testing.T) {
+	t.Parallel()
+
+	groupIntervalYAML := `
+groups:
+  - name: fast_group
+    interval: 10s
+    rules:
+      - record: fast_metric
+        expr: sum(rate(http_requests_total[5m]))
+  - name: slow_group
+    interval: 120s
+    rules:
+      - record: slow_metric
+        expr: count(up)
+`
+	var steps []int64
+	queryFunc := func(_ context.Context, _ string, startTime, endTime, step int64) (model.Matrix, []string, error) {
+		steps = append(steps, step)
+		ts := model.Time(startTime + 1)
+		return model.Matrix{
+			{
+				Metric: model.Metric{model.MetricNameLabel: "placeholder"},
+				Values: []model.SamplePair{{Timestamp: ts, Value: 1.0}},
+			},
+		}, nil, nil
+	}
+
+	bkt := objstore.NewInMemBucket()
+	ruleFile := writeRuleFile(t, groupIntervalYAML)
+	start := time.Unix(0, 0).UTC()
+	end := start.Add(2 * time.Hour)
+
+	b := New(
+		newTestLogger(),
+		queryFunc,
+		bkt,
+		newTestLabels(),
+		t.TempDir(),
+		WithEvalInterval(60*time.Second), // global default 60s
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+	)
+	ids, err := b.Run(context.Background(), []string{ruleFile}, start, end)
+	testutil.Ok(t, err)
+	testutil.Equals(t, 1, len(ids))
+	testutil.Equals(t, 2, len(steps))
+	// fast_group should use 10s, slow_group should use 120s.
+	testutil.Equals(t, int64(10), steps[0])
+	testutil.Equals(t, int64(120), steps[1])
+}
+
+// TestRun_RecoveryAfterFailedWindow verifies that a re-run after a failed window
+// does not skip the previously failed window.
+func TestRun_RecoveryAfterFailedWindow(t *testing.T) {
+	t.Parallel()
+
+	bkt := objstore.NewInMemBucket()
+	extLabels := newTestLabels()
+	ruleFile := writeRuleFile(t, simpleRecordingRuleYAML)
+
+	start := time.Unix(0, 0).UTC()
+	end := start.Add(2 * time.Hour)
+
+	// First run: query fails.
+	b1 := New(
+		newTestLogger(),
+		errorQuery(fmt.Errorf("transient failure")),
+		bkt,
+		extLabels,
+		t.TempDir(),
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+	)
+	ids1, err := b1.Run(context.Background(), []string{ruleFile}, start, end)
+	testutil.NotOk(t, err)
+	testutil.Equals(t, 0, len(ids1))
+	testutil.Equals(t, 0, countBucketBlocks(bkt))
+
+	// Second run: query succeeds. The window should NOT be skipped.
+	b2 := New(
+		newTestLogger(),
+		singleSampleQuery("test_metric", 42),
+		bkt,
+		extLabels,
+		t.TempDir(),
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+	)
+	ids2, err := b2.Run(context.Background(), []string{ruleFile}, start, end)
+	testutil.Ok(t, err)
+	testutil.Equals(t, 1, len(ids2))
+	testutil.Assert(t, countBucketBlocks(bkt) >= 1, "expected block after recovery")
 }

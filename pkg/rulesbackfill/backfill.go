@@ -122,8 +122,9 @@ type recordingRule struct {
 
 // ruleGroup holds a group name and its recording rules.
 type ruleGroup struct {
-	Name  string
-	Rules []recordingRule
+	Name     string
+	Interval time.Duration // Per-group evaluation interval; 0 means use the global default.
+	Rules    []recordingRule
 }
 
 // manifest is the JSON structure written to the bucket after a backfill run.
@@ -204,7 +205,7 @@ func (b *Backfiller) Run(ctx context.Context, ruleFiles []string, start, end tim
 			continue
 		}
 
-		id, err := b.processWindow(ctx, groups, w.start, w.end, blockDurMs)
+		id, err := b.processWindow(ctx, groups, w.start, w.end, blockDurMs, startMs, endMs)
 		if err != nil {
 			merr.Add(errors.Wrapf(err, "process window [%d, %d)", w.start, w.end))
 			continue
@@ -261,9 +262,14 @@ func (b *Backfiller) parseRuleFiles(patterns []string) ([]ruleGroup, error) {
 					})
 				}
 				if len(rules) > 0 {
+					var groupInterval time.Duration
+					if rg.Interval != 0 {
+						groupInterval = time.Duration(rg.Interval)
+					}
 					groups = append(groups, ruleGroup{
-						Name:  rg.Name,
-						Rules: rules,
+						Name:     rg.Name,
+						Interval: groupInterval,
+						Rules:    rules,
 					})
 				}
 			}
@@ -273,20 +279,46 @@ func (b *Backfiller) parseRuleFiles(patterns []string) ([]ruleGroup, error) {
 }
 
 // processWindow creates a TSDB block for a single time window.
-func (b *Backfiller) processWindow(ctx context.Context, groups []ruleGroup, windowStart, windowEnd, blockDurMs int64) (ulid.ULID, error) {
+// requestedStart and requestedEnd are the user-specified boundaries used to clamp
+// the query range so we never query data outside the requested interval.
+func (b *Backfiller) processWindow(ctx context.Context, groups []ruleGroup, windowStart, windowEnd, blockDurMs, requestedStart, requestedEnd int64) (ulid.ULID, error) {
+	// Clamp query range to the user-requested interval.
+	queryStart := windowStart
+	if requestedStart > queryStart {
+		queryStart = requestedStart
+	}
+	queryEnd := windowEnd
+	if requestedEnd < queryEnd {
+		queryEnd = requestedEnd
+	}
+	if queryStart >= queryEnd {
+		level.Debug(b.logger).Log("msg", "clamped window is empty, skipping", "window_start", windowStart, "window_end", windowEnd)
+		return ulid.ULID{}, nil
+	}
+
 	slogLogger := logutil.GoKitLogToSlog(b.logger)
-	writer, err := tsdb.NewBlockWriter(slogLogger, b.dataDir, blockDurMs)
+	// Use 2*blockDurMs for the writer range. BlockWriter rejects samples older than
+	// the appendable minimum time once the head advances. With multiple series appending
+	// out-of-order timestamps within the same window, a 1x range can hit ErrOutOfBounds.
+	// The doubled range avoids this; Flush still writes correct min/max from actual samples.
+	writer, err := tsdb.NewBlockWriter(slogLogger, b.dataDir, 2*blockDurMs)
 	if err != nil {
 		return ulid.ULID{}, errors.Wrap(err, "create block writer")
 	}
 	defer runutil.CloseWithLogOnErr(b.logger, writer, "block writer")
 
-	stepSeconds := int64(b.evalInterval.Seconds())
 	sampleCount := 0
 	totalSamples := 0
 	app := writer.Appender(ctx)
 
 	for _, group := range groups {
+		// Use the group's own interval if set, otherwise fall back to the global default.
+		evalInterval := b.evalInterval
+		if group.Interval > 0 {
+			evalInterval = group.Interval
+		}
+		stepSeconds := int64(evalInterval.Seconds())
+
 		for _, rule := range group.Rules {
 			if ctx.Err() != nil {
 				return ulid.ULID{}, ctx.Err()
@@ -301,19 +333,18 @@ func (b *Backfiller) processWindow(ctx context.Context, groups []ruleGroup, wind
 				"group", group.Name,
 				"rule", rule.Name,
 				"expr", rule.Expr,
-				"window_start", windowStart,
-				"window_end", windowEnd,
+				"query_start", queryStart,
+				"query_end", queryEnd,
+				"step", stepSeconds,
 			)
 
-			matrix, warnings, queryErr := b.queryFunc(ctx, rule.Expr, windowStart, windowEnd, stepSeconds)
+			matrix, warnings, queryErr := b.queryFunc(ctx, rule.Expr, queryStart, queryEnd, stepSeconds)
 			if queryErr != nil {
-				level.Error(b.logger).Log(
-					"msg", "query failed for rule",
-					"group", group.Name,
-					"rule", rule.Name,
-					"err", queryErr,
-				)
-				continue // Continue on per-rule errors.
+				// Fail the entire window on any rule query failure.
+				if rollbackErr := app.Rollback(); rollbackErr != nil {
+					level.Warn(b.logger).Log("msg", "rollback after query failure", "err", rollbackErr)
+				}
+				return ulid.ULID{}, errors.Wrapf(queryErr, "query failed for rule %s/%s", group.Name, rule.Name)
 			}
 			for _, w := range warnings {
 				level.Warn(b.logger).Log("msg", "query warning", "rule", rule.Name, "warning", w)
@@ -339,13 +370,11 @@ func (b *Backfiller) processWindow(ctx context.Context, groups []ruleGroup, wind
 					val := float64(sp.Value)
 
 					if _, appendErr := app.Append(0, lbls, ts, val); appendErr != nil {
-						level.Error(b.logger).Log(
-							"msg", "failed to append sample",
-							"rule", rule.Name,
-							"ts", ts,
-							"err", appendErr,
-						)
-						continue
+						// Fail the entire window on any append failure.
+						if rollbackErr := app.Rollback(); rollbackErr != nil {
+							level.Warn(b.logger).Log("msg", "rollback after append failure", "err", rollbackErr)
+						}
+						return ulid.ULID{}, errors.Wrapf(appendErr, "append sample for rule %s/%s at ts %d", group.Name, rule.Name, ts)
 					}
 					sampleCount++
 					totalSamples++
