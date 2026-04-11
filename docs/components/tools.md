@@ -1113,6 +1113,248 @@ Flags:
 
 ```
 
+## Rules-backfill
+
+The `tools rules-backfill` subcommand retroactively evaluates Prometheus recording rules against historical data accessible through a Thanos Query endpoint, produces TSDB blocks from the results, and uploads those blocks to object storage. Alerting rules in the provided rule files are skipped automatically.
+
+This is useful when a new recording rule is deployed and dashboards need historical data immediately, when recording rules must be regenerated after a label migration, or when aggregated metrics need to be reconstructed after data loss. The tool connects to Thanos Query via the HTTP PromQL API, so it benefits from deduplication, fan-out, and partial response handling that Thanos Query already provides.
+
+Unlike `promtool tsdb create-blocks-from rules`, which targets a single Prometheus instance and writes blocks to a local directory, `thanos tools rules-backfill` queries across the full Thanos data layer (Store Gateway, Sidecars, Receivers) and uploads blocks directly to object storage with proper Thanos metadata (external labels, source type, resolution).
+
+Example:
+
+```bash
+thanos tools rules-backfill \
+    --rules="rules/*.yaml" \
+    --query="http://thanos-query:9090" \
+    --objstore.config-file="bucket.yml" \
+    --start="-180d" \
+    --end="-3h" \
+    --label='cluster="prod-us-east-1"' \
+    --label='backfill_job="2026-04"'
+```
+
+### Flags
+
+```
+usage: thanos tools rules-backfill [<flags>]
+
+Backfill recording rules against historical Thanos data and upload blocks to
+object storage.
+
+
+Flags:
+  -h, --[no-]help          Show context-sensitive help (also try --help-long and
+                           --help-man).
+      --[no-]version       Show application version.
+      --log.level=info     Log filtering level.
+      --log.format=logfmt  Log format to use. Possible options: logfmt, json or
+                           journald.
+      --tracing.config-file=<file-path>
+                           Path to YAML file with tracing
+                           configuration. See format details:
+                           https://thanos.io/tip/thanos/tracing.md/#configuration
+      --tracing.config=<content>
+                           Alternative to 'tracing.config-file' flag
+                           (mutually exclusive). Content of YAML file
+                           with tracing configuration. See format details:
+                           https://thanos.io/tip/thanos/tracing.md/#configuration
+      --[no-]enable-auto-gomemlimit
+                           Enable go runtime to automatically limit memory
+                           consumption.
+      --auto-gomemlimit.ratio=0.9
+                           The ratio of reserved GOMEMLIMIT memory to the
+                           detected maximum container or system memory.
+      --rules=RULES ...    The rule files glob to backfill (repeated). Required.
+      --query=QUERY        Thanos Query HTTP endpoint URL. Required.
+      --start=START        Start of the backfill time range (RFC3339 or relative
+                           duration like -180d). Required.
+      --end=-3h            End of the backfill time range (RFC3339 or relative
+                           duration like -3h). Default is 3h ago.
+      --eval-interval=60s  Evaluation interval for rules. If a rule group
+                           specifies its own interval, that value takes
+                           precedence.
+      --max-block-duration=2h
+                           Maximum duration for a single TSDB block.
+      --label=key="value" ...
+                           External labels to attach to blocks (repeated,
+                           format key="value"). Required.
+      --dry-run            Create blocks locally but do not upload to object
+                           storage.
+      --tmp-dir=TMP-DIR    Temporary directory for block creation. Defaults to
+                           OS temp dir.
+      --dedup              Enable deduplication in queries. Default true.
+      --no-dedup           Disable deduplication in queries.
+      --partial-response   Enable partial response in queries. Default false.
+      --max-source-resolution=0s
+                           Maximum source resolution for queries (0s, 5m, 1h).
+      --query-timeout=5m   Timeout for individual query requests.
+      --retry-attempts=3   Number of retry attempts for failed queries.
+      --query-rate-limit=10
+                           Maximum queries per second against the Query API.
+      --hash-func=         Hash function for block verification (e.g. SHA256).
+                           Empty means none.
+      --tenant-header=     HTTP header name for multi-tenancy (e.g.
+                           THANOS-TENANT). Empty means no tenant header.
+      --tenant=            Tenant ID value to send via the tenant header.
+      --objstore.config-file=<file-path>
+                           Path to YAML file that contains object
+                           store configuration. See format details:
+                           https://thanos.io/tip/thanos/storage.md/#configuration
+                           Required unless --dry-run is set.
+      --objstore.config=<content>
+                           Alternative to 'objstore.config-file' flag (mutually
+                           exclusive). Content of YAML file that contains
+                           object store configuration. See format details:
+                           https://thanos.io/tip/thanos/storage.md/#configuration
+```
+
+### Usage Examples
+
+**Basic backfill of a recording rule over a fixed time range:**
+
+```bash
+thanos tools rules-backfill \
+    --rules="rules/aggregations.yaml" \
+    --query="http://thanos-query:9090" \
+    --objstore.config-file="bucket.yml" \
+    --start="2026-01-01T00:00:00Z" \
+    --end="2026-04-01T00:00:00Z" \
+    --label='cluster="prod-us-east-1"' \
+    --label='backfill_job="2026-Q1-agg"'
+```
+
+**Using relative time durations:**
+
+```bash
+thanos tools rules-backfill \
+    --rules="rules/*.yaml" \
+    --query="http://thanos-query:9090" \
+    --objstore.config-file="bucket.yml" \
+    --start="-180d" \
+    --end="-3h" \
+    --label='cluster="prod"' \
+    --label='backfill_job="2026-04"'
+```
+
+**Dry-run mode (create blocks locally without uploading):**
+
+```bash
+thanos tools rules-backfill \
+    --rules="rules/new-rule.yaml" \
+    --query="http://thanos-query:9090" \
+    --start="-7d" \
+    --end="-3h" \
+    --label='cluster="prod"' \
+    --label='backfill_job="test-run"' \
+    --dry-run
+```
+
+In dry-run mode, `--objstore.config-file` is not required. Blocks are written to the temporary directory and can be inspected manually.
+
+**Multi-tenant setup with tenant header:**
+
+```bash
+thanos tools rules-backfill \
+    --rules="rules/tenant-a.yaml" \
+    --query="http://thanos-query:9090" \
+    --objstore.config-file="bucket.yml" \
+    --start="-90d" \
+    --end="-3h" \
+    --label='tenant="team-a"' \
+    --label='backfill_job="2026-04"' \
+    --tenant-header="THANOS-TENANT" \
+    --tenant="team-a"
+```
+
+**Custom evaluation interval and block duration:**
+
+```bash
+thanos tools rules-backfill \
+    --rules="rules/hourly-agg.yaml" \
+    --query="http://thanos-query:9090" \
+    --objstore.config-file="bucket.yml" \
+    --start="-365d" \
+    --end="-3h" \
+    --eval-interval="5m" \
+    --max-block-duration="2h" \
+    --label='cluster="prod"' \
+    --label='backfill_job="2026-annual"' \
+    --query-rate-limit=5
+```
+
+### External Labels and Compaction Groups
+
+External labels on generated blocks determine which compaction group the blocks belong to. The Thanos compactor groups blocks by external labels and resolution, then checks for time-range overlaps within each group. Two blocks in the same compaction group with overlapping time ranges cause the compactor to halt (unless vertical compaction is enabled).
+
+Because backfilled blocks always cover a time range where the bucket already has existing blocks, the external label strategy is critical for safe operation.
+
+**Recommended: Use a unique backfill job label per run.** Add a label such as `backfill_job="<unique-value>"` alongside the labels that identify the data source (e.g., `cluster`, `tenant`). This places backfilled blocks in their own compaction group, separate from live data. No compactor configuration changes are needed.
+
+```bash
+# Each run gets its own compaction group -- fully safe
+--label='cluster="prod"' --label='backfill_job="2026-04-new-rules"'
+```
+
+The extra label is visible on series at query time. A query for `my_rule{cluster="prod"}` still matches backfilled blocks -- the additional label appears in results but does not prevent matching. For the primary use case (backfilling a rule that never existed before), this is the simplest and safest approach.
+
+**Advanced: Same labels as live data.** If you need backfilled series to have the exact same label set as live series (no extra labels), use the same external labels as existing blocks. This requires `--compact.enable-vertical-compaction` to be active on the compactor before the first backfill block is uploaded. Without it, the compactor halts for the entire bucket. The tool warns at startup if it detects live-data blocks with the same compaction group key in the target time range.
+
+All generated blocks carry `thanos.source: "rules.backfill"` in their metadata regardless of the label strategy, providing traceability through `thanos tools bucket inspect`.
+
+### Idempotency and Resumability
+
+The tool is designed to be safely re-run after interruption. On startup, before any block is written, it scans the bucket for existing blocks that match the run's external labels, have source `rules.backfill`, and fall within the target time range. A planned time window is skipped if any existing backfill block's time range overlaps with it.
+
+This works because `block.Upload` writes `meta.json` last. A crash at any point before `meta.json` is written leaves no visible block in the bucket -- both the Store Gateway and compactor ignore ULID directories without `meta.json`. On re-run, the tool detects which windows have blocks and skips them. Orphaned partial directories from interrupted uploads are cleaned up by the compactor's `BlocksCleaner`.
+
+No local checkpoint files are needed. The bucket itself is the checkpoint. The same `--start`, `--end`, `--max-block-duration`, and `--label` flags produce deterministic time window splits, so re-runs with the same parameters skip windows that already have uploaded blocks.
+
+Note: coverage detection is based on block time range overlap, not on whether the block contains all intended rules. If a run is interrupted after uploading a block that contains only a subset of rules for a window (e.g., rule A succeeded but rule B failed before the fix that made query failures abort the window), the next run will skip that window entirely. The current implementation prevents this scenario by failing the entire window on any rule query or append error -- no block is uploaded for a partially successful window.
+
+### Rule Dependencies
+
+If rule B's expression references a metric produced by rule A, and both rules are in the same file being backfilled, rule B will produce empty or incorrect results. Within a single backfill pass, rule A's output is not yet available in Thanos Query -- it must first be uploaded to object storage and synced by the Store Gateway.
+
+To handle dependent rules, run separate invocations:
+
+1. Backfill rule A.
+2. Wait for the Store Gateway to sync the new blocks (default sync interval: 3 minutes).
+3. Backfill rule B in a separate invocation.
+
+### Per-Group Evaluation Intervals
+
+If a rule group in the provided rule file specifies its own `interval` field, that value is used as the evaluation step for all rules in that group. The `--eval-interval` flag only applies to groups that do not define an explicit interval. This matches Prometheus semantics, where each rule group can have its own evaluation cadence.
+
+```yaml
+groups:
+  - name: fast-eval
+    interval: 15s       # This group uses 15s, ignoring --eval-interval
+    rules:
+      - record: job:request_rate:rate5m
+        expr: sum(rate(http_requests_total[5m])) by (job)
+
+  - name: default-eval   # This group uses --eval-interval (default 60s)
+    rules:
+      - record: job:error_rate:rate5m
+        expr: sum(rate(http_errors_total[5m])) by (job)
+```
+
+### Post-Backfill Verification
+
+After the backfill completes, verify that the blocks are correctly uploaded and queryable:
+
+1. **Check block count.** Use `thanos tools bucket inspect` to list blocks produced by the backfill:
+
+   ```bash
+   thanos tools bucket inspect --objstore.config-file="bucket.yml" \
+       -l backfill_job="2026-04"
+   ```
+
+2. **Query the backfilled metric.** Through Thanos Query, run a PromQL query covering the backfilled time range and verify non-empty results. Allow a few minutes for the Store Gateway to sync new blocks (default sync interval: 3 minutes).
+
+3. **Check compactor health.** After the Store Gateway picks up the new blocks, monitor the compactor for halt errors. Check `thanos_compact_group_compactions_failures_total` for at least one hour post-backfill. If you used distinct external labels (recommended), the compactor should process the backfill group without issues.
+
 #### Probes
 
 - The downsample service exposes two endpoints for probing:
