@@ -375,35 +375,37 @@ func (b *Backfiller) Run(ctx context.Context, ruleFiles []string, start, end tim
 	}
 	mu.Unlock()
 
-	// If errgroup returned early due to context cancellation, surface it.
-	if runErr != nil && (errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)) {
-		mu.Lock()
-		u := append([]ulid.ULID(nil), uploaded...)
-		mu.Unlock()
-		level.Info(b.logger).Log("msg", "backfill cancelled",
-			"windows_total", totalWindows,
-			"windows_written", written.Load(),
-			"windows_skipped", skipped.Load(),
-			"windows_failed", failed.Load(),
-			"blocks_uploaded", len(u),
-			"duration", time.Since(startTime),
-		)
-		return u, runErr
-	}
-
-	// Write manifest to bucket.
+	// Snapshot shared state before the manifest write so the manifest reflects
+	// exactly what was accumulated, regardless of cancellation.
 	mu.Lock()
 	uploadedCopy := append([]ulid.ULID(nil), uploaded...)
 	failedCopy := append([]failedWindow(nil), failedList...)
 	mu.Unlock()
 
+	cancelled := runErr != nil && (errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded))
+
+	// Persist the manifest whenever there is state worth resuming from. This
+	// must also run on cancellation so an interrupted run leaves a usable
+	// record of what was uploaded and what remains to be retried. Use a fresh
+	// background context with a short timeout because ctx is already cancelled
+	// on the cancellation path.
 	if !b.dryRun && b.bkt != nil && (len(uploadedCopy) > 0 || len(failedCopy) > 0) {
-		if err := b.writeManifest(ctx, uploadedCopy, startMs, endMs, failedCopy); err != nil {
+		manifestCtx := ctx
+		if cancelled {
+			var manifestCancel context.CancelFunc
+			manifestCtx, manifestCancel = context.WithTimeout(context.Background(), 30*time.Second)
+			defer manifestCancel()
+		}
+		if err := b.writeManifest(manifestCtx, uploadedCopy, startMs, endMs, failedCopy); err != nil {
 			level.Warn(b.logger).Log("msg", "failed to write backfill manifest", "err", err)
 		}
 	}
 
-	level.Info(b.logger).Log("msg", "backfill summary",
+	summaryMsg := "backfill summary"
+	if cancelled {
+		summaryMsg = "backfill cancelled"
+	}
+	level.Info(b.logger).Log("msg", summaryMsg,
 		"windows_total", totalWindows,
 		"windows_written", written.Load(),
 		"windows_skipped", skipped.Load(),
@@ -412,6 +414,9 @@ func (b *Backfiller) Run(ctx context.Context, ruleFiles []string, start, end tim
 		"duration", time.Since(startTime),
 	)
 
+	if cancelled {
+		return uploadedCopy, runErr
+	}
 	return uploadedCopy, merr.Err()
 }
 
@@ -446,12 +451,17 @@ func (b *Backfiller) preflight(ctx context.Context, numGroups, totalRules, numWi
 		return errors.Wrap(err, "query endpoint unreachable or returning errors")
 	}
 
-	// In non-dry-run mode, exercise bucket auth and reachability without mutating state.
-	// Iter with a non-existent prefix is cheap and should not return an error just
-	// because nothing is there.
+	// In non-dry-run mode, verify the bucket is actually writable by uploading a
+	// tiny probe object and deleting it. A list-only probe would not catch
+	// credentials that permit read/list but not put, which is precisely the
+	// failure mode that would abort a real run hours in.
 	if !b.dryRun && b.bkt != nil {
-		if err := b.bkt.Iter(ctx, "preflight-check-nonexistent/", func(string) error { return nil }); err != nil {
-			return errors.Wrap(err, "bucket not writable or unreachable")
+		probeName := fmt.Sprintf(".rules-backfill-preflight/probe-%d", time.Now().UnixNano())
+		if err := b.bkt.Upload(ctx, probeName, bytes.NewReader([]byte("ok"))); err != nil {
+			return errors.Wrap(err, "bucket not writable (preflight probe upload failed)")
+		}
+		if err := b.bkt.Delete(ctx, probeName); err != nil {
+			level.Warn(b.logger).Log("msg", "preflight probe delete failed; debris left in bucket", "path", probeName, "err", err)
 		}
 	}
 

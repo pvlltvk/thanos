@@ -1357,6 +1357,16 @@ func (b *iterErrorBucket) Iter(_ context.Context, _ string, _ func(string) error
 	return fmt.Errorf("bucket iter error: connection refused")
 }
 
+// uploadErrorBucket wraps InMemBucket and makes Upload return an error,
+// simulating a credential that grants read/list but not put.
+type uploadErrorBucket struct {
+	*objstore.InMemBucket
+}
+
+func (b *uploadErrorBucket) Upload(_ context.Context, _ string, _ io.Reader, _ ...objstore.ObjectUploadOption) error {
+	return fmt.Errorf("bucket upload error: access denied")
+}
+
 // bufferLogger returns a go-kit logger that writes to the provided buffer.
 // The buffer can then be inspected for expected log lines.
 func bufferLogger(buf *bytes.Buffer) log.Logger {
@@ -1919,12 +1929,14 @@ func TestPreflight_QueryEndpointUnreachable(t *testing.T) {
 
 // --- TestPreflight_BucketUnreachable -----------------------------------------
 
-// TestPreflight_BucketUnreachable verifies that when the bucket's Iter call
-// fails during preflight (non-dry-run), Run returns a preflight error.
+// TestPreflight_BucketUnreachable verifies that when the bucket rejects the
+// write probe during preflight (non-dry-run), Run returns a preflight error.
+// This guards against read/list-only credentials that would silently pass a
+// list-based probe and then fail hours later on the first real upload.
 func TestPreflight_BucketUnreachable(t *testing.T) {
 	t.Parallel()
 
-	bkt := &iterErrorBucket{InMemBucket: objstore.NewInMemBucket()}
+	bkt := &uploadErrorBucket{InMemBucket: objstore.NewInMemBucket()}
 	ruleFile := writeRuleFile(t, simpleRecordingRuleYAML)
 	start := time.Unix(0, 0).UTC()
 	end := start.Add(2 * time.Hour)
@@ -2198,6 +2210,76 @@ func TestRun_Manifest_WrittenEvenWithoutSuccessfulUploads(t *testing.T) {
 	testutil.Equals(t, 0, len(m.Blocks))
 	testutil.Assert(t, len(m.FailedWindows) > 0,
 		"expected FailedWindows in manifest when all windows fail, got 0")
+}
+
+// --- TestRun_Manifest_WrittenOnCancellation ----------------------------------
+
+// TestRun_Manifest_WrittenOnCancellation verifies that when Run is interrupted
+// by context cancellation after some windows have already uploaded, the
+// manifest still makes it to the bucket so a future resume can pick up where
+// the run left off. Regression guard for the early-return-before-manifest bug.
+func TestRun_Manifest_WrittenOnCancellation(t *testing.T) {
+	t.Parallel()
+
+	const numWindows = 3
+	blockDur := 2 * time.Hour
+	start := time.Unix(0, 0).UTC()
+	end := start.Add(time.Duration(numWindows) * blockDur)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var called atomic.Int64
+	queryFunc := func(qCtx context.Context, _ string, startTime, _, _ int64) (model.Matrix, []string, error) {
+		idx := called.Add(1)
+		if idx >= 2 {
+			cancel()
+			return nil, nil, qCtx.Err()
+		}
+		ts := model.Time(startTime + 1)
+		return model.Matrix{
+			{
+				Metric: model.Metric{model.MetricNameLabel: "m"},
+				Values: []model.SamplePair{{Timestamp: ts, Value: 1.0}},
+			},
+		}, nil, nil
+	}
+
+	bkt := objstore.NewInMemBucket()
+	ruleFile := writeRuleFile(t, simpleRecordingRuleYAML)
+
+	b := New(
+		newTestLogger(),
+		queryFunc,
+		bkt,
+		newTestLabels(),
+		t.TempDir(),
+		WithConcurrency(1),
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+		WithDisablePreflight(true),
+	)
+
+	ids, err := b.Run(ctx, []string{ruleFile}, start, end)
+	testutil.Assert(t, err != nil, "expected non-nil error after context cancellation")
+	testutil.Assert(t,
+		strings.Contains(err.Error(), "context canceled") || strings.Contains(err.Error(), "canceled"),
+		"expected context canceled error, got: %v", err)
+	testutil.Assert(t, len(ids) >= 1,
+		"expected at least one block uploaded before cancellation, got %d", len(ids))
+
+	var manifestData []byte
+	for key, data := range bkt.Objects() {
+		if strings.HasPrefix(key, manifestPrefix+"/") && strings.HasSuffix(key, ".json") {
+			manifestData = data
+			break
+		}
+	}
+	testutil.Assert(t, manifestData != nil,
+		"expected manifest in bucket after cancelled run, found none")
+
+	var m manifest
+	testutil.Ok(t, json.Unmarshal(manifestData, &m))
+	testutil.Assert(t, len(m.Blocks) >= 1,
+		"expected manifest to reference uploaded blocks after cancellation, got %d", len(m.Blocks))
 }
 
 // --- Unused import suppression -----------------------------------------------
