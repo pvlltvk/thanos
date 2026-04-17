@@ -258,3 +258,170 @@ func TestRulesBackfill(t *testing.T) {
 	testutil.Equals(t, len(uploadedIDs), len(secondRunIDs),
 		"idempotency check: second backfill run must not upload additional blocks")
 }
+
+// TestRulesBackfill_Phase2 exercises the Phase 2 flags (--concurrency and
+// --retry-attempts) end-to-end in a real Docker environment with MinIO,
+// Prometheus, sidecar, Store GW, and Querier.
+//
+// Concurrency note: the backfill time range is ~7 minutes, which produces a
+// single 2-hour block window. Increasing concurrency beyond 1 on a single
+// window has no observable parallelism effect, but the test verifies that
+// --concurrency=4 is accepted and the tool still produces correct output.
+// A multi-window concurrency stress test is covered at the unit level by
+// TestRun_Concurrency_ParallelExecution.
+func TestRulesBackfill_Phase2(t *testing.T) {
+	t.Parallel()
+
+	e, err := e2e.NewDockerEnvironment("rbf2")
+	testutil.Ok(t, err)
+	t.Cleanup(e2ethanos.CleanScenario(t, e))
+
+	// -------------------------------------------------------------------------
+	// MinIO
+	// -------------------------------------------------------------------------
+	const bucket = "rules-backfill-phase2"
+	m := e2edb.NewMinio(e, "thanos", bucket, e2edb.WithMinioTLS())
+	testutil.Ok(t, e2e.StartAndWaitReady(m))
+
+	svcConfig := client.BucketConfig{
+		Type:   objstore.S3,
+		Config: e2ethanos.NewS3Config(bucket, m.InternalEndpoint("http"), m.InternalDir()),
+	}
+
+	// -------------------------------------------------------------------------
+	// Prometheus + sidecar
+	// -------------------------------------------------------------------------
+	promCfg := e2ethanos.DefaultPromConfig("prom1", 0, "", "", e2ethanos.LocalPrometheusTarget)
+	prom, sidecar := e2ethanos.NewPrometheusWithSidecar(
+		e, "prom1", promCfg, "", e2ethanos.DefaultPrometheusImage(), "")
+	testutil.Ok(t, e2e.StartAndWaitReady(prom, sidecar))
+
+	// -------------------------------------------------------------------------
+	// Store GW + Querier
+	// -------------------------------------------------------------------------
+	storeGW := e2ethanos.NewStoreGW(e, "1", svcConfig, "", "", nil)
+	testutil.Ok(t, e2e.StartAndWaitReady(storeGW))
+
+	querier := e2ethanos.NewQuerierBuilder(e, "1",
+		sidecar.InternalEndpoint("grpc"),
+		storeGW.InternalEndpoint("grpc"),
+	).Init()
+	testutil.Ok(t, e2e.StartAndWaitReady(querier))
+
+	// -------------------------------------------------------------------------
+	// Wait until `up` is visible through the querier.
+	// -------------------------------------------------------------------------
+	logger := log.NewLogfmtLogger(os.Stdout)
+
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	t.Cleanup(waitCancel)
+
+	querierURL, err := url.Parse("http://" + querier.Endpoint("http"))
+	testutil.Ok(t, err)
+
+	testutil.Ok(t, runutil.RetryWithLog(logger, 5*time.Second, waitCtx.Done(), func() error {
+		res, _, _, queryErr := promclient.NewDefaultClient().QueryInstant(
+			waitCtx, querierURL, "up", time.Now(), promclient.QueryOptions{Deduplicate: true})
+		if queryErr != nil {
+			return queryErr
+		}
+		if len(res) == 0 {
+			return fmt.Errorf("no results yet for 'up' query through querier")
+		}
+		return nil
+	}))
+
+	// -------------------------------------------------------------------------
+	// Rule file
+	// -------------------------------------------------------------------------
+	rulesDir := filepath.Join(e.SharedDir(), "rules-p2")
+	testutil.Ok(t, os.MkdirAll(rulesDir, 0755))
+
+	ruleContent := `groups:
+  - name: phase2_group
+    rules:
+      - record: phase2:up:sum
+        expr: sum(up)
+`
+	rulesFilePath := filepath.Join(rulesDir, "rules.yaml")
+	testutil.Ok(t, os.WriteFile(rulesFilePath, []byte(ruleContent), 0644))
+
+	bktCfgBytes, err := yaml.Marshal(svcConfig)
+	testutil.Ok(t, err)
+
+	backfillEnd := time.Now().UTC().Add(-3 * time.Minute)
+	backfillStart := backfillEnd.Add(-7 * time.Minute)
+
+	startFlag := backfillStart.Format(time.RFC3339)
+	endFlag := backfillEnd.Format(time.RFC3339)
+	queryURL := "http://" + querier.InternalEndpoint("http")
+
+	runner := e.Runnable("backfill-runner-p2").
+		Init(e2e.StartOptions{
+			Image:   e2ethanos.DefaultImage(),
+			Command: e2e.NewCommandRunUntilStop(),
+			User:    fmt.Sprintf("%d", os.Getuid()),
+		})
+	testutil.Ok(t, e2e.StartAndWaitReady(runner))
+
+	// -------------------------------------------------------------------------
+	// Phase 2 run: --concurrency=4 --retry-attempts=5
+	// The 7-minute range produces a single 2-hour block window, so concurrency
+	// does not produce observable parallelism here. The primary assertions are
+	// that the flags are accepted and the block is still correctly produced.
+	// -------------------------------------------------------------------------
+	phase2Args := []string{
+		"rules-backfill",
+		"--rules=" + rulesFilePath,
+		"--query=" + queryURL,
+		"--start=" + startFlag,
+		"--end=" + endFlag,
+		`--label=cluster="e2e-p2"`,
+		"--eval-interval=30s",
+		"--concurrency=4",
+		"--retry-attempts=5",
+		"--objstore.config=" + string(bktCfgBytes),
+	}
+
+	testutil.Ok(t, runner.Exec(e2e.NewCommand("tools", phase2Args...)))
+
+	// -------------------------------------------------------------------------
+	// Verify blocks landed in the bucket with correct external labels.
+	// -------------------------------------------------------------------------
+	hostBktCfg := e2ethanos.NewS3Config(bucket, m.Endpoint("http"), m.Dir())
+	bkt, err := s3.NewBucketWithConfig(logger, hostBktCfg, "test-verify-p2", nil)
+	testutil.Ok(t, err)
+
+	var uploadedIDs []ulid.ULID
+	verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	t.Cleanup(verifyCancel)
+
+	testutil.Ok(t, runutil.RetryWithLog(logger, 5*time.Second, verifyCtx.Done(), func() error {
+		uploadedIDs = nil
+		iterErr := bkt.Iter(verifyCtx, "", func(name string) error {
+			rawID := strings.TrimSuffix(name, "/")
+			id, parseErr := ulid.Parse(rawID)
+			if parseErr != nil {
+				return nil
+			}
+			uploadedIDs = append(uploadedIDs, id)
+			return nil
+		})
+		if iterErr != nil {
+			return iterErr
+		}
+		if len(uploadedIDs) == 0 {
+			return fmt.Errorf("no blocks found in bucket yet; waiting for upload to complete")
+		}
+		return nil
+	}))
+
+	testutil.Assert(t, len(uploadedIDs) > 0,
+		"expected at least one block uploaded when using --concurrency=4 --retry-attempts=5")
+
+	for _, id := range uploadedIDs {
+		meta, dlErr := block.DownloadMeta(verifyCtx, logger, bkt, id)
+		testutil.Ok(t, dlErr)
+		testutil.Equals(t, "e2e-p2", meta.Thanos.Labels["cluster"])
+	}
+}

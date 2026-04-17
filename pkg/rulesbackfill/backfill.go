@@ -9,8 +9,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-kit/log"
@@ -21,6 +24,7 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/rulefmt"
 	"github.com/prometheus/prometheus/tsdb"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"
 
 	"github.com/thanos-io/objstore"
@@ -37,6 +41,9 @@ const (
 
 	// manifestPrefix is the bucket path prefix for backfill manifests.
 	manifestPrefix = "backfill-manifests"
+
+	// progressInterval is how often the periodic progress logger fires.
+	progressInterval = 30 * time.Second
 )
 
 // QueryRangeFunc abstracts the Thanos Query HTTP API for testing.
@@ -46,16 +53,19 @@ type QueryRangeFunc func(ctx context.Context, query string, startTime, endTime, 
 // Backfiller evaluates recording rules against historical data via Thanos Query
 // and produces TSDB blocks that are uploaded to object storage.
 type Backfiller struct {
-	logger         log.Logger
-	queryFunc      QueryRangeFunc
-	bkt            objstore.Bucket
-	externalLabels labels.Labels
-	maxBlockDur    time.Duration
-	evalInterval   time.Duration
-	dryRun         bool
-	hashFunc       metadata.HashFunc
-	dataDir        string
-	rateLimiter    *rate.Limiter
+	logger           log.Logger
+	queryFunc        QueryRangeFunc
+	bkt              objstore.Bucket
+	externalLabels   labels.Labels
+	maxBlockDur      time.Duration
+	evalInterval     time.Duration
+	dryRun           bool
+	hashFunc         metadata.HashFunc
+	dataDir          string
+	rateLimiter      *rate.Limiter
+	concurrency      int
+	retryAttempts    int
+	disablePreflight bool
 }
 
 // Option configures a Backfiller.
@@ -86,6 +96,36 @@ func WithRateLimiter(l *rate.Limiter) Option {
 	return func(b *Backfiller) { b.rateLimiter = l }
 }
 
+// WithConcurrency sets the maximum number of windows processed in parallel.
+// Values <= 0 are treated as 1 (serial). Default is 1.
+func WithConcurrency(n int) Option {
+	return func(b *Backfiller) {
+		if n < 1 {
+			n = 1
+		}
+		b.concurrency = n
+	}
+}
+
+// WithRetryAttempts sets the number of retry attempts for retriable operations
+// (notably block uploads). The caller-supplied queryFunc is expected to have
+// its own retry behavior. Default is 0 (no retries).
+func WithRetryAttempts(n int) Option {
+	return func(b *Backfiller) {
+		if n < 0 {
+			n = 0
+		}
+		b.retryAttempts = n
+	}
+}
+
+// WithDisablePreflight disables the pre-flight validation step. Intended for
+// use by unit tests that do not want preflight to issue an extra query or
+// bucket operation.
+func WithDisablePreflight(disable bool) Option {
+	return func(b *Backfiller) { b.disablePreflight = disable }
+}
+
 // New creates a new Backfiller with the given configuration.
 func New(
 	logger log.Logger,
@@ -106,6 +146,8 @@ func New(
 		dryRun:         false,
 		hashFunc:       metadata.NoneFunc,
 		rateLimiter:    rate.NewLimiter(rate.Limit(10), 1),
+		concurrency:    1,
+		retryAttempts:  0,
 	}
 	for _, o := range opts {
 		o(b)
@@ -128,32 +170,41 @@ type ruleGroup struct {
 	Rules    []recordingRule
 }
 
+// failedWindow records a window that did not complete successfully during a
+// backfill run. Persisted in the manifest to enable future resume tooling.
+type failedWindow struct {
+	Start int64  `json:"start_ms"`
+	End   int64  `json:"end_ms"`
+	Error string `json:"error,omitempty"`
+}
+
 // manifest is the JSON structure written to the bucket after a backfill run.
 type manifest struct {
-	Timestamp time.Time   `json:"timestamp"`
-	Blocks    []ulid.ULID `json:"blocks"`
-	Start     int64       `json:"start_ms"`
-	End       int64       `json:"end_ms"`
-	DryRun    bool        `json:"dry_run"`
+	Timestamp     time.Time      `json:"timestamp"`
+	Blocks        []ulid.ULID    `json:"blocks"`
+	Start         int64          `json:"start_ms"`
+	End           int64          `json:"end_ms"`
+	DryRun        bool           `json:"dry_run"`
+	FailedWindows []failedWindow `json:"failed_windows,omitempty"`
 }
 
 // Run executes the backfill. It parses rule files, computes block-aligned time
 // windows, queries historical data for each recording rule, writes TSDB blocks,
 // and uploads them to object storage. Returns the list of uploaded block ULIDs.
 func (b *Backfiller) Run(ctx context.Context, ruleFiles []string, start, end time.Time) ([]ulid.ULID, error) {
+	startTime := time.Now()
+
 	groups, err := b.parseRuleFiles(ruleFiles)
 	if err != nil {
 		return nil, errors.Wrap(err, "parse rule files")
 	}
 
-	if len(groups) == 0 {
-		level.Warn(b.logger).Log("msg", "no recording rules found in provided rule files")
-		return nil, nil
-	}
-
 	totalRules := 0
 	for _, g := range groups {
 		totalRules += len(g.Rules)
+	}
+	if totalRules == 0 {
+		return nil, errors.New("no recording rules found in rule files (alerting rules are skipped)")
 	}
 	level.Info(b.logger).Log("msg", "parsed recording rules", "groups", len(groups), "rules", totalRules)
 
@@ -170,6 +221,13 @@ func (b *Backfiller) Run(ctx context.Context, ruleFiles []string, start, end tim
 		"start", start.UTC().Format(time.RFC3339),
 		"end", end.UTC().Format(time.RFC3339),
 	)
+
+	// Pre-flight validation: verify query endpoint and, in non-dry-run mode, bucket accessibility.
+	if !b.disablePreflight {
+		if err := b.preflight(ctx, len(groups), totalRules, len(windows), endMs); err != nil {
+			return nil, errors.Wrap(err, "preflight")
+		}
+	}
 
 	// Scan bucket for already-completed windows (skip when bucket is nil, e.g. dry-run).
 	var (
@@ -190,41 +248,221 @@ func (b *Backfiller) Run(ctx context.Context, ruleFiles []string, start, end tim
 		level.Info(b.logger).Log("msg", "bucket not configured, skipping bucket scan")
 	}
 
-	var (
-		uploaded []ulid.ULID
-		merr     errutil.MultiError
-	)
-
-	for _, w := range windows {
-		if ctx.Err() != nil {
-			return uploaded, ctx.Err()
-		}
-
-		// Skip windows already covered by previous backfill runs.
+	// Determine pending windows (those not already covered). Idempotency check runs
+	// in the main goroutine before spawning workers to keep behavior identical at
+	// concurrency=1 and avoid racing against the covered map.
+	type pendingWindow struct {
+		idx int
+		w   window
+	}
+	var pending []pendingWindow
+	for i, w := range windows {
 		if isWindowCovered(covered, w.start, w.end) {
 			level.Info(b.logger).Log("msg", "skipping already covered window", "start", w.start, "end", w.end)
 			continue
 		}
+		pending = append(pending, pendingWindow{idx: i, w: w})
+	}
 
-		id, err := b.processWindow(ctx, groups, w.start, w.end, blockDurMs, startMs, endMs)
-		if err != nil {
-			merr.Add(errors.Wrapf(err, "process window [%d, %d)", w.start, w.end))
-			continue
+	concurrency := b.concurrency
+	if concurrency < 1 {
+		concurrency = 1
+	}
+
+	totalWindows := int64(len(windows))
+	skippedWindows := int64(len(windows) - len(pending))
+
+	var (
+		written atomic.Int64
+		failed  atomic.Int64
+		skipped atomic.Int64
+	)
+	skipped.Store(skippedWindows)
+
+	// Progress reporter.
+	progressCtx, progressCancel := context.WithCancel(ctx)
+	progressDone := make(chan struct{})
+	go func() {
+		defer close(progressDone)
+		t := time.NewTicker(progressInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-progressCtx.Done():
+				return
+			case <-t.C:
+				logProgress(b.logger, written.Load(), skipped.Load(), failed.Load(), totalWindows)
+			}
 		}
-		if id != (ulid.ULID{}) {
-			uploaded = append(uploaded, id)
+	}()
+
+	// Shared mutable state protected by mu.
+	var (
+		mu          sync.Mutex
+		uploaded    []ulid.ULID
+		merr        errutil.MultiError
+		failures    = make(map[string]int)
+		failedList  []failedWindow
+	)
+
+	eg, egCtx := errgroup.WithContext(ctx)
+	eg.SetLimit(concurrency)
+
+	for _, pw := range pending {
+		pw := pw
+		eg.Go(func() error {
+			if egCtx.Err() != nil {
+				return egCtx.Err()
+			}
+
+			// Each worker gets its own dataDir subdir so concurrent BlockWriters
+			// do not collide on intermediate state files. Cleaned up on return.
+			workDir := filepath.Join(b.dataDir, fmt.Sprintf("w-%d", pw.idx))
+			if err := os.MkdirAll(workDir, 0o755); err != nil {
+				failed.Add(1)
+				mu.Lock()
+				merr.Add(errors.Wrapf(err, "create worker dir for window [%d, %d)", pw.w.start, pw.w.end))
+				failedList = append(failedList, failedWindow{Start: pw.w.start, End: pw.w.end, Error: err.Error()})
+				mu.Unlock()
+				return nil
+			}
+			defer func() {
+				if rmErr := os.RemoveAll(workDir); rmErr != nil {
+					level.Warn(b.logger).Log("msg", "failed to remove worker dir", "dir", workDir, "err", rmErr)
+				}
+			}()
+
+			id, perRule, err := b.processWindow(egCtx, groups, pw.w.start, pw.w.end, blockDurMs, startMs, endMs, workDir)
+			if err != nil {
+				// Context cancellation propagates through the errgroup and stops the run.
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return err
+				}
+				failed.Add(1)
+				mu.Lock()
+				merr.Add(errors.Wrapf(err, "process window [%d, %d)", pw.w.start, pw.w.end))
+				failedList = append(failedList, failedWindow{Start: pw.w.start, End: pw.w.end, Error: err.Error()})
+				if perRule != "" {
+					failures[perRule]++
+				}
+				mu.Unlock()
+				return nil
+			}
+
+			written.Add(1)
+			if id != (ulid.ULID{}) {
+				mu.Lock()
+				uploaded = append(uploaded, id)
+				mu.Unlock()
+			}
+			return nil
+		})
+	}
+
+	runErr := eg.Wait()
+	progressCancel()
+	<-progressDone
+
+	// Final progress line before the summary.
+	logProgress(b.logger, written.Load(), skipped.Load(), failed.Load(), totalWindows)
+
+	// Per-rule failure breakdown.
+	mu.Lock()
+	if len(failures) > 0 {
+		for k, v := range failures {
+			level.Warn(b.logger).Log("msg", "rule failure count", "rule", k, "failed_windows", v)
 		}
+	}
+	mu.Unlock()
+
+	// If errgroup returned early due to context cancellation, surface it.
+	if runErr != nil && (errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)) {
+		mu.Lock()
+		u := append([]ulid.ULID(nil), uploaded...)
+		mu.Unlock()
+		level.Info(b.logger).Log("msg", "backfill cancelled",
+			"windows_total", totalWindows,
+			"windows_written", written.Load(),
+			"windows_skipped", skipped.Load(),
+			"windows_failed", failed.Load(),
+			"blocks_uploaded", len(u),
+			"duration", time.Since(startTime),
+		)
+		return u, runErr
 	}
 
 	// Write manifest to bucket.
-	if len(uploaded) > 0 && !b.dryRun {
-		if err := b.writeManifest(ctx, uploaded, startMs, endMs); err != nil {
+	mu.Lock()
+	uploadedCopy := append([]ulid.ULID(nil), uploaded...)
+	failedCopy := append([]failedWindow(nil), failedList...)
+	mu.Unlock()
+
+	if !b.dryRun && b.bkt != nil && (len(uploadedCopy) > 0 || len(failedCopy) > 0) {
+		if err := b.writeManifest(ctx, uploadedCopy, startMs, endMs, failedCopy); err != nil {
 			level.Warn(b.logger).Log("msg", "failed to write backfill manifest", "err", err)
 		}
 	}
 
-	level.Info(b.logger).Log("msg", "backfill completed", "blocks_created", len(uploaded), "errors", len(merr))
-	return uploaded, merr.Err()
+	level.Info(b.logger).Log("msg", "backfill summary",
+		"windows_total", totalWindows,
+		"windows_written", written.Load(),
+		"windows_skipped", skipped.Load(),
+		"windows_failed", failed.Load(),
+		"blocks_uploaded", len(uploadedCopy),
+		"duration", time.Since(startTime),
+	)
+
+	return uploadedCopy, merr.Err()
+}
+
+// logProgress emits a single progress log line with the given counters.
+func logProgress(logger log.Logger, written, skipped, failed, total int64) {
+	pct := float64(0)
+	if total > 0 {
+		pct = float64(written+skipped+failed) / float64(total) * 100
+	}
+	level.Info(logger).Log(
+		"msg", "progress",
+		"written", written,
+		"skipped", skipped,
+		"failed", failed,
+		"total", total,
+		"percent", fmt.Sprintf("%.1f", pct),
+	)
+}
+
+// preflight validates that the query endpoint is reachable, that there are
+// recording rules to process, and, in non-dry-run mode, that the bucket is
+// accessible. It also logs estimated work up front.
+func (b *Backfiller) preflight(ctx context.Context, numGroups, totalRules, numWindows int, endMs int64) error {
+	// Probe the query endpoint with a cheap 1-minute range query so we fail fast
+	// if the endpoint is unreachable, misconfigured, or returning errors.
+	probeStart := endMs - 60_000
+	probeEnd := endMs
+	if probeStart < 0 {
+		probeStart = 0
+	}
+	if _, _, err := b.queryFunc(ctx, "up", probeStart, probeEnd, 60); err != nil {
+		return errors.Wrap(err, "query endpoint unreachable or returning errors")
+	}
+
+	// In non-dry-run mode, exercise bucket auth and reachability without mutating state.
+	// Iter with a non-existent prefix is cheap and should not return an error just
+	// because nothing is there.
+	if !b.dryRun && b.bkt != nil {
+		if err := b.bkt.Iter(ctx, "preflight-check-nonexistent/", func(string) error { return nil }); err != nil {
+			return errors.Wrap(err, "bucket not writable or unreachable")
+		}
+	}
+
+	level.Info(b.logger).Log(
+		"msg", "preflight complete",
+		"rules", totalRules,
+		"groups", numGroups,
+		"windows", numWindows,
+		"estimated_queries", totalRules*numWindows,
+	)
+	return nil
 }
 
 // parseRuleFiles parses all provided rule file globs and extracts recording rules.
@@ -283,13 +521,16 @@ func (b *Backfiller) parseRuleFiles(patterns []string) ([]ruleGroup, error) {
 // processWindow creates a TSDB block for a single time window.
 // requestedStart and requestedEnd are the user-specified boundaries used to clamp
 // the query range so we never query data outside the requested interval.
-func (b *Backfiller) processWindow(ctx context.Context, groups []ruleGroup, windowStart, windowEnd, blockDurMs, requestedStart, requestedEnd int64) (ulid.ULID, error) {
+// workDir is a per-window scratch directory owned by the caller; processWindow
+// does not remove it. The second return value is a "group/rule" key identifying
+// the rule that failed, if the failure is attributable to a specific rule.
+func (b *Backfiller) processWindow(ctx context.Context, groups []ruleGroup, windowStart, windowEnd, blockDurMs, requestedStart, requestedEnd int64, workDir string) (ulid.ULID, string, error) {
 	// Clamp query range to the user-requested interval.
 	queryStart := maxInt64(windowStart, requestedStart)
 	queryEndExclusive := minInt64(windowEnd, requestedEnd)
 	if queryStart >= queryEndExclusive {
 		level.Debug(b.logger).Log("msg", "clamped window is empty, skipping", "window_start", windowStart, "window_end", windowEnd)
-		return ulid.ULID{}, nil
+		return ulid.ULID{}, "", nil
 	}
 	// PromQL query_range end is inclusive while our planned windows are half-open [start, end).
 	// Convert to an inclusive end here so adjacent windows do not duplicate boundary samples.
@@ -300,9 +541,9 @@ func (b *Backfiller) processWindow(ctx context.Context, groups []ruleGroup, wind
 	// the appendable minimum time once the head advances. With multiple series appending
 	// out-of-order timestamps within the same window, a 1x range can hit ErrOutOfBounds.
 	// The doubled range avoids this; Flush still writes correct min/max from actual samples.
-	writer, err := tsdb.NewBlockWriter(slogLogger, b.dataDir, 2*blockDurMs)
+	writer, err := tsdb.NewBlockWriter(slogLogger, workDir, 2*blockDurMs)
 	if err != nil {
-		return ulid.ULID{}, errors.Wrap(err, "create block writer")
+		return ulid.ULID{}, "", errors.Wrap(err, "create block writer")
 	}
 	defer runutil.CloseWithLogOnErr(b.logger, writer, "block writer")
 
@@ -330,12 +571,13 @@ func (b *Backfiller) processWindow(ctx context.Context, groups []ruleGroup, wind
 		}
 
 		for _, rule := range group.Rules {
+			ruleKey := group.Name + "/" + rule.Name
 			if ctx.Err() != nil {
-				return ulid.ULID{}, ctx.Err()
+				return ulid.ULID{}, "", ctx.Err()
 			}
 
 			if err := b.rateLimiter.Wait(ctx); err != nil {
-				return ulid.ULID{}, errors.Wrap(err, "rate limiter wait")
+				return ulid.ULID{}, ruleKey, errors.Wrap(err, "rate limiter wait")
 			}
 
 			level.Debug(b.logger).Log(
@@ -354,7 +596,7 @@ func (b *Backfiller) processWindow(ctx context.Context, groups []ruleGroup, wind
 				if rollbackErr := app.Rollback(); rollbackErr != nil {
 					level.Warn(b.logger).Log("msg", "rollback after query failure", "err", rollbackErr)
 				}
-				return ulid.ULID{}, errors.Wrapf(queryErr, "query failed for rule %s/%s", group.Name, rule.Name)
+				return ulid.ULID{}, ruleKey, errors.Wrapf(queryErr, "query failed for rule %s/%s", group.Name, rule.Name)
 			}
 			for _, w := range warnings {
 				level.Warn(b.logger).Log("msg", "query warning", "rule", rule.Name, "warning", w)
@@ -384,14 +626,14 @@ func (b *Backfiller) processWindow(ctx context.Context, groups []ruleGroup, wind
 						if rollbackErr := app.Rollback(); rollbackErr != nil {
 							level.Warn(b.logger).Log("msg", "rollback after append failure", "err", rollbackErr)
 						}
-						return ulid.ULID{}, errors.Wrapf(appendErr, "append sample for rule %s/%s at ts %d", group.Name, rule.Name, ts)
+						return ulid.ULID{}, ruleKey, errors.Wrapf(appendErr, "append sample for rule %s/%s at ts %d", group.Name, rule.Name, ts)
 					}
 					sampleCount++
 					totalSamples++
 
 					if sampleCount >= maxSamplesInMemory {
 						if commitErr := app.Commit(); commitErr != nil {
-							return ulid.ULID{}, errors.Wrap(commitErr, "commit appender")
+							return ulid.ULID{}, ruleKey, errors.Wrap(commitErr, "commit appender")
 						}
 						app = writer.Appender(ctx)
 						sampleCount = 0
@@ -404,7 +646,7 @@ func (b *Backfiller) processWindow(ctx context.Context, groups []ruleGroup, wind
 	// Final commit for remaining samples.
 	if sampleCount > 0 {
 		if err := app.Commit(); err != nil {
-			return ulid.ULID{}, errors.Wrap(err, "final commit")
+			return ulid.ULID{}, "", errors.Wrap(err, "final commit")
 		}
 	} else {
 		if err := app.Rollback(); err != nil {
@@ -414,15 +656,15 @@ func (b *Backfiller) processWindow(ctx context.Context, groups []ruleGroup, wind
 
 	if totalSamples == 0 {
 		level.Info(b.logger).Log("msg", "no samples in window, skipping block creation", "start", windowStart, "end", windowEnd)
-		return ulid.ULID{}, nil
+		return ulid.ULID{}, "", nil
 	}
 
 	blockID, err := writer.Flush(ctx)
 	if err != nil {
-		return ulid.ULID{}, errors.Wrap(err, "flush block writer")
+		return ulid.ULID{}, "", errors.Wrap(err, "flush block writer")
 	}
 
-	blockDir := filepath.Join(b.dataDir, blockID.String())
+	blockDir := filepath.Join(workDir, blockID.String())
 	level.Info(b.logger).Log(
 		"msg", "block created",
 		"block", blockID,
@@ -440,17 +682,17 @@ func (b *Backfiller) processWindow(ctx context.Context, groups []ruleGroup, wind
 		},
 	}
 	if _, err := metadata.InjectThanos(b.logger, blockDir, thanosMeta, nil); err != nil {
-		return ulid.ULID{}, errors.Wrap(err, "inject thanos metadata")
+		return ulid.ULID{}, "", errors.Wrap(err, "inject thanos metadata")
 	}
 
 	if b.dryRun {
 		level.Info(b.logger).Log("msg", "dry-run: block written locally, skipping upload", "block", blockID, "dir", blockDir)
-		return blockID, nil
+		return blockID, "", nil
 	}
 
-	// Upload to object storage.
-	if err := block.Upload(ctx, b.logger, b.bkt, blockDir, b.hashFunc); err != nil {
-		return ulid.ULID{}, errors.Wrap(err, "upload block")
+	// Upload to object storage with bounded retry + exponential backoff.
+	if err := b.uploadWithRetry(ctx, blockID, blockDir); err != nil {
+		return ulid.ULID{}, "", errors.Wrap(err, "upload block")
 	}
 	level.Info(b.logger).Log("msg", "block uploaded", "block", blockID)
 
@@ -459,17 +701,53 @@ func (b *Backfiller) processWindow(ctx context.Context, groups []ruleGroup, wind
 		level.Warn(b.logger).Log("msg", "failed to remove local block dir after upload", "dir", blockDir, "err", err)
 	}
 
-	return blockID, nil
+	return blockID, "", nil
 }
 
-// writeManifest writes a JSON manifest listing all uploaded block ULIDs to the bucket.
-func (b *Backfiller) writeManifest(ctx context.Context, blockIDs []ulid.ULID, startMs, endMs int64) error {
+// uploadWithRetry uploads a block directory with bounded exponential backoff.
+// Before each retry it checks whether the block's meta.json already exists in
+// the bucket (e.g. from a prior attempt that finished uploading but whose
+// response was lost) and treats that as success to avoid duplicate uploads.
+func (b *Backfiller) uploadWithRetry(ctx context.Context, blockID ulid.ULID, blockDir string) error {
+	metaKey := path.Join(blockID.String(), metadata.MetaFilename)
+	var lastErr error
+	for attempt := 0; attempt <= b.retryAttempts; attempt++ {
+		if attempt > 0 {
+			// Check if a prior attempt actually completed (eventual-consistency / lost response).
+			if exists, exErr := b.bkt.Exists(ctx, metaKey); exErr == nil && exists {
+				level.Info(b.logger).Log("msg", "block already exists in bucket, treating upload as success", "block", blockID)
+				return nil
+			}
+			backoff := time.Duration(1<<uint(attempt-1)) * time.Second // 1s, 2s, 4s, ...
+			level.Debug(b.logger).Log("msg", "retrying upload", "block", blockID, "attempt", attempt, "backoff", backoff)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+		lastErr = block.Upload(ctx, b.logger, b.bkt, blockDir, b.hashFunc)
+		if lastErr == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+	}
+	return errors.Wrapf(lastErr, "upload failed after %d attempts", b.retryAttempts+1)
+}
+
+// writeManifest writes a JSON manifest listing all uploaded block ULIDs and any
+// failed windows to the bucket. It is written even on partial failure so future
+// tooling (e.g. a resume subcommand) can inspect which windows still need work.
+func (b *Backfiller) writeManifest(ctx context.Context, blockIDs []ulid.ULID, startMs, endMs int64, failedWindows []failedWindow) error {
 	m := manifest{
-		Timestamp: time.Now().UTC(),
-		Blocks:    blockIDs,
-		Start:     startMs,
-		End:       endMs,
-		DryRun:    b.dryRun,
+		Timestamp:     time.Now().UTC(),
+		Blocks:        blockIDs,
+		Start:         startMs,
+		End:           endMs,
+		DryRun:        b.dryRun,
+		FailedWindows: failedWindows,
 	}
 
 	data, err := json.MarshalIndent(m, "", "  ")

@@ -50,6 +50,7 @@ type rulesBackfillConfig struct {
 	queryTimeout     time.Duration
 	retryAttempts    int
 	queryRateLimit   float64
+	concurrency      int
 	hashFunc         string
 	tenantHeader     string
 	tenantID         string
@@ -105,6 +106,9 @@ func registerRulesBackfill(app extkingpin.AppClause) {
 
 	cmd.Flag("query-rate-limit", "Maximum queries per second against the Query API.").
 		Default("10").Float64Var(&conf.queryRateLimit)
+
+	cmd.Flag("concurrency", "Number of block windows to process in parallel. The query rate limit is shared across workers.").
+		Default("1").IntVar(&conf.concurrency)
 
 	cmd.Flag("hash-func", "Hash function to use for block verification (e.g. SHA256). Empty means none.").
 		Default("").StringVar(&conf.hashFunc)
@@ -231,6 +235,8 @@ func registerRulesBackfill(app extkingpin.AppClause) {
 		opts = append(opts, rulesbackfill.WithDryRun(conf.dryRun))
 		opts = append(opts, rulesbackfill.WithHashFunc(hashFunc))
 		opts = append(opts, rulesbackfill.WithRateLimiter(rate.NewLimiter(rate.Limit(conf.queryRateLimit), 1)))
+		opts = append(opts, rulesbackfill.WithConcurrency(conf.concurrency))
+		opts = append(opts, rulesbackfill.WithRetryAttempts(conf.retryAttempts))
 
 		backfiller := rulesbackfill.New(logger, queryFunc, bkt, lset, conf.tmpDir, opts...)
 

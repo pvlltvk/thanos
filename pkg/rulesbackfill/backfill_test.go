@@ -4,18 +4,22 @@
 package rulesbackfill
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/efficientgo/core/testutil"
 	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/tsdb"
@@ -498,6 +502,7 @@ groups:
 		newTestLabels(),
 		t.TempDir(),
 		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+		WithDisablePreflight(true),
 	)
 	ids, err := b.Run(context.Background(), []string{ruleFile}, start, end)
 	testutil.Ok(t, err)
@@ -507,7 +512,12 @@ groups:
 	testutil.Equals(t, 2, callCount)
 }
 
-func TestRun_NoRecordingRules_ReturnsNil(t *testing.T) {
+// TestRun_NoRecordingRules_ReturnsError verifies that a rule file containing
+// only alerting rules (i.e. no recording rules) is treated as a configuration
+// error. Phase 2 upgraded this from a warn-and-continue to a hard error so the
+// operator discovers the mistake at preflight time rather than after waiting
+// for a long backfill to no-op.
+func TestRun_NoRecordingRules_ReturnsError(t *testing.T) {
 	t.Parallel()
 
 	alertOnlyYAML := `
@@ -528,8 +538,10 @@ groups:
 		t.TempDir(),
 	)
 	ids, err := b.Run(context.Background(), []string{ruleFile}, time.Unix(0, 0), time.Unix(7200, 0))
-	testutil.Ok(t, err)
-	testutil.Assert(t, len(ids) == 0, "expected no blocks for alert-only rule file")
+	testutil.NotOk(t, err)
+	testutil.Assert(t, strings.Contains(err.Error(), "no recording rules"),
+		"expected error to mention no recording rules, got: %v", err)
+	testutil.Equals(t, 0, len(ids))
 }
 
 // --- TestScanBucket ----------------------------------------------------------
@@ -683,7 +695,8 @@ func TestRunIdempotency_SkipsAlreadyCoveredWindows(t *testing.T) {
 	}
 
 	b := New(newTestLogger(), queryFunc, bkt, extLabels, dataDir,
-		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)))
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+		WithDisablePreflight(true))
 
 	// First run: should produce a block.
 	ids1, err := b.Run(context.Background(), []string{ruleFile}, start, end)
@@ -693,7 +706,8 @@ func TestRunIdempotency_SkipsAlreadyCoveredWindows(t *testing.T) {
 
 	// Second run: same params → should skip the already-covered window.
 	b2 := New(newTestLogger(), queryFunc, bkt, extLabels, t.TempDir(),
-		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)))
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+		WithDisablePreflight(true))
 	ids2, err := b2.Run(context.Background(), []string{ruleFile}, start, end)
 	testutil.Ok(t, err)
 	testutil.Equals(t, 0, len(ids2))
@@ -873,6 +887,7 @@ func TestRunContextCancellation_ReturnsPromptly(t *testing.T) {
 		newTestLabels(),
 		t.TempDir(),
 		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+		WithDisablePreflight(true),
 	)
 	_, err := b.Run(ctx, []string{ruleFile}, start, end)
 
@@ -1097,6 +1112,7 @@ groups:
 		newTestLabels(),
 		t.TempDir(),
 		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+		WithDisablePreflight(true),
 	)
 	ids, err := b.Run(context.Background(), []string{ruleFile}, start, end)
 	testutil.NotOk(t, err)
@@ -1194,6 +1210,7 @@ groups:
 		t.TempDir(),
 		WithEvalInterval(60*time.Second), // global default 60s
 		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+		WithDisablePreflight(true),
 	)
 	ids, err := b.Run(context.Background(), []string{ruleFile}, start, end)
 	testutil.Ok(t, err)
@@ -1278,6 +1295,7 @@ func TestRun_AdjacentWindowsDoNotOverlapAtBoundary(t *testing.T) {
 		newTestLabels(),
 		t.TempDir(),
 		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+		WithDisablePreflight(true),
 	)
 	ids, err := b.Run(context.Background(), []string{ruleFile}, start, end)
 	testutil.Ok(t, err)
@@ -1286,3 +1304,903 @@ func TestRun_AdjacentWindowsDoNotOverlapAtBoundary(t *testing.T) {
 	testutil.Assert(t, calls[0].end < calls[1].start,
 		"adjacent windows overlap: first [%d,%d], second [%d,%d]", calls[0].start, calls[0].end, calls[1].start, calls[1].end)
 }
+
+// =============================================================================
+// Phase 2 tests
+// =============================================================================
+
+// --- fake bucket helpers -----------------------------------------------------
+
+// countingUploadBucket wraps InMemBucket and counts Upload calls. It can be
+// configured to fail the first N uploads with a transient error.
+type countingUploadBucket struct {
+	*objstore.InMemBucket
+	mu           sync.Mutex
+	uploadCalls  int
+	failFirst    int // fail the first N Upload calls
+}
+
+func (b *countingUploadBucket) Upload(ctx context.Context, name string, r io.Reader, opts ...objstore.ObjectUploadOption) error {
+	b.mu.Lock()
+	b.uploadCalls++
+	shouldFail := b.uploadCalls <= b.failFirst
+	b.mu.Unlock()
+	if shouldFail {
+		// Drain the reader so it can be retried from the caller's buffer.
+		io.Copy(io.Discard, r) //nolint:errcheck
+		return fmt.Errorf("transient upload error (call %d)", b.uploadCalls)
+	}
+	return b.InMemBucket.Upload(ctx, name, r, opts...)
+}
+
+// alwaysFailBucket wraps InMemBucket and makes every Upload call fail.
+type alwaysFailBucket struct {
+	*objstore.InMemBucket
+	mu    sync.Mutex
+	calls int
+}
+
+func (b *alwaysFailBucket) Upload(_ context.Context, _ string, r io.Reader, _ ...objstore.ObjectUploadOption) error {
+	b.mu.Lock()
+	b.calls++
+	b.mu.Unlock()
+	io.Copy(io.Discard, r) //nolint:errcheck
+	return fmt.Errorf("permanent upload failure")
+}
+
+// iterErrorBucket wraps InMemBucket and makes Iter return an error.
+type iterErrorBucket struct {
+	*objstore.InMemBucket
+}
+
+func (b *iterErrorBucket) Iter(_ context.Context, _ string, _ func(string) error, _ ...objstore.IterOption) error {
+	return fmt.Errorf("bucket iter error: connection refused")
+}
+
+// bufferLogger returns a go-kit logger that writes to the provided buffer.
+// The buffer can then be inspected for expected log lines.
+func bufferLogger(buf *bytes.Buffer) log.Logger {
+	return log.NewLogfmtLogger(log.NewSyncWriter(buf))
+}
+
+// --- TestRun_Concurrency_ParallelExecution -----------------------------------
+
+// TestRun_Concurrency_ParallelExecution verifies that WithConcurrency(4) allows
+// at least 2 windows to be in-flight simultaneously. It uses an atomic counter
+// to track peak concurrency across the queryFunc invocations.
+func TestRun_Concurrency_ParallelExecution(t *testing.T) {
+	t.Parallel()
+
+	const numWindows = 10
+	const concurrency = 4
+	blockDur := 2 * time.Hour
+	start := time.Unix(0, 0).UTC()
+	end := start.Add(time.Duration(numWindows) * blockDur)
+
+	var (
+		inFlight    atomic.Int64
+		peakInFlight atomic.Int64
+	)
+
+	// gate is used to keep all goroutines inside queryFunc simultaneously so
+	// the scheduler has a chance to schedule multiple workers before any exits.
+	// Each worker sends to ready then waits for the gate to open.
+	ready := make(chan struct{}, numWindows)
+	gate := make(chan struct{})
+
+	queryFunc := func(ctx context.Context, _ string, startTime, _, _ int64) (model.Matrix, []string, error) {
+		cur := inFlight.Add(1)
+		defer inFlight.Add(-1)
+
+		// Record peak.
+		for {
+			old := peakInFlight.Load()
+			if cur <= old || peakInFlight.CompareAndSwap(old, cur) {
+				break
+			}
+		}
+
+		// Signal that this goroutine is inside queryFunc.
+		ready <- struct{}{}
+		// Wait until the gate opens (closed by the test goroutine once enough
+		// workers are inside).
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		}
+
+		ts := model.Time(startTime + 1)
+		return model.Matrix{
+			{
+				Metric: model.Metric{model.MetricNameLabel: "m"},
+				Values: []model.SamplePair{{Timestamp: ts, Value: 1.0}},
+			},
+		}, nil, nil
+	}
+
+	bkt := objstore.NewInMemBucket()
+	ruleFile := writeRuleFile(t, simpleRecordingRuleYAML)
+
+	b := New(
+		newTestLogger(),
+		queryFunc,
+		bkt,
+		newTestLabels(),
+		t.TempDir(),
+		WithConcurrency(concurrency),
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+		WithDisablePreflight(true),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() {
+		_, err := b.Run(ctx, []string{ruleFile}, start, end)
+		runDone <- err
+	}()
+
+	// Wait until at least 2 workers are inside queryFunc, then open the gate.
+	waited := 0
+	for waited < 2 {
+		select {
+		case <-ready:
+			waited++
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for workers to become concurrent")
+		}
+	}
+	close(gate)
+
+	// Drain remaining ready signals.
+	for i := waited; i < numWindows; i++ {
+		select {
+		case <-ready:
+		case <-ctx.Done():
+		}
+	}
+
+	err := <-runDone
+	testutil.Ok(t, err)
+
+	peak := peakInFlight.Load()
+	testutil.Assert(t, peak >= 2,
+		"expected peak concurrency >= 2, got %d", peak)
+	testutil.Assert(t, peak <= int64(concurrency),
+		"expected peak concurrency <= %d, got %d", concurrency, peak)
+}
+
+// --- TestRun_Concurrency_ErrorPropagation ------------------------------------
+
+// TestRun_Concurrency_ErrorPropagation verifies that when one window fails,
+// other windows still complete (errgroup workers return nil on per-window
+// errors, allowing the group to continue), and the returned error is non-nil.
+func TestRun_Concurrency_ErrorPropagation(t *testing.T) {
+	t.Parallel()
+
+	const numWindows = 5
+	blockDur := 2 * time.Hour
+	start := time.Unix(0, 0).UTC()
+	end := start.Add(time.Duration(numWindows) * blockDur)
+
+	// Windows at even indices succeed; odd indices fail.
+	var callIdx atomic.Int64
+	queryFunc := func(_ context.Context, _ string, startTime, _, _ int64) (model.Matrix, []string, error) {
+		idx := callIdx.Add(1)
+		if idx%2 == 0 {
+			return nil, nil, fmt.Errorf("injected failure for call %d", idx)
+		}
+		ts := model.Time(startTime + 1)
+		return model.Matrix{
+			{
+				Metric: model.Metric{model.MetricNameLabel: "m"},
+				Values: []model.SamplePair{{Timestamp: ts, Value: 1.0}},
+			},
+		}, nil, nil
+	}
+
+	bkt := objstore.NewInMemBucket()
+	ruleFile := writeRuleFile(t, simpleRecordingRuleYAML)
+
+	b := New(
+		newTestLogger(),
+		queryFunc,
+		bkt,
+		newTestLabels(),
+		t.TempDir(),
+		WithConcurrency(4),
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+		WithDisablePreflight(true),
+	)
+
+	ids, err := b.Run(context.Background(), []string{ruleFile}, start, end)
+
+	// Some windows failed, so err must be non-nil.
+	testutil.NotOk(t, err)
+	// Some windows succeeded, so we get at least one uploaded block.
+	testutil.Assert(t, len(ids) > 0,
+		"expected at least one successful block when only some windows fail, got 0")
+	// The number of uploaded blocks must be less than total windows.
+	testutil.Assert(t, len(ids) < numWindows,
+		"expected fewer uploaded blocks than total windows (%d), got %d", numWindows, len(ids))
+}
+
+// --- TestRun_Concurrency_ContextCancellation ---------------------------------
+
+// TestRun_Concurrency_ContextCancellation verifies that cancelling the context
+// mid-run causes Run to return with a context error.
+func TestRun_Concurrency_ContextCancellation(t *testing.T) {
+	t.Parallel()
+
+	const numWindows = 8
+	blockDur := 2 * time.Hour
+	start := time.Unix(0, 0).UTC()
+	end := start.Add(time.Duration(numWindows) * blockDur)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var called atomic.Int64
+	queryFunc := func(qCtx context.Context, _ string, startTime, _, _ int64) (model.Matrix, []string, error) {
+		n := called.Add(1)
+		if n >= 3 {
+			cancel()
+		}
+		// Block until context is cancelled so the cancellation can propagate.
+		select {
+		case <-qCtx.Done():
+			return nil, nil, qCtx.Err()
+		case <-time.After(5 * time.Second):
+		}
+		ts := model.Time(startTime + 1)
+		return model.Matrix{
+			{
+				Metric: model.Metric{model.MetricNameLabel: "m"},
+				Values: []model.SamplePair{{Timestamp: ts, Value: 1.0}},
+			},
+		}, nil, nil
+	}
+
+	bkt := objstore.NewInMemBucket()
+	ruleFile := writeRuleFile(t, simpleRecordingRuleYAML)
+
+	b := New(
+		newTestLogger(),
+		queryFunc,
+		bkt,
+		newTestLabels(),
+		t.TempDir(),
+		WithConcurrency(4),
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+		WithDisablePreflight(true),
+	)
+
+	_, err := b.Run(ctx, []string{ruleFile}, start, end)
+	testutil.Assert(t, err != nil, "expected non-nil error after context cancellation")
+	testutil.Assert(t,
+		strings.Contains(err.Error(), "context canceled") || strings.Contains(err.Error(), "canceled"),
+		"expected context canceled error, got: %v", err)
+	testutil.Assert(t, called.Load() < int64(numWindows),
+		"expected fewer than %d windows processed after cancellation, got %d", numWindows, called.Load())
+}
+
+// --- TestRun_Concurrency_WorkerScratchDirsCleanedUp --------------------------
+
+// TestRun_Concurrency_WorkerScratchDirsCleanedUp verifies that all per-window
+// worker scratch directories (w-*) are removed from dataDir after Run returns,
+// regardless of whether individual windows succeed or fail.
+func TestRun_Concurrency_WorkerScratchDirsCleanedUp(t *testing.T) {
+	t.Parallel()
+
+	const numWindows = 6
+	blockDur := 2 * time.Hour
+	start := time.Unix(0, 0).UTC()
+	end := start.Add(time.Duration(numWindows) * blockDur)
+
+	// Mix of successes and failures.
+	var callIdx atomic.Int64
+	queryFunc := func(_ context.Context, _ string, startTime, _, _ int64) (model.Matrix, []string, error) {
+		idx := callIdx.Add(1)
+		if idx == 3 {
+			return nil, nil, fmt.Errorf("injected failure")
+		}
+		ts := model.Time(startTime + 1)
+		return model.Matrix{
+			{
+				Metric: model.Metric{model.MetricNameLabel: "m"},
+				Values: []model.SamplePair{{Timestamp: ts, Value: 1.0}},
+			},
+		}, nil, nil
+	}
+
+	dataDir := t.TempDir()
+	bkt := objstore.NewInMemBucket()
+	ruleFile := writeRuleFile(t, simpleRecordingRuleYAML)
+
+	b := New(
+		newTestLogger(),
+		queryFunc,
+		bkt,
+		newTestLabels(),
+		dataDir,
+		WithConcurrency(4),
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+		WithDisablePreflight(true),
+	)
+
+	b.Run(context.Background(), []string{ruleFile}, start, end) //nolint:errcheck
+
+	// Verify no w-* directories remain.
+	entries, err := os.ReadDir(dataDir)
+	testutil.Ok(t, err)
+	for _, e := range entries {
+		testutil.Assert(t, !strings.HasPrefix(e.Name(), "w-"),
+			"expected no w-* scratch dir to remain in dataDir, found: %s", e.Name())
+	}
+}
+
+// --- TestUploadRetry_TransientFailureSucceeds ---------------------------------
+
+// TestUploadRetry_TransientFailureSucceeds verifies that uploadWithRetry
+// succeeds when the bucket fails the first two Upload calls then succeeds.
+func TestUploadRetry_TransientFailureSucceeds(t *testing.T) {
+	t.Parallel()
+
+	inner := objstore.NewInMemBucket()
+	bkt := &countingUploadBucket{InMemBucket: inner, failFirst: 2}
+	ruleFile := writeRuleFile(t, simpleRecordingRuleYAML)
+
+	start := time.Unix(0, 0).UTC()
+	end := start.Add(2 * time.Hour)
+
+	b := New(
+		newTestLogger(),
+		singleSampleQuery("test_metric", 1),
+		bkt,
+		newTestLabels(),
+		t.TempDir(),
+		WithRetryAttempts(3),
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+		WithDisablePreflight(true),
+	)
+
+	ids, err := b.Run(context.Background(), []string{ruleFile}, start, end)
+	testutil.Ok(t, err)
+	testutil.Equals(t, 1, len(ids))
+
+	// Must have attempted at least 3 Upload calls (2 failing + 1 succeeding).
+	bkt.mu.Lock()
+	calls := bkt.uploadCalls
+	bkt.mu.Unlock()
+	testutil.Assert(t, calls >= 3,
+		"expected >= 3 upload calls (2 failures + 1 success), got %d", calls)
+
+	// Block must be present in the underlying bucket.
+	testutil.Assert(t, countBucketBlocks(inner) >= 1, "expected block in bucket after retry success")
+}
+
+// --- TestUploadRetry_ExhaustAttempts -----------------------------------------
+
+// TestUploadRetry_ExhaustAttempts verifies that when all block-upload attempts
+// fail, uploadWithRetry exhausts its retries, the window is counted as failed,
+// and Run returns a non-nil error.
+//
+// block.Upload issues multiple Upload calls per attempt (one per block file).
+// It aborts on the first file error. We fail every upload call and count how
+// many times a ULID-prefixed (block file) path is attempted as the first file
+// in a new batch — which equals the number of block.Upload invocations, i.e.
+// retryAttempts+1.
+func TestUploadRetry_ExhaustAttempts(t *testing.T) {
+	t.Parallel()
+
+	inner := objstore.NewInMemBucket()
+
+	const retryAttempts = 2
+
+	// Track all Upload call paths so we can count how many block.Upload rounds
+	// occurred. Each round starts a new sequence of file uploads; since we fail
+	// every single Upload, each round consists of exactly one upload attempt
+	// before block.Upload aborts. So totalBlockUploadCalls == retryAttempts+1.
+	var totalBlockUploadCalls int
+	var mu sync.Mutex
+
+	interceptFunc := func(_ context.Context, name string, r io.Reader) error {
+		io.Copy(io.Discard, r) //nolint:errcheck
+		// Only count paths that belong to a block (ULID-prefixed), to exclude
+		// the manifest upload which also flows through this bucket.
+		parts := strings.SplitN(name, "/", 2)
+		if len(parts) == 2 {
+			if _, err := parsePossibleULID(parts[0]); err == nil {
+				mu.Lock()
+				totalBlockUploadCalls++
+				mu.Unlock()
+			}
+		}
+		return fmt.Errorf("permanent upload failure")
+	}
+
+	fakeBkt := &funcUploadBucket{Bucket: inner, upload: interceptFunc}
+	ruleFile := writeRuleFile(t, simpleRecordingRuleYAML)
+
+	start := time.Unix(0, 0).UTC()
+	end := start.Add(2 * time.Hour)
+
+	b := New(
+		newTestLogger(),
+		singleSampleQuery("test_metric", 1),
+		fakeBkt,
+		newTestLabels(),
+		t.TempDir(),
+		WithRetryAttempts(retryAttempts),
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+		WithDisablePreflight(true),
+	)
+
+	ids, err := b.Run(context.Background(), []string{ruleFile}, start, end)
+	testutil.NotOk(t, err)
+	testutil.Equals(t, 0, len(ids))
+
+	// Each block.Upload attempt uploads exactly 1 file before aborting on error.
+	// So total calls == retryAttempts+1.
+	mu.Lock()
+	got := totalBlockUploadCalls
+	mu.Unlock()
+	testutil.Equals(t, retryAttempts+1, got)
+}
+
+// --- TestUploadRetry_ShortCircuitIfAlreadyUploaded ---------------------------
+
+// TestUploadRetry_ShortCircuitIfAlreadyUploaded verifies that if meta.json is
+// already present in the bucket when a retry attempt checks (simulating a
+// server-acknowledged write whose response was lost), uploadWithRetry treats
+// the upload as successful without issuing a second block.Upload call.
+//
+// Strategy: intercept Upload calls. Let all block files in attempt 0 succeed
+// in inner (so meta.json lands in the bucket), but return an error at the end
+// of the attempt by failing on the LAST upload of the meta.json file — which
+// causes block.Upload to fail. On retry attempt 1, uploadWithRetry calls
+// bkt.Exists(metaKey) and finds it already present, so it short-circuits.
+// We count how many times block.Upload is invoked by tracking how many times
+// the meta.json upload path is reached; it must be exactly 1.
+func TestUploadRetry_ShortCircuitIfAlreadyUploaded(t *testing.T) {
+	t.Parallel()
+
+	ruleFile := writeRuleFile(t, simpleRecordingRuleYAML)
+	start := time.Unix(0, 0).UTC()
+	end := start.Add(2 * time.Hour)
+
+	inner := objstore.NewInMemBucket()
+
+	// metaUploadCount tracks how many times meta.json was attempted.
+	var metaUploadCount int
+	var mu sync.Mutex
+
+	interceptFunc := func(ctx context.Context, name string, r io.Reader) error {
+		data, _ := io.ReadAll(r)
+		// Always write into inner so Exists will find files there.
+		if writeErr := inner.Upload(ctx, name, bytes.NewReader(data)); writeErr != nil {
+			return writeErr
+		}
+		// For meta.json specifically: succeed the first time (so inner has it),
+		// but also count it. We do NOT fail here — we let all of attempt 0
+		// succeed at the inner level. Then we fail the entire block.Upload call
+		// by returning an error on the FIRST meta.json upload.
+		if strings.HasSuffix(name, "/"+metadata.MetaFilename) {
+			mu.Lock()
+			metaUploadCount++
+			n := metaUploadCount
+			mu.Unlock()
+			if n == 1 {
+				// Return error to simulate lost ACK. inner already has meta.json.
+				return fmt.Errorf("transient: server wrote but response lost")
+			}
+		}
+		return nil
+	}
+
+	fakeBucket := &funcUploadBucket{Bucket: inner, upload: interceptFunc}
+
+	b := New(
+		newTestLogger(),
+		singleSampleQuery("test_metric", 1),
+		fakeBucket,
+		newTestLabels(),
+		t.TempDir(),
+		WithRetryAttempts(2),
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+		WithDisablePreflight(true),
+	)
+
+	ids, err := b.Run(context.Background(), []string{ruleFile}, start, end)
+	testutil.Ok(t, err)
+	testutil.Equals(t, 1, len(ids))
+
+	// inner must contain the block from the first attempt's writes.
+	testutil.Assert(t, countBucketBlocks(inner) >= 1,
+		"expected block in inner bucket after short-circuit on already-uploaded detection")
+
+	// meta.json must have been attempted exactly once — the second attempt
+	// finds meta.json via Exists and does not call Upload again.
+	mu.Lock()
+	finalMetaCount := metaUploadCount
+	mu.Unlock()
+	testutil.Equals(t, 1, finalMetaCount)
+}
+
+// funcUploadBucket wraps a Bucket and overrides Upload with a custom function.
+type funcUploadBucket struct {
+	objstore.Bucket
+	upload func(ctx context.Context, name string, r io.Reader) error
+}
+
+func (f *funcUploadBucket) Upload(ctx context.Context, name string, r io.Reader, _ ...objstore.ObjectUploadOption) error {
+	return f.upload(ctx, name, r)
+}
+
+// --- TestUploadRetry_RespectsContextCancel -----------------------------------
+
+// TestUploadRetry_RespectsContextCancel verifies that cancelling the context
+// during the backoff sleep between upload retries causes uploadWithRetry to
+// return the context error promptly.
+func TestUploadRetry_RespectsContextCancel(t *testing.T) {
+	t.Parallel()
+
+	inner := objstore.NewInMemBucket()
+	// Always fail so we always hit the backoff path.
+	bkt := &alwaysFailBucket{InMemBucket: inner}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Cancel the context after a short delay, giving one Upload attempt time to
+	// start but cancelling before the first full retry backoff (1s) completes.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	ruleFile := writeRuleFile(t, simpleRecordingRuleYAML)
+	start := time.Unix(0, 0).UTC()
+	end := start.Add(2 * time.Hour)
+
+	b := New(
+		newTestLogger(),
+		singleSampleQuery("test_metric", 1),
+		bkt,
+		newTestLabels(),
+		t.TempDir(),
+		// Large retry count so we would definitely block in backoff.
+		WithRetryAttempts(10),
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+		WithDisablePreflight(true),
+	)
+
+	start2 := time.Now()
+	_, err := b.Run(ctx, []string{ruleFile}, start, end)
+	elapsed := time.Since(start2)
+
+	// Run must return an error and must not have waited for all retry backoffs
+	// (10 retries with exponential backoff would take > 1023s total).
+	testutil.Assert(t, err != nil, "expected error when context cancelled during retry backoff")
+	testutil.Assert(t, elapsed < 10*time.Second,
+		"Run should return promptly after context cancellation, took %v", elapsed)
+}
+
+// --- TestPreflight_QueryEndpointUnreachable ----------------------------------
+
+// TestPreflight_QueryEndpointUnreachable verifies that when the query endpoint
+// returns an error during preflight, Run returns early with a "preflight" error
+// and no block processing occurs.
+func TestPreflight_QueryEndpointUnreachable(t *testing.T) {
+	t.Parallel()
+
+	bkt := objstore.NewInMemBucket()
+	ruleFile := writeRuleFile(t, simpleRecordingRuleYAML)
+	start := time.Unix(0, 0).UTC()
+	end := start.Add(2 * time.Hour)
+
+	b := New(
+		newTestLogger(),
+		errorQuery(fmt.Errorf("connection refused")),
+		bkt,
+		newTestLabels(),
+		t.TempDir(),
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+		// Preflight is NOT disabled — we want it to run.
+	)
+
+	ids, err := b.Run(context.Background(), []string{ruleFile}, start, end)
+	testutil.NotOk(t, err)
+	testutil.Assert(t, strings.Contains(err.Error(), "preflight"),
+		"expected error to mention 'preflight', got: %v", err)
+	testutil.Equals(t, 0, len(ids))
+	testutil.Equals(t, 0, countBucketBlocks(bkt))
+}
+
+// --- TestPreflight_BucketUnreachable -----------------------------------------
+
+// TestPreflight_BucketUnreachable verifies that when the bucket's Iter call
+// fails during preflight (non-dry-run), Run returns a preflight error.
+func TestPreflight_BucketUnreachable(t *testing.T) {
+	t.Parallel()
+
+	bkt := &iterErrorBucket{InMemBucket: objstore.NewInMemBucket()}
+	ruleFile := writeRuleFile(t, simpleRecordingRuleYAML)
+	start := time.Unix(0, 0).UTC()
+	end := start.Add(2 * time.Hour)
+
+	// Query succeeds so preflight progresses past the query probe.
+	b := New(
+		newTestLogger(),
+		emptyQuery(),
+		bkt,
+		newTestLabels(),
+		t.TempDir(),
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+		// dryRun=false (default) so bucket check runs.
+	)
+
+	ids, err := b.Run(context.Background(), []string{ruleFile}, start, end)
+	testutil.NotOk(t, err)
+	testutil.Assert(t, strings.Contains(err.Error(), "preflight"),
+		"expected error to mention 'preflight', got: %v", err)
+	testutil.Equals(t, 0, len(ids))
+}
+
+// --- TestPreflight_DryRunSkipsBucketCheck ------------------------------------
+
+// TestPreflight_DryRunSkipsBucketCheck verifies that in dry-run mode the
+// preflight step does not attempt to call Iter on the bucket. We pass a bucket
+// whose Iter always errors; if Iter were called, the test would fail.
+func TestPreflight_DryRunSkipsBucketCheck(t *testing.T) {
+	t.Parallel()
+
+	// iterErrorBucket.Iter returns an error; if preflight calls it we will see
+	// the error bubble up.
+	bkt := &iterErrorBucket{InMemBucket: objstore.NewInMemBucket()}
+	ruleFile := writeRuleFile(t, simpleRecordingRuleYAML)
+	start := time.Unix(0, 0).UTC()
+	end := start.Add(2 * time.Hour)
+
+	b := New(
+		newTestLogger(),
+		singleSampleQuery("test_metric", 1),
+		bkt,
+		newTestLabels(),
+		t.TempDir(),
+		WithDryRun(true),
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+	)
+
+	// With dryRun=true the bucket check inside preflight is skipped. The only
+	// Iter call that could fire is the bucket scan; but in dry-run the bucket
+	// scan is also skipped (bkt is not nil but dryRun=true means the scan path
+	// takes the "bucket not configured" branch only when bkt==nil). Actually,
+	// bucket scan does run when bkt != nil even in dry-run — ScanBucket calls
+	// Iter. So we expect the scan to fail, but preflight itself must succeed.
+	// We test the narrower property: the preflight-specific "bucket not
+	// writable or unreachable" error path must NOT be triggered.
+	_, err := b.Run(context.Background(), []string{ruleFile}, start, end)
+	if err != nil {
+		testutil.Assert(t, !strings.Contains(err.Error(), "bucket not writable"),
+			"preflight should not check bucket writable in dry-run; got: %v", err)
+	}
+}
+
+// --- TestPreflight_DisablePreflightOption ------------------------------------
+
+// TestPreflight_DisablePreflightOption verifies that WithDisablePreflight(true)
+// bypasses the preflight step even when the query endpoint would normally fail.
+// Run must proceed past preflight (it will fail later in processWindow due to
+// the error query, but that is a per-window error, not a preflight error).
+func TestPreflight_DisablePreflightOption(t *testing.T) {
+	t.Parallel()
+
+	bkt := objstore.NewInMemBucket()
+	ruleFile := writeRuleFile(t, simpleRecordingRuleYAML)
+	start := time.Unix(0, 0).UTC()
+	end := start.Add(2 * time.Hour)
+
+	b := New(
+		newTestLogger(),
+		errorQuery(fmt.Errorf("query endpoint broken")),
+		bkt,
+		newTestLabels(),
+		t.TempDir(),
+		WithDisablePreflight(true),
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+	)
+
+	_, err := b.Run(context.Background(), []string{ruleFile}, start, end)
+
+	// Error must come from processWindow (query failure), not from preflight.
+	testutil.NotOk(t, err)
+	testutil.Assert(t, !strings.Contains(err.Error(), "preflight"),
+		"error should not mention 'preflight' when preflight is disabled; got: %v", err)
+}
+
+// --- TestRun_Summary_PartialFailureLogsFailedCount ---------------------------
+
+// TestRun_Summary_PartialFailureLogsFailedCount verifies that the final summary
+// log line emitted by Run includes the correct failed window count when some
+// windows fail.
+func TestRun_Summary_PartialFailureLogsFailedCount(t *testing.T) {
+	t.Parallel()
+
+	const numWindows = 5
+	const expectedFailed = 2
+	blockDur := 2 * time.Hour
+	start := time.Unix(0, 0).UTC()
+	end := start.Add(time.Duration(numWindows) * blockDur)
+
+	// Windows 2 and 4 (1-indexed) fail.
+	var callIdx atomic.Int64
+	queryFunc := func(_ context.Context, _ string, startTime, _, _ int64) (model.Matrix, []string, error) {
+		idx := callIdx.Add(1)
+		if idx == 2 || idx == 4 {
+			return nil, nil, fmt.Errorf("injected failure %d", idx)
+		}
+		ts := model.Time(startTime + 1)
+		return model.Matrix{
+			{
+				Metric: model.Metric{model.MetricNameLabel: "m"},
+				Values: []model.SamplePair{{Timestamp: ts, Value: 1.0}},
+			},
+		}, nil, nil
+	}
+
+	var buf bytes.Buffer
+	logger := bufferLogger(&buf)
+
+	bkt := objstore.NewInMemBucket()
+	ruleFile := writeRuleFile(t, simpleRecordingRuleYAML)
+
+	b := New(
+		logger,
+		queryFunc,
+		bkt,
+		newTestLabels(),
+		t.TempDir(),
+		WithConcurrency(1),
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+		WithDisablePreflight(true),
+	)
+
+	b.Run(context.Background(), []string{ruleFile}, start, end) //nolint:errcheck
+
+	logOutput := buf.String()
+
+	// The summary line must contain "windows_failed=2".
+	testutil.Assert(t,
+		strings.Contains(logOutput, fmt.Sprintf("windows_failed=%d", expectedFailed)),
+		"expected log to contain windows_failed=%d; log output:\n%s", expectedFailed, logOutput)
+
+	// The summary line must also report the correct total.
+	testutil.Assert(t,
+		strings.Contains(logOutput, fmt.Sprintf("windows_total=%d", numWindows)),
+		"expected log to contain windows_total=%d; log output:\n%s", numWindows, logOutput)
+}
+
+// --- TestRun_Manifest_IncludesFailedWindows ----------------------------------
+
+// TestRun_Manifest_IncludesFailedWindows verifies that on partial failure the
+// manifest JSON written to the bucket contains FailedWindows entries with
+// non-empty start/end fields.
+func TestRun_Manifest_IncludesFailedWindows(t *testing.T) {
+	t.Parallel()
+
+	const numWindows = 4
+	blockDur := 2 * time.Hour
+	start := time.Unix(0, 0).UTC()
+	end := start.Add(time.Duration(numWindows) * blockDur)
+
+	// Window 2 fails.
+	var callIdx atomic.Int64
+	queryFunc := func(_ context.Context, _ string, startTime, _, _ int64) (model.Matrix, []string, error) {
+		idx := callIdx.Add(1)
+		if idx == 2 {
+			return nil, nil, fmt.Errorf("injected failure")
+		}
+		ts := model.Time(startTime + 1)
+		return model.Matrix{
+			{
+				Metric: model.Metric{model.MetricNameLabel: "m"},
+				Values: []model.SamplePair{{Timestamp: ts, Value: 1.0}},
+			},
+		}, nil, nil
+	}
+
+	bkt := objstore.NewInMemBucket()
+	ruleFile := writeRuleFile(t, simpleRecordingRuleYAML)
+
+	b := New(
+		newTestLogger(),
+		queryFunc,
+		bkt,
+		newTestLabels(),
+		t.TempDir(),
+		WithConcurrency(1),
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+		WithDisablePreflight(true),
+	)
+
+	b.Run(context.Background(), []string{ruleFile}, start, end) //nolint:errcheck
+
+	// Find the manifest in the bucket.
+	var manifestData []byte
+	for key, data := range bkt.Objects() {
+		if strings.HasPrefix(key, manifestPrefix+"/") && strings.HasSuffix(key, ".json") {
+			manifestData = data
+			break
+		}
+	}
+	testutil.Assert(t, manifestData != nil, "expected manifest in bucket after partial failure")
+
+	var m manifest
+	testutil.Ok(t, json.Unmarshal(manifestData, &m))
+
+	testutil.Assert(t, len(m.FailedWindows) > 0,
+		"expected at least one entry in manifest.FailedWindows, got 0")
+
+	for _, fw := range m.FailedWindows {
+		testutil.Assert(t, fw.Start > 0 || fw.End > 0,
+			"expected non-zero start/end in failed window, got start=%d end=%d", fw.Start, fw.End)
+		testutil.Assert(t, fw.Error != "",
+			"expected non-empty error in failed window entry")
+	}
+
+	// Successful windows produce blocks; check those are also listed.
+	testutil.Assert(t, len(m.Blocks) > 0,
+		"expected at least one block in manifest alongside failed windows")
+}
+
+// --- TestRun_Manifest_WrittenEvenWithoutSuccessfulUploads --------------------
+
+// TestRun_Manifest_WrittenEvenWithoutSuccessfulUploads verifies that the
+// manifest is still written to the bucket when all windows fail, so that
+// future resume tooling can inspect which windows need reprocessing.
+func TestRun_Manifest_WrittenEvenWithoutSuccessfulUploads(t *testing.T) {
+	t.Parallel()
+
+	// Single window, always failing.
+	bkt := objstore.NewInMemBucket()
+	ruleFile := writeRuleFile(t, simpleRecordingRuleYAML)
+	start := time.Unix(0, 0).UTC()
+	end := start.Add(2 * time.Hour)
+
+	b := New(
+		newTestLogger(),
+		errorQuery(fmt.Errorf("all windows fail")),
+		bkt,
+		newTestLabels(),
+		t.TempDir(),
+		WithRateLimiter(rate.NewLimiter(rate.Inf, 1)),
+		WithDisablePreflight(true),
+	)
+
+	ids, err := b.Run(context.Background(), []string{ruleFile}, start, end)
+	testutil.NotOk(t, err)
+	testutil.Equals(t, 0, len(ids))
+
+	// Manifest must be present even though no blocks were uploaded.
+	var manifestData []byte
+	for key, data := range bkt.Objects() {
+		if strings.HasPrefix(key, manifestPrefix+"/") && strings.HasSuffix(key, ".json") {
+			manifestData = data
+			break
+		}
+	}
+	testutil.Assert(t, manifestData != nil,
+		"expected manifest in bucket even when all windows fail")
+
+	var m manifest
+	testutil.Ok(t, json.Unmarshal(manifestData, &m))
+	testutil.Equals(t, 0, len(m.Blocks))
+	testutil.Assert(t, len(m.FailedWindows) > 0,
+		"expected FailedWindows in manifest when all windows fail, got 0")
+}
+
+// --- Unused import suppression -----------------------------------------------
+// level is imported to enable the bufferLogger helper; this var prevents the
+// compiler from complaining if no other test in this file references it directly.
+var _ = level.Debug
