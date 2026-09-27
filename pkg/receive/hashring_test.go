@@ -6,6 +6,7 @@ package receive
 import (
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"testing"
 
@@ -1059,4 +1060,85 @@ func compareNodeSets(before, after map[string]struct{}) (added, removed []string
 		}
 	}
 	return
+}
+
+func TestHashringHashIgnoredLabel(t *testing.T) {
+	t.Parallel()
+
+	const replicaLabel = "prometheus_replica"
+	endpoints := make([]Endpoint, 0, 6)
+	for i := range 6 {
+		endpoints = append(endpoints, Endpoint{Address: fmt.Sprintf("node-%d", i)})
+	}
+
+	for _, tc := range []struct {
+		name      string
+		algorithm HashringAlgorithm
+		cfg       HashringConfig
+	}{
+		{
+			name:      "hashmod",
+			algorithm: AlgorithmHashmod,
+			cfg:       HashringConfig{Endpoints: endpoints},
+		},
+		{
+			name:      "ketama",
+			algorithm: AlgorithmKetama,
+			cfg:       HashringConfig{Endpoints: endpoints},
+		},
+		{
+			name:      "ketama with shuffle sharding",
+			algorithm: AlgorithmKetama,
+			cfg: HashringConfig{
+				Endpoints:             endpoints,
+				ShuffleShardingConfig: ShuffleShardingConfig{ShardSize: 4, ZoneAwarenessDisabled: true},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const replicationFactor = 2
+
+			cfg := []HashringConfig{tc.cfg}
+			plain, err := NewMultiHashring(tc.algorithm, replicationFactor, cfg, prometheus.NewRegistry())
+			require.NoError(t, err)
+			ignoring, err := NewMultiHashring(tc.algorithm, replicationFactor, cfg, prometheus.NewRegistry(), WithHashIgnoredLabel(replicaLabel))
+			require.NoError(t, err)
+
+			var differentWithoutIgnore int
+			for i := range 1000 {
+				lbls := []labelpb.ZLabel{
+					{Name: "__name__", Value: "up"},
+					{Name: "instance", Value: fmt.Sprintf("host-%d", i)},
+				}
+				replica0 := &prompb.TimeSeries{Labels: append(slices.Clone(lbls), labelpb.ZLabel{Name: replicaLabel, Value: "prometheus-0"})}
+				replica1 := &prompb.TimeSeries{Labels: append(slices.Clone(lbls), labelpb.ZLabel{Name: replicaLabel, Value: "prometheus-1"})}
+				withoutLabel := &prompb.TimeSeries{Labels: lbls}
+
+				for n := range uint64(replicationFactor) {
+					e0, err := ignoring.GetN("tenant", replica0, n)
+					require.NoError(t, err)
+					e1, err := ignoring.GetN("tenant", replica1, n)
+					require.NoError(t, err)
+					require.Equal(t, e0, e1)
+
+					// Series without the label are routed exactly as without the option.
+					expected, err := plain.GetN("tenant", withoutLabel, n)
+					require.NoError(t, err)
+					actual, err := ignoring.GetN("tenant", withoutLabel, n)
+					require.NoError(t, err)
+					require.Equal(t, expected, actual)
+					require.Equal(t, expected, e0)
+
+					p0, err := plain.GetN("tenant", replica0, n)
+					require.NoError(t, err)
+					p1, err := plain.GetN("tenant", replica1, n)
+					require.NoError(t, err)
+					if p0 != p1 {
+						differentWithoutIgnore++
+					}
+				}
+			}
+			require.Positive(t, differentWithoutIgnore)
+		})
+	}
 }

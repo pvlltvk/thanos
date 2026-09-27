@@ -87,12 +87,38 @@ func (s SingleNodeHashring) GetN(_ string, _ *prompb.TimeSeries, n uint64) (Endp
 	}, nil
 }
 
+// HashringOption is a functional option for hashrings.
+type HashringOption func(o *hashringOptions)
+
+type hashringOptions struct {
+	hashIgnoredLabel string
+}
+
+// WithHashIgnoredLabel makes hashrings ignore the given label when hashing series, so that
+// series differing only by this label are routed to the same endpoints.
+func WithHashIgnoredLabel(name string) HashringOption {
+	return func(o *hashringOptions) {
+		o.hashIgnoredLabel = name
+	}
+}
+
+func applyHashringOptions(opts []HashringOption) hashringOptions {
+	var o hashringOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return o
+}
+
 // simpleHashring represents a group of nodes handling write requests by hashmoding individual series.
-type simpleHashring []Endpoint
+type simpleHashring struct {
+	endpoints        []Endpoint
+	hashIgnoredLabel string
+}
 
 func (s simpleHashring) Close() {}
 
-func newSimpleHashring(endpoints []Endpoint) (Hashring, error) {
+func newSimpleHashring(endpoints []Endpoint, opts ...HashringOption) (Hashring, error) {
 	for i := range endpoints {
 		if endpoints[i].AZ != "" {
 			return nil, errors.New("Hashmod algorithm does not support AZ aware hashring configuration. Either use Ketama or remove AZ configuration.")
@@ -102,11 +128,14 @@ func newSimpleHashring(endpoints []Endpoint) (Hashring, error) {
 		return strings.Compare(a.Address, b.Address)
 	})
 
-	return simpleHashring(endpoints), nil
+	return simpleHashring{
+		endpoints:        endpoints,
+		hashIgnoredLabel: applyHashringOptions(opts).hashIgnoredLabel,
+	}, nil
 }
 
 func (s simpleHashring) Nodes() []Endpoint {
-	return s
+	return s.endpoints
 }
 
 // Get returns a target to handle the given tenant and time series.
@@ -116,11 +145,11 @@ func (s simpleHashring) Get(tenant string, ts *prompb.TimeSeries) (Endpoint, err
 
 // GetN returns the nth target to handle the given tenant and time series.
 func (s simpleHashring) GetN(tenant string, ts *prompb.TimeSeries, n uint64) (Endpoint, error) {
-	if n >= uint64(len(s)) {
-		return Endpoint{}, &insufficientNodesError{have: uint64(len(s)), want: n + 1}
+	if n >= uint64(len(s.endpoints)) {
+		return Endpoint{}, &insufficientNodesError{have: uint64(len(s.endpoints)), want: n + 1}
 	}
 
-	return s[(labelpb.HashWithPrefix(tenant, ts.Labels)+n)%uint64(len(s))], nil
+	return s.endpoints[(labelpb.HashWithPrefixIgnoring(tenant, ts.Labels, s.hashIgnoredLabel)+n)%uint64(len(s.endpoints))], nil
 }
 
 type section struct {
@@ -139,14 +168,15 @@ func (p sections) Sort()              { sort.Sort(p) }
 
 // ketamaHashring represents a group of nodes handling write requests with consistent hashing.
 type ketamaHashring struct {
-	endpoints    []Endpoint
-	sections     sections
-	numEndpoints uint64
+	endpoints        []Endpoint
+	sections         sections
+	numEndpoints     uint64
+	hashIgnoredLabel string
 }
 
 func (s ketamaHashring) Close() {}
 
-func newKetamaHashring(endpoints []Endpoint, sectionsPerNode int, replicationFactor uint64) (*ketamaHashring, error) {
+func newKetamaHashring(endpoints []Endpoint, sectionsPerNode int, replicationFactor uint64, opts ...HashringOption) (*ketamaHashring, error) {
 	numSections := len(endpoints) * sectionsPerNode
 
 	if len(endpoints) < int(replicationFactor) {
@@ -176,9 +206,10 @@ func newKetamaHashring(endpoints []Endpoint, sectionsPerNode int, replicationFac
 	calculateSectionReplicas(ringSections, replicationFactor, availabilityZones)
 
 	return &ketamaHashring{
-		endpoints:    endpoints,
-		sections:     ringSections,
-		numEndpoints: uint64(len(endpoints)),
+		endpoints:        endpoints,
+		sections:         ringSections,
+		numEndpoints:     uint64(len(endpoints)),
+		hashIgnoredLabel: applyHashringOptions(opts).hashIgnoredLabel,
 	}, nil
 }
 
@@ -233,7 +264,7 @@ func (c ketamaHashring) GetN(tenant string, ts *prompb.TimeSeries, n uint64) (En
 		return Endpoint{}, &insufficientNodesError{have: c.numEndpoints, want: n + 1}
 	}
 
-	v := labelpb.HashWithPrefix(tenant, ts.Labels)
+	v := labelpb.HashWithPrefixIgnoring(tenant, ts.Labels, c.hashIgnoredLabel)
 
 	var i uint64
 	i = uint64(sort.Search(len(c.sections), func(i int) bool {
@@ -676,7 +707,7 @@ func (s *shuffleShardHashring) getTenantShard(tenant string) (*ketamaHashring, e
 		}
 	}
 
-	return newKetamaHashring(finalNodes, SectionsPerNode, s.replicationFactor)
+	return newKetamaHashring(finalNodes, SectionsPerNode, s.replicationFactor, WithHashIgnoredLabel(baseRing.hashIgnoredLabel))
 }
 
 // GetN returns the nth endpoint for a tenant and time series, respecting the shuffle sharding.
@@ -693,7 +724,7 @@ func (s *shuffleShardHashring) GetN(tenant string, ts *prompb.TimeSeries, n uint
 // groups.
 // Which hashring to use for a tenant is determined
 // by the tenants field of the hashring configuration.
-func NewMultiHashring(algorithm HashringAlgorithm, replicationFactor uint64, cfg []HashringConfig, reg prometheus.Registerer) (Hashring, error) {
+func NewMultiHashring(algorithm HashringAlgorithm, replicationFactor uint64, cfg []HashringConfig, reg prometheus.Registerer, opts ...HashringOption) (Hashring, error) {
 	m := &multiHashring{
 		cache: make(map[string]Hashring),
 	}
@@ -705,7 +736,7 @@ func NewMultiHashring(algorithm HashringAlgorithm, replicationFactor uint64, cfg
 		if h.Algorithm != "" {
 			activeAlgorithm = h.Algorithm
 		}
-		hashring, err = newHashring(activeAlgorithm, h.Endpoints, replicationFactor, h.Hashring, h.Tenants, h.ShuffleShardingConfig, reg)
+		hashring, err = newHashring(activeAlgorithm, h.Endpoints, replicationFactor, h.Hashring, h.Tenants, h.ShuffleShardingConfig, reg, opts...)
 		if err != nil {
 			return nil, err
 		}
@@ -726,11 +757,11 @@ func NewMultiHashring(algorithm HashringAlgorithm, replicationFactor uint64, cfg
 	return m, nil
 }
 
-func newHashring(algorithm HashringAlgorithm, endpoints []Endpoint, replicationFactor uint64, hashring string, tenants []string, shuffleShardingConfig ShuffleShardingConfig, reg prometheus.Registerer) (Hashring, error) {
+func newHashring(algorithm HashringAlgorithm, endpoints []Endpoint, replicationFactor uint64, hashring string, tenants []string, shuffleShardingConfig ShuffleShardingConfig, reg prometheus.Registerer, opts ...HashringOption) (Hashring, error) {
 
 	switch algorithm {
 	case AlgorithmHashmod:
-		ringImpl, err := newSimpleHashring(endpoints)
+		ringImpl, err := newSimpleHashring(endpoints, opts...)
 		if err != nil {
 			return nil, err
 		}
@@ -739,7 +770,7 @@ func newHashring(algorithm HashringAlgorithm, endpoints []Endpoint, replicationF
 		}
 		return ringImpl, nil
 	case AlgorithmKetama:
-		ringImpl, err := newKetamaHashring(endpoints, SectionsPerNode, replicationFactor)
+		ringImpl, err := newKetamaHashring(endpoints, SectionsPerNode, replicationFactor, opts...)
 		if err != nil {
 			return nil, err
 		}
@@ -758,6 +789,6 @@ func newHashring(algorithm HashringAlgorithm, endpoints []Endpoint, replicationF
 		if shuffleShardingConfig.ShardSize > 0 {
 			return nil, fmt.Errorf("hashmod algorithm does not support shuffle sharding. Either use Ketama or remove shuffle sharding configuration")
 		}
-		return newSimpleHashring(endpoints)
+		return newSimpleHashring(endpoints, opts...)
 	}
 }

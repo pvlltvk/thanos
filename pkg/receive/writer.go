@@ -14,6 +14,7 @@ import (
 	"github.com/prometheus/prometheus/model/exemplar"
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 
@@ -96,6 +97,7 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq []prompb.TimeS
 		tooFarInFuture: r.opts.TooFarInFutureTimeWindow,
 		Appender:       app,
 	}
+	dedup := newHADedupWriter(r.multiTSDB, tenantID)
 
 	for _, t := range wreq {
 		// Check if time series labels are valid. If not, skip the time series
@@ -106,7 +108,8 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq []prompb.TimeS
 			continue
 		}
 
-		lset := labelpb.ZLabelsToPromLabels(t.Labels)
+		zlbls, dedupSeries := dedup.prepare(t.Labels, false)
+		lset := labelpb.ZLabelsToPromLabels(zlbls)
 
 		// Check if the TSDB has cached reference for those labels.
 		ref, lset = getRef.GetRef(lset, lset.Hash())
@@ -116,18 +119,25 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq []prompb.TimeS
 			// Do the reallocation here instead of one level higher because this ensures that we
 			// do _not_ intern all strings even if they are already exist. This is a high likelihood
 			// that this is the case because new series are created much rarer.
-			lbls := append([]labelpb.ZLabel(nil), t.Labels...)
+			lbls := append([]labelpb.ZLabel(nil), zlbls...)
 			labelpb.ReAllocZLabelsStrings(&lbls)
 			lset = labelpb.ZLabelsToPromLabels(lbls)
 		}
 
 		// Append as many valid samples as possible, but keep track of the errors.
 		for _, s := range t.Samples {
+			if !dedupSeries.accept(ref, s.Timestamp, value.IsStaleNaN(s.Value)) {
+				continue
+			}
 			ref, err = app.Append(ref, lset, s.Timestamp, s.Value)
+			dedupSeries.appended(ref)
 			errorTracker.addSampleError(err, tLogger, lset, s.Timestamp, s.Value)
 		}
 
 		for _, hp := range t.Histograms {
+			if !dedupSeries.accept(ref, hp.Timestamp, value.IsStaleNaN(hp.Sum)) {
+				continue
+			}
 			var (
 				h  *histogram.Histogram
 				fh *histogram.FloatHistogram
@@ -140,12 +150,13 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq []prompb.TimeS
 			}
 
 			ref, err = app.AppendHistogram(ref, lset, hp.Timestamp, h, fh)
+			dedupSeries.appended(ref)
 			errorTracker.addHistogramError(err, tLogger, lset, hp.Timestamp)
 		}
 
 		// Current implementation of app.AppendExemplar doesn't create a new series, so it must be already present.
 		// We drop the exemplars in case the series doesn't exist.
-		if ref != 0 && len(t.Exemplars) > 0 {
+		if ref != 0 && len(t.Exemplars) > 0 && dedupSeries.acceptExemplars(ref) {
 			for _, ex := range t.Exemplars {
 				labelpb.ReAllocZLabelsStrings(&ex.Labels)
 				exLset := labelpb.ZLabelsToPromLabels(ex.Labels)

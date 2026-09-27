@@ -485,6 +485,50 @@ func TestHashWithPrefix(t *testing.T) {
 	testutil.Assert(t, HashWithPrefix("a", lbls) != HashWithPrefix("b", lbls))
 }
 
+func TestHashWithPrefixIgnoring(t *testing.T) {
+	bigValue := strings.Repeat("abcdefghij", 200)
+	for _, tcase := range []struct {
+		name string
+		lbls []ZLabel
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name: "small",
+			lbls: []ZLabel{{Name: "__name__", Value: "up"}, {Name: "job", Value: "node"}},
+		},
+		{
+			name: "over 1KB",
+			lbls: []ZLabel{{Name: "__name__", Value: "up"}, {Name: "a", Value: bigValue}, {Name: "job", Value: "node"}},
+		},
+	} {
+		t.Run(tcase.name, func(t *testing.T) {
+			testutil.Equals(t, HashWithPrefix("a", tcase.lbls), HashWithPrefixIgnoring("a", tcase.lbls, "replica"))
+			testutil.Equals(t, HashWithPrefix("a", tcase.lbls), HashWithPrefixIgnoring("a", tcase.lbls, ""))
+
+			for _, pos := range []int{0, len(tcase.lbls) / 2, len(tcase.lbls)} {
+				withReplica := make([]ZLabel, 0, len(tcase.lbls)+1)
+				withReplica = append(withReplica, tcase.lbls[:pos]...)
+				withReplica = append(withReplica, ZLabel{Name: "replica", Value: "prometheus-0"})
+				withReplica = append(withReplica, tcase.lbls[pos:]...)
+
+				otherReplica := DeepCopy(withReplica)
+				otherReplica[pos].Value = "prometheus-1"
+
+				testutil.Equals(t, HashWithPrefix("a", tcase.lbls), HashWithPrefixIgnoring("a", withReplica, "replica"))
+				testutil.Equals(t, HashWithPrefixIgnoring("a", withReplica, "replica"), HashWithPrefixIgnoring("a", otherReplica, "replica"))
+				testutil.Assert(t, HashWithPrefix("a", withReplica) != HashWithPrefix("a", otherReplica))
+			}
+		})
+	}
+
+	lbls := []ZLabel{{Name: "__name__", Value: "up"}, {Name: "replica", Value: "prometheus-0"}}
+	testutil.Equals(t, 0.0, testing.AllocsPerRun(100, func() {
+		benchmarkLabelsResult = HashWithPrefixIgnoring("a", lbls, "replica")
+	}))
+}
+
 var benchmarkLabelsResult uint64
 
 func BenchmarkHasWithPrefix(b *testing.B) {
@@ -536,6 +580,18 @@ func BenchmarkHasWithPrefix(b *testing.B) {
 			b.ResetTimer()
 			for b.Loop() {
 				h = HashWithPrefix(prefix, tcase.lbls)
+			}
+			benchmarkLabelsResult = h
+		})
+		b.Run(tcase.name+" ignoring label", func(b *testing.B) {
+			var h uint64
+
+			const prefix = "test-"
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				h = HashWithPrefixIgnoring(prefix, tcase.lbls, "prometheus_replica")
 			}
 			benchmarkLabelsResult = h
 		})

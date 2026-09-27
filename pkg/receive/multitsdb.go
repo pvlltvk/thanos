@@ -39,6 +39,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/info/infopb"
 	"github.com/thanos-io/thanos/pkg/logutil"
 	"github.com/thanos-io/thanos/pkg/receive/expandedpostingscache"
+	"github.com/thanos-io/thanos/pkg/receive/hadedup"
 	"github.com/thanos-io/thanos/pkg/shipper"
 	"github.com/thanos-io/thanos/pkg/store"
 	storecache "github.com/thanos-io/thanos/pkg/store/cache"
@@ -82,6 +83,8 @@ type MultiTSDB struct {
 	initSingleFlight singleflight.Group
 
 	gcImmediately bool
+
+	haDedupConfig *hadedup.Config
 }
 
 // MultiTSDBOption is a functional option for MultiTSDB.
@@ -121,6 +124,13 @@ func WithMatchersCache(cache storecache.MatchersCache) MultiTSDBOption {
 func WithUploadConcurrency(concurrency int) MultiTSDBOption {
 	return func(s *MultiTSDB) {
 		s.uploadConcurrency = concurrency
+	}
+}
+
+// WithHADedup enables deduplication of samples written by HA Prometheus replicas.
+func WithHADedup(cfg hadedup.Config) MultiTSDBOption {
+	return func(s *MultiTSDB) {
+		s.haDedupConfig = &cfg
 	}
 }
 
@@ -336,6 +346,8 @@ type tenant struct {
 	maxBlockDuration int64
 
 	lastSuccessfulHeadCompaction atomic.Int64
+
+	haDedup *hadedup.Tracker
 }
 
 // shouldBeMarkedInactive checks if the tenant should be marked as inactive / read-only.
@@ -527,6 +539,48 @@ func (t *tenant) startPeriodicUploader() {
 				if err := doIter(); err != nil {
 					level.Error(t.logger).Log("msg", "periodic upload failed", "err", err)
 				}
+			case <-t.doneC:
+				return
+			}
+		}
+	}()
+}
+
+const haDedupGCInterval = time.Minute
+
+// haDedupTracker returns the tenant's HA dedup tracker, creating it on first use.
+// It returns nil if the tenant's TSDB is not running.
+func (t *tenant) haDedupTracker(cfg hadedup.Config) *hadedup.Tracker {
+	t.mtx.RLock()
+	tracker := t.haDedup
+	t.mtx.RUnlock()
+	if tracker != nil {
+		return tracker
+	}
+
+	t.mtx.Lock()
+	defer t.mtx.Unlock()
+	if t.haDedup != nil {
+		return t.haDedup
+	}
+	if t.reg == nil {
+		return nil
+	}
+	t.haDedup = hadedup.NewTracker(cfg, t.reg)
+	t.startPeriodicHADedupGC(t.haDedup)
+	return t.haDedup
+}
+
+func (t *tenant) startPeriodicHADedupGC(tracker *hadedup.Tracker) {
+	go func() {
+		ticker := time.NewTicker(haDedupGCInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				removed := tracker.GC()
+				level.Debug(t.logger).Log("msg", "garbage collected HA dedup state", "removed_series", removed)
 			case <-t.doneC:
 				return
 			}
@@ -1077,6 +1131,21 @@ func (t *MultiTSDB) TenantAppendable(tenantID string) (Appendable, error) {
 		return nil, err
 	}
 	return tenant.readyStorage(), nil
+}
+
+// TenantHADedupTracker returns the HA dedup tracker of the given tenant, or nil if HA deduplication is disabled.
+func (t *MultiTSDB) TenantHADedupTracker(tenantID string) *hadedup.Tracker {
+	if t.haDedupConfig == nil {
+		return nil
+	}
+
+	t.mtx.RLock()
+	tenant, ok := t.tenants[tenantID]
+	t.mtx.RUnlock()
+	if !ok {
+		return nil
+	}
+	return tenant.haDedupTracker(*t.haDedupConfig)
 }
 
 func (t *MultiTSDB) SetHashringConfig(cfg []HashringConfig) error {

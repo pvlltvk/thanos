@@ -710,5 +710,38 @@ Flags:
                                  Fraction of the backoff duration to use as
                                  random jitter for the Retry-After header (e.g.
                                  0.5 = ±50%).
+      --receive.ha-dedup.replica-label=""
+                                 [EXPERIMENTAL] Label name identifying HA
+                                 Prometheus replicas that write identical
+                                 series. If set, routers hash series ignoring
+                                 this label and ingestors keep samples of only
+                                 one replica per series and strip the label.
+                                 Must be set to the same value on routers and
+                                 ingestors. Empty disables HA deduplication.
+      --receive.ha-dedup.failover-intervals=1.5
+                                 [EXPERIMENTAL] Number of the series' learned
+                                 sample intervals without samples from the
+                                 owning replica after which another replica
+                                 takes the series over. Must be greater than 1.
+      --receive.ha-dedup.min-failover-timeout=10s
+                                 [EXPERIMENTAL] Lower bound of the per-series HA
+                                 failover timeout.
+      --receive.ha-dedup.max-failover-timeout=5m
+                                 [EXPERIMENTAL] Upper bound of the per-series HA
+                                 failover timeout.
+      --receive.ha-dedup.default-failover-timeout=60s
+                                 [EXPERIMENTAL] HA failover timeout used until
+                                 the sample interval of a series has been
+                                 learned.
+      --receive.ha-dedup.max-replicas-per-tenant=1024
+                                 [EXPERIMENTAL] Maximum number of distinct
+                                 replica label values tracked per tenant.
+                                 Series of further replicas are written without
+                                 deduplication.
+      --receive.ha-dedup.state-ttl=0s
+                                 [EXPERIMENTAL] How long HA dedup state of
+                                 a series is kept after its newest sample,
+                                 relative to the newest sample of the tenant.
+                                 0s means max-failover-timeout + 10m.
 
 ```

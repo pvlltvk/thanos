@@ -13,6 +13,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/model/exemplar"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 
@@ -69,6 +70,7 @@ func (r *CapNProtoWriter) Write(ctx context.Context, wreq *writecapnp.Request) e
 	var (
 		series  writecapnp.Series
 		builder labels.ScratchBuilder
+		dedup   = newHADedupWriter(r.multiTSDB, wreq.Tenant)
 	)
 	for wreq.Next() {
 		if err := wreq.At(&series); err != nil {
@@ -82,6 +84,9 @@ func (r *CapNProtoWriter) Write(ctx context.Context, wreq *writecapnp.Request) e
 			errorTracker.addLabelsError(err, lset, tLogger)
 			continue
 		}
+
+		zlbls, dedupSeries := dedup.prepare(labelpb.ZLabelsFromPromLabels(series.Labels), true)
+		series.Labels = labelpb.ZLabelsToPromLabels(zlbls)
 
 		var lset labels.Labels
 		// Check if the TSDB has cached reference for those labels.
@@ -99,18 +104,26 @@ func (r *CapNProtoWriter) Write(ctx context.Context, wreq *writecapnp.Request) e
 
 		// Append as many valid samples as possible, but keep track of the errors.
 		for _, s := range series.Samples {
+			if !dedupSeries.accept(ref, s.Timestamp, value.IsStaleNaN(s.Value)) {
+				continue
+			}
 			ref, err = app.Append(ref, lset, s.Timestamp, s.Value)
+			dedupSeries.appended(ref)
 			errorTracker.addSampleError(err, tLogger, lset, s.Timestamp, s.Value)
 		}
 
 		for _, hp := range series.Histograms {
+			if !dedupSeries.accept(ref, hp.Timestamp, isStaleHistogram(hp.Histogram, hp.FloatHistogram)) {
+				continue
+			}
 			ref, err = app.AppendHistogram(ref, lset, hp.Timestamp, hp.Histogram, hp.FloatHistogram)
+			dedupSeries.appended(ref)
 			errorTracker.addHistogramError(err, tLogger, lset, hp.Timestamp)
 		}
 
 		// Current implementation of app.AppendExemplar doesn't create a new series, so it must be already present.
 		// We drop the exemplars in case the series doesn't exist.
-		if ref != 0 && len(series.Exemplars) > 0 {
+		if ref != 0 && len(series.Exemplars) > 0 && dedupSeries.acceptExemplars(ref) {
 			for _, ex := range series.Exemplars {
 				exLogger := log.With(tLogger, "exemplarLset", ex.Labels)
 

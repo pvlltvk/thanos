@@ -46,6 +46,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/logging"
 	"github.com/thanos-io/thanos/pkg/prober"
 	"github.com/thanos-io/thanos/pkg/receive"
+	"github.com/thanos-io/thanos/pkg/receive/hadedup"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	grpcserver "github.com/thanos-io/thanos/pkg/server/grpc"
 	httpserver "github.com/thanos-io/thanos/pkg/server/http"
@@ -80,6 +81,20 @@ func registerReceive(app *extkingpin.App) {
 		}
 		if lset.Len() == 0 {
 			return errors.New("no external labels configured for receive, uniquely identifying external labels must be configured (ideally with `receive_` prefix); see https://thanos.io/tip/thanos/storage.md#external-labels for details.")
+		}
+		if conf.haDedupReplicaLabel != "" {
+			if !model.UTF8Validation.IsValidLabelName(conf.haDedupReplicaLabel) {
+				return errors.Errorf("unsupported format for HA dedup replica label name, got %s", conf.haDedupReplicaLabel)
+			}
+			if lset.Has(conf.haDedupReplicaLabel) || conf.haDedupReplicaLabel == conf.tenantLabelName {
+				return errors.Errorf("HA dedup replica label %s must differ from the external labels of receive", conf.haDedupReplicaLabel)
+			}
+			if conf.haDedupReplicaLabel == conf.splitTenantLabelName {
+				return errors.Errorf("HA dedup replica label %s must differ from the split tenant label", conf.haDedupReplicaLabel)
+			}
+			if err := conf.haDedupConfig().Validate(); err != nil {
+				return errors.Wrap(err, "invalid HA dedup configuration")
+			}
 		}
 
 		grpcLogOpts, logFilterMethods, err := logging.ParsegRPCOptions(conf.reqLogConfig)
@@ -238,6 +253,10 @@ func runReceive(
 	}
 
 	multiTSDBOptions = append(multiTSDBOptions, receive.WithUploadConcurrency(conf.uploadConcurrency))
+	if conf.haDedupReplicaLabel != "" {
+		multiTSDBOptions = append(multiTSDBOptions, receive.WithHADedup(conf.haDedupConfig()))
+		level.Info(logger).Log("msg", "HA replica deduplication enabled", "replica_label", conf.haDedupReplicaLabel)
+	}
 
 	dbs := receive.NewMultiTSDB(
 		dataDir,
@@ -597,6 +616,11 @@ func setupHashring(g *run.Group,
 	updates := make(chan []receive.HashringConfig, 1)
 	algorithm := receive.HashringAlgorithm(conf.hashringsAlgorithm)
 
+	var hashringOpts []receive.HashringOption
+	if conf.haDedupReplicaLabel != "" {
+		hashringOpts = append(hashringOpts, receive.WithHashIgnoredLabel(conf.haDedupReplicaLabel))
+	}
+
 	// The Hashrings config file path is given initializing config watcher.
 	if conf.hashringsFilePath != "" {
 		cw, err := receive.NewConfigWatcher(log.With(logger, "component", "config-watcher"), reg, conf.hashringsFilePath, *conf.refreshInterval)
@@ -660,7 +684,7 @@ func setupHashring(g *run.Group,
 					webHandler.Hashring(receive.SingleNodeHashring(conf.endpoint))
 					level.Info(logger).Log("msg", "Empty hashring config. Set up single node hashring.")
 				} else {
-					h, err := receive.NewMultiHashring(algorithm, conf.replicationFactor, c, reg)
+					h, err := receive.NewMultiHashring(algorithm, conf.replicationFactor, c, reg, hashringOpts...)
 					if err != nil {
 						return errors.Wrap(err, "unable to create new hashring from config")
 					}
@@ -960,6 +984,26 @@ type receiveConfig struct {
 	compactedBlocksExpandedPostingsCacheSize uint64
 	otlpEnableTargetInfo                     bool
 	otlpResourceAttributes                   []string
+
+	haDedupReplicaLabel           string
+	haDedupFailoverIntervals      float64
+	haDedupMinFailoverTimeout     *model.Duration
+	haDedupMaxFailoverTimeout     *model.Duration
+	haDedupDefaultFailoverTimeout *model.Duration
+	haDedupMaxReplicasPerTenant   int
+	haDedupStateTTL               *model.Duration
+}
+
+func (rc *receiveConfig) haDedupConfig() hadedup.Config {
+	return hadedup.Config{
+		ReplicaLabel:           rc.haDedupReplicaLabel,
+		FailoverIntervals:      rc.haDedupFailoverIntervals,
+		MinFailoverTimeout:     time.Duration(*rc.haDedupMinFailoverTimeout),
+		MaxFailoverTimeout:     time.Duration(*rc.haDedupMaxFailoverTimeout),
+		DefaultFailoverTimeout: time.Duration(*rc.haDedupDefaultFailoverTimeout),
+		MaxReplicas:            rc.haDedupMaxReplicasPerTenant,
+		StateTTL:               time.Duration(*rc.haDedupStateTTL),
+	}
 }
 
 type relabelCfg struct {
@@ -1152,6 +1196,17 @@ func (rc *receiveConfig) registerFlag(cmd extkingpin.FlagClause) {
 	rc.retryAfterBackoff = extkingpin.ModelDuration(cmd.Flag("receive.retry-after-backoff", "Backoff duration for the Retry-After header returned on 429 (active-series-limiting exceeded) and 503 (quorum unavailable) responses.").Default("5s"))
 
 	cmd.Flag("receive.retry-after-jitter", "Fraction of the backoff duration to use as random jitter for the Retry-After header (e.g. 0.5 = ±50%).").Default("0.5").Float64Var(&rc.retryAfterJitter)
+
+	cmd.Flag("receive.ha-dedup.replica-label", "[EXPERIMENTAL] Label name identifying HA Prometheus replicas that write identical series. If set, routers hash series ignoring this label and ingestors keep samples of only one replica per series and strip the label. Must be set to the same value on routers and ingestors. Empty disables HA deduplication.").
+		Default("").StringVar(&rc.haDedupReplicaLabel)
+	cmd.Flag("receive.ha-dedup.failover-intervals", "[EXPERIMENTAL] Number of the series' learned sample intervals without samples from the owning replica after which another replica takes the series over. Must be greater than 1.").
+		Default("1.5").Float64Var(&rc.haDedupFailoverIntervals)
+	rc.haDedupMinFailoverTimeout = extkingpin.ModelDuration(cmd.Flag("receive.ha-dedup.min-failover-timeout", "[EXPERIMENTAL] Lower bound of the per-series HA failover timeout.").Default("10s"))
+	rc.haDedupMaxFailoverTimeout = extkingpin.ModelDuration(cmd.Flag("receive.ha-dedup.max-failover-timeout", "[EXPERIMENTAL] Upper bound of the per-series HA failover timeout.").Default("5m"))
+	rc.haDedupDefaultFailoverTimeout = extkingpin.ModelDuration(cmd.Flag("receive.ha-dedup.default-failover-timeout", "[EXPERIMENTAL] HA failover timeout used until the sample interval of a series has been learned.").Default("60s"))
+	cmd.Flag("receive.ha-dedup.max-replicas-per-tenant", "[EXPERIMENTAL] Maximum number of distinct replica label values tracked per tenant. Series of further replicas are written without deduplication.").
+		Default("1024").IntVar(&rc.haDedupMaxReplicasPerTenant)
+	rc.haDedupStateTTL = extkingpin.ModelDuration(cmd.Flag("receive.ha-dedup.state-ttl", "[EXPERIMENTAL] How long HA dedup state of a series is kept after its newest sample, relative to the newest sample of the tenant. 0s means max-failover-timeout + 10m.").Default("0s"))
 }
 
 // determineMode returns the ReceiverMode that this receiver is configured to run in.
