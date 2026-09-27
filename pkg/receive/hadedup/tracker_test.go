@@ -144,10 +144,11 @@ func TestTrackerAccept(t *testing.T) {
 			steps: []step{
 				{replica: a, ts: 0, accept: true},
 				{replica: a, ts: 15000, accept: true},
-				// A 60s gap is ignored, the interval stays 15s.
+				// A 60s gap is undone by the next regular sample, the interval stays 15s.
 				{replica: a, ts: 75000, accept: true},
-				{replica: b, ts: 75000 + 22500, accept: false},
-				{replica: b, ts: 75000 + 22500 + 1, accept: true},
+				{replica: a, ts: 90000, accept: true},
+				{replica: b, ts: 90000 + 22500, accept: false},
+				{replica: b, ts: 90000 + 22500 + 1, accept: true},
 			},
 			expectedOwner:    b,
 			expectedTimeouts: 1,
@@ -176,6 +177,22 @@ func TestTrackerAccept(t *testing.T) {
 				{replica: b, ts: 35000, accept: true},
 				{replica: a, ts: 45000, accept: false},
 				{replica: b, ts: 50000, accept: true},
+			},
+			expectedOwner:     b,
+			expectedHandovers: 1,
+		},
+		{
+			name: "samples of a lagging new owner older than the handed over ones are dropped",
+			steps: []step{
+				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 15000, accept: true},
+				{replica: b, ts: 10000, accept: false},
+				{replica: a, ts: 30000, stale: true, accept: false},
+				// prometheus-0 already delivered samples up to 15s.
+				{replica: b, ts: 12000, accept: false},
+				{replica: b, ts: 15000, accept: false},
+				{replica: b, ts: 25000, accept: true},
+				{replica: b, ts: 20000, accept: true},
 			},
 			expectedOwner:     b,
 			expectedHandovers: 1,
@@ -331,47 +348,150 @@ func TestTrackerReplicaTableOverflow(t *testing.T) {
 	require.Equal(t, 2.0, promtest.ToFloat64(tr.metrics.replicas))
 }
 
+func newTestTracker(cfg Config, now *time.Time) *Tracker {
+	tr := NewTracker(cfg, prometheus.NewRegistry())
+	tr.now = func() time.Time { return *now }
+	return tr
+}
+
 func TestTrackerGC(t *testing.T) {
 	t.Parallel()
 
 	cfg := testConfig()
-	cfg.StateTTL = time.Minute
-	tr := NewTracker(cfg, prometheus.NewRegistry())
+	cfg.StateTTL = 5 * time.Minute
+	cfg.DefaultFailoverTimeout = 5 * time.Minute
+	now := time.UnixMilli(1_700_000_000_000)
+	tr := newTestTracker(cfg, &now)
 	require.Equal(t, 0, tr.GC())
 
 	a, _ := tr.Replica("a")
 	b, _ := tr.Replica("b")
+	ts := now.UnixMilli()
 
-	require.True(t, tr.Accept(1, a, 0, false))
-	require.True(t, tr.Accept(2, a, 0, false))
+	require.True(t, tr.Accept(1, a, ts-(6*time.Minute).Milliseconds(), false))
+	require.True(t, tr.Accept(2, a, ts-(6*time.Minute).Milliseconds(), false))
 	// Series 2 is kept alive by a non-owner sample.
-	require.False(t, tr.Accept(2, b, 30000, false))
-	require.True(t, tr.Accept(3, a, 90000, false))
+	require.False(t, tr.Accept(2, b, ts-(4*time.Minute).Milliseconds(), false))
+	require.True(t, tr.Accept(3, a, ts, false))
 
 	require.Equal(t, 1, tr.GC())
 	require.Equal(t, 2.0, promtest.ToFloat64(tr.metrics.trackedSeries))
 	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.gcRemoved))
 
 	// Removed state is re-created by the next sample of any replica.
-	require.True(t, tr.Accept(1, b, 95000, false))
+	require.True(t, tr.Accept(1, b, ts, false))
 	require.True(t, tr.IsOwner(1, b))
 
-	// Series 2 was last seen at 30s, now more than a minute before the newest sample.
+	// Series 2 was last seen 4m ago, which becomes more than 5m.
+	now = now.Add(time.Minute + time.Millisecond)
 	require.Equal(t, 1, tr.GC())
 	require.Equal(t, 2.0, promtest.ToFloat64(tr.metrics.trackedSeries))
 }
 
-func TestTrackerDefaultStateTTL(t *testing.T) {
+func TestTrackerGCIgnoresFutureSamples(t *testing.T) {
 	t.Parallel()
 
-	tr := NewTracker(testConfig(), prometheus.NewRegistry())
+	now := time.UnixMilli(1_700_000_000_000)
+	tr := newTestTracker(testConfig(), &now)
 	a, _ := tr.Replica("a")
+	ts := now.UnixMilli()
 
-	require.True(t, tr.Accept(1, a, 0, false))
-	require.True(t, tr.Accept(2, a, (15*time.Minute).Milliseconds(), false))
+	require.True(t, tr.Accept(1, a, ts, false))
+	require.True(t, tr.Accept(2, a, ts+(365*24*time.Hour).Milliseconds(), false))
 	require.Equal(t, 0, tr.GC())
-	require.True(t, tr.Accept(2, a, (15*time.Minute).Milliseconds()+1, false))
+
+	// The default TTL is max failover timeout + 10m.
+	now = now.Add(15*time.Minute + time.Millisecond)
 	require.Equal(t, 1, tr.GC())
+	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.trackedSeries))
+}
+
+func TestTrackerReplicaGC(t *testing.T) {
+	t.Parallel()
+
+	cfg := testConfig()
+	cfg.MaxReplicas = 2
+	cfg.StateTTL = 5 * time.Minute
+	now := time.UnixMilli(1_700_000_000_000)
+	tr := newTestTracker(cfg, &now)
+	ts := func() int64 { return now.UnixMilli() }
+
+	a, ok := tr.Replica("a")
+	require.True(t, ok)
+	b, ok := tr.Replica("b")
+	require.True(t, ok)
+	require.True(t, tr.Accept(1, a, ts(), false))
+	require.True(t, tr.Accept(2, b, ts(), false))
+	tr.GC()
+
+	_, ok = tr.Replica("c")
+	require.False(t, ok, "replica table is full")
+
+	// Only series 1 keeps receiving samples. No replica is looked up in the meantime, but a still owns series 1.
+	for range 6 {
+		now = now.Add(time.Minute)
+		require.True(t, tr.Accept(1, a, ts(), false))
+		tr.GC()
+	}
+	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.replicas))
+
+	c, ok := tr.Replica("c")
+	require.True(t, ok)
+	require.Equal(t, b, c, "freed index is reused")
+	require.True(t, tr.Accept(3, c, ts(), false))
+	require.False(t, tr.Accept(1, c, ts()+1000, false))
+	require.True(t, tr.IsOwner(1, a))
+
+	again, ok := tr.Replica("a")
+	require.True(t, ok)
+	require.Equal(t, a, again)
+	require.Equal(t, 2.0, promtest.ToFloat64(tr.metrics.replicas))
+
+	// Churning replica values keep being deduplicated once old ones age out.
+	for i := range 5 {
+		tr.GC()
+		now = now.Add(6 * time.Minute)
+		tr.GC()
+
+		r0, ok := tr.Replica(fmt.Sprintf("churn-%d-0", i))
+		require.True(t, ok, "iteration %d", i)
+		r1, ok := tr.Replica(fmt.Sprintf("churn-%d-1", i))
+		require.True(t, ok, "iteration %d", i)
+		require.True(t, tr.Accept(storage.SeriesRef(100+i), r0, ts(), false))
+		require.False(t, tr.Accept(storage.SeriesRef(100+i), r1, ts()+1000, false))
+	}
+}
+
+func TestLearnInterval(t *testing.T) {
+	t.Parallel()
+
+	cur := learnInterval(0, 15000)
+	require.Equal(t, uint32(15000), cur)
+
+	// Occasional almost doubled deltas don't make the interval drift upwards.
+	for i := range 100 {
+		delta := int64(15000)
+		if i%5 == 0 {
+			delta = 29900
+		}
+		cur = learnInterval(cur, delta)
+		require.LessOrEqual(t, cur, uint32(17000))
+	}
+	cur = learnInterval(cur, 15000)
+	require.Equal(t, uint32(15000), cur)
+
+	// A real interval change is learned within a bounded number of samples.
+	var n int
+	for cur < 29000 {
+		cur = learnInterval(cur, 30000)
+		n++
+		require.LessOrEqual(t, n, 25)
+	}
+	require.LessOrEqual(t, cur, uint32(30000))
+
+	require.Equal(t, uint32(10000), learnInterval(cur, 10000))
+	require.Equal(t, uint32(10000), learnInterval(10000, 0))
+	require.Equal(t, uint32(10000), learnInterval(10000, -5))
 }
 
 func TestTrackerConcurrent(t *testing.T) {
@@ -417,12 +537,21 @@ func TestConfigValidate(t *testing.T) {
 	}{
 		{name: "default", cfg: func(c *Config) {}, valid: true},
 		{name: "no label", cfg: func(c *Config) { c.ReplicaLabel = "" }},
+		{name: "reserved metric name label", cfg: func(c *Config) { c.ReplicaLabel = "__name__" }},
+		{name: "reserved label prefix", cfg: func(c *Config) { c.ReplicaLabel = "__replica__" }},
 		{name: "failover intervals equal to 1", cfg: func(c *Config) { c.FailoverIntervals = 1 }},
 		{name: "min greater than max", cfg: func(c *Config) { c.MinFailoverTimeout = 10 * time.Minute }},
 		{name: "zero default timeout", cfg: func(c *Config) { c.DefaultFailoverTimeout = 0 }},
+		{name: "default timeout below min", cfg: func(c *Config) { c.DefaultFailoverTimeout = 5 * time.Second }},
+		{name: "default timeout above max", cfg: func(c *Config) { c.DefaultFailoverTimeout = 6 * time.Minute }},
+		{name: "default timeout equal to min and max", cfg: func(c *Config) {
+			c.MinFailoverTimeout, c.DefaultFailoverTimeout, c.MaxFailoverTimeout = time.Minute, time.Minute, time.Minute
+		}, valid: true},
 		{name: "zero max replicas", cfg: func(c *Config) { c.MaxReplicas = 0 }},
 		{name: "too many max replicas", cfg: func(c *Config) { c.MaxReplicas = MaxReplicasLimit + 1 }},
 		{name: "negative state TTL", cfg: func(c *Config) { c.StateTTL = -time.Second }},
+		{name: "state TTL below max failover timeout", cfg: func(c *Config) { c.StateTTL = 4 * time.Minute }},
+		{name: "state TTL equal to max failover timeout", cfg: func(c *Config) { c.StateTTL = 5 * time.Minute }, valid: true},
 	} {
 		t.Run(tcase.name, func(t *testing.T) {
 			cfg := testConfig()

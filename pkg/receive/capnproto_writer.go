@@ -48,6 +48,13 @@ func (r *CapNProtoWriter) Write(ctx context.Context, wreq *writecapnp.Request) e
 	if err != nil {
 		return errors.Wrap(err, "get tenant appendable")
 	}
+	dedup, err := newHADedupWriter(r.multiTSDB, wreq.Tenant)
+	if err == tsdb.ErrNotReady {
+		return err
+	}
+	if err != nil {
+		return errors.Wrap(err, "get HA dedup tracker")
+	}
 
 	app, err := s.Appender(ctx)
 	if err == tsdb.ErrNotReady {
@@ -70,7 +77,6 @@ func (r *CapNProtoWriter) Write(ctx context.Context, wreq *writecapnp.Request) e
 	var (
 		series  writecapnp.Series
 		builder labels.ScratchBuilder
-		dedup   = newHADedupWriter(r.multiTSDB, wreq.Tenant)
 	)
 	for wreq.Next() {
 		if err := wreq.At(&series); err != nil {

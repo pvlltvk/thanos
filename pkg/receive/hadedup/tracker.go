@@ -15,6 +15,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/storage"
 	"go.uber.org/atomic"
 )
@@ -22,6 +23,7 @@ import (
 const (
 	numStripes = 64
 	noReplica  = math.MaxUint16
+	noTs       = math.MinInt64
 
 	// MaxReplicasLimit is the maximum allowed value of Config.MaxReplicas.
 	MaxReplicasLimit = noReplica
@@ -46,8 +48,8 @@ type Config struct {
 	DefaultFailoverTimeout time.Duration
 	// MaxReplicas caps the number of distinct replica label values tracked per tenant.
 	MaxReplicas int
-	// StateTTL is how long series state is kept after its newest sample, relative to the newest sample seen by the tracker.
-	// Zero means MaxFailoverTimeout + 10m.
+	// StateTTL is how long state is kept for series whose newest sample is older than the current time, and for
+	// replica values that are no longer used. Zero means MaxFailoverTimeout + 10m.
 	StateTTL time.Duration
 }
 
@@ -55,6 +57,9 @@ type Config struct {
 func (c Config) Validate() error {
 	if c.ReplicaLabel == "" {
 		return errors.New("replica label must be set")
+	}
+	if strings.HasPrefix(c.ReplicaLabel, model.ReservedLabelPrefix) {
+		return errors.Errorf("replica label %s must not use the reserved prefix %s", c.ReplicaLabel, model.ReservedLabelPrefix)
 	}
 	if c.FailoverIntervals <= 1 {
 		return errors.Errorf("failover intervals must be greater than 1, got %v", c.FailoverIntervals)
@@ -65,11 +70,17 @@ func (c Config) Validate() error {
 	if c.MinFailoverTimeout > c.MaxFailoverTimeout {
 		return errors.Errorf("min failover timeout %v must not be greater than max failover timeout %v", c.MinFailoverTimeout, c.MaxFailoverTimeout)
 	}
+	if c.DefaultFailoverTimeout < c.MinFailoverTimeout || c.DefaultFailoverTimeout > c.MaxFailoverTimeout {
+		return errors.Errorf("default failover timeout %v must be between min failover timeout %v and max failover timeout %v", c.DefaultFailoverTimeout, c.MinFailoverTimeout, c.MaxFailoverTimeout)
+	}
 	if c.MaxReplicas <= 0 || c.MaxReplicas > MaxReplicasLimit {
 		return errors.Errorf("max replicas must be between 1 and %d, got %d", MaxReplicasLimit, c.MaxReplicas)
 	}
 	if c.StateTTL < 0 {
 		return errors.New("state TTL must not be negative")
+	}
+	if c.StateTTL != 0 && c.StateTTL < c.MaxFailoverTimeout {
+		return errors.Errorf("state TTL %v must not be less than max failover timeout %v", c.StateTTL, c.MaxFailoverTimeout)
 	}
 	return nil
 }
@@ -77,7 +88,8 @@ func (c Config) Validate() error {
 type seriesState struct {
 	// ownerLastTs is the timestamp of the newest sample accepted from the owner.
 	ownerLastTs int64
-	// candLastTs is the timestamp of the newest sample seen from cand.
+	// candLastTs is the timestamp of the newest sample seen from cand. While cand is noReplica it holds the
+	// timestamp up to which samples of the owner are dropped after a stale handover, or noTs.
 	candLastTs int64
 	// intervalMs is the learned sample interval of the owner, 0 if unknown.
 	intervalMs uint32
@@ -89,6 +101,13 @@ type seriesState struct {
 type stripe struct {
 	mtx    sync.Mutex
 	series map[storage.SeriesRef]seriesState
+}
+
+type replica struct {
+	value string
+	// seen is set on every lookup and consumed by GC to update lastSeen, so lookups don't need to read the clock.
+	seen     atomic.Bool
+	lastSeen time.Time
 }
 
 type metrics struct {
@@ -123,7 +142,7 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		}),
 		replicas: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
 			Name: "thanos_receive_ha_dedup_replicas",
-			Help: "Number of distinct HA replica label values seen.",
+			Help: "Number of distinct HA replica label values tracked.",
 		}),
 		passthroughTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 			Name: "thanos_receive_ha_dedup_passthrough_total",
@@ -150,17 +169,18 @@ type Tracker struct {
 	minTimeoutMs      int64
 	maxTimeoutMs      int64
 	defaultTimeoutMs  int64
-	stateTTLMs        int64
+	stateTTL          time.Duration
 	maxReplicas       int
 
 	replicasMtx sync.RWMutex
-	replicas    map[string]uint16
+	replicaIdx  map[string]uint16
+	// replicas is indexed by interned replica index; freed slots are nil and listed in freeReplicas.
+	replicas     []*replica
+	freeReplicas []uint16
 
 	stripes [numStripes]stripe
 
-	// maxTs is the newest sample timestamp seen, used as the reference point for GC.
-	maxTs atomic.Int64
-
+	now     func() time.Time
 	metrics *metrics
 }
 
@@ -170,19 +190,18 @@ func NewTracker(cfg Config, reg prometheus.Registerer) *Tracker {
 	if stateTTL == 0 {
 		stateTTL = cfg.MaxFailoverTimeout + 10*time.Minute
 	}
-	t := &Tracker{
+	return &Tracker{
 		replicaLabel:      cfg.ReplicaLabel,
 		failoverIntervals: cfg.FailoverIntervals,
 		minTimeoutMs:      cfg.MinFailoverTimeout.Milliseconds(),
 		maxTimeoutMs:      cfg.MaxFailoverTimeout.Milliseconds(),
 		defaultTimeoutMs:  cfg.DefaultFailoverTimeout.Milliseconds(),
-		stateTTLMs:        stateTTL.Milliseconds(),
+		stateTTL:          stateTTL,
 		maxReplicas:       cfg.MaxReplicas,
-		replicas:          map[string]uint16{},
+		replicaIdx:        map[string]uint16{},
+		now:               time.Now,
 		metrics:           newMetrics(reg),
 	}
-	t.maxTs.Store(math.MinInt64)
-	return t
 }
 
 // ReplicaLabel returns the name of the replica label.
@@ -194,7 +213,12 @@ func (t *Tracker) ReplicaLabel() string {
 // in which case the series must be written without deduplication.
 func (t *Tracker) Replica(value string) (uint16, bool) {
 	t.replicasMtx.RLock()
-	r, ok := t.replicas[value]
+	r, ok := t.replicaIdx[value]
+	if ok {
+		if rep := t.replicas[r]; !rep.seen.Load() {
+			rep.seen.Store(true)
+		}
+	}
 	t.replicasMtx.RUnlock()
 	if ok {
 		return r, true
@@ -202,16 +226,27 @@ func (t *Tracker) Replica(value string) (uint16, bool) {
 
 	t.replicasMtx.Lock()
 	defer t.replicasMtx.Unlock()
-	if r, ok := t.replicas[value]; ok {
+	if r, ok := t.replicaIdx[value]; ok {
+		t.replicas[r].seen.Store(true)
 		return r, true
 	}
-	if len(t.replicas) >= t.maxReplicas {
+	if len(t.replicaIdx) >= t.maxReplicas {
 		return 0, false
 	}
-	r = uint16(len(t.replicas))
+
 	// The value references request memory, detach it before keeping it.
-	t.replicas[strings.Clone(value)] = r
-	t.metrics.replicas.Set(float64(len(t.replicas)))
+	rep := &replica{value: strings.Clone(value), lastSeen: t.now()}
+	rep.seen.Store(true)
+	if n := len(t.freeReplicas); n > 0 {
+		r = t.freeReplicas[n-1]
+		t.freeReplicas = t.freeReplicas[:n-1]
+		t.replicas[r] = rep
+	} else {
+		r = uint16(len(t.replicas))
+		t.replicas = append(t.replicas, rep)
+	}
+	t.replicaIdx[rep.value] = r
+	t.metrics.replicas.Set(float64(len(t.replicaIdx)))
 	return r, true
 }
 
@@ -241,12 +276,13 @@ func (t *Tracker) Accept(ref storage.SeriesRef, replica uint16, ts int64, stale 
 	if !exists {
 		t.metrics.trackedSeries.Inc()
 	}
-	t.observe(ts, accept, reason)
+	t.observe(accept, reason)
 	return accept
 }
 
 // Init records replica as the owner of a series created by appending its sample at ts, unless another
-// writer created state for the series in the meantime.
+// writer created state for the series in the meantime. In that case both replicas' first samples may have
+// been appended.
 func (t *Tracker) Init(ref storage.SeriesRef, replica uint16, ts int64) {
 	s := &t.stripes[uint64(ref)%numStripes]
 	s.mtx.Lock()
@@ -255,14 +291,14 @@ func (t *Tracker) Init(ref storage.SeriesRef, replica uint16, ts int64) {
 		if s.series == nil {
 			s.series = map[storage.SeriesRef]seriesState{}
 		}
-		s.series[ref] = seriesState{owner: replica, ownerLastTs: ts, cand: noReplica}
+		s.series[ref] = seriesState{owner: replica, ownerLastTs: ts, cand: noReplica, candLastTs: noTs}
 	}
 	s.mtx.Unlock()
 
 	if !exists {
 		t.metrics.trackedSeries.Inc()
 	}
-	t.observe(ts, true, "")
+	t.observe(true, "")
 }
 
 // IsOwner returns true if replica owns the series or the series is not tracked.
@@ -274,13 +310,7 @@ func (t *Tracker) IsOwner(ref storage.SeriesRef, replica uint16) bool {
 	return !exists || st.owner == replica
 }
 
-func (t *Tracker) observe(ts int64, accept bool, failoverReason string) {
-	for {
-		cur := t.maxTs.Load()
-		if ts <= cur || t.maxTs.CompareAndSwap(cur, ts) {
-			break
-		}
-	}
+func (t *Tracker) observe(accept bool, failoverReason string) {
 	if accept {
 		t.metrics.accepted.Inc()
 	} else {
@@ -298,35 +328,41 @@ func (t *Tracker) observe(ts int64, accept bool, failoverReason string) {
 // decisions independent of remote-write delivery lag, so a lagging owner loses ownership to the most current replica.
 func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, stale bool) (bool, string) {
 	if !exists {
-		*s = seriesState{owner: r, ownerLastTs: ts, cand: noReplica}
+		*s = seriesState{owner: r, ownerLastTs: ts, cand: noReplica, candLastTs: noTs}
 		return true, ""
 	}
 
 	if r == s.owner {
-		if ts > s.ownerLastTs {
-			s.intervalMs = learnInterval(s.intervalMs, ts-s.ownerLastTs)
-			s.ownerLastTs = ts
+		if s.cand == noReplica && ts <= s.candLastTs {
+			return false, ""
 		}
 		if stale && s.cand != noReplica && s.candLastTs >= ts-t.timeout(s.intervalMs) {
 			// The series vanished only on the owner while another replica still produces it: hand the series
-			// over and drop the stale marker. Resetting cand makes the new owner's own stale marker be accepted
-			// if the series vanishes there too, instead of handing it back and forth.
-			s.owner, s.ownerLastTs = s.cand, s.candLastTs
-			s.cand, s.candLastTs = noReplica, 0
+			// over and drop the stale marker. The new owner may lag behind the old one, so its samples up to the
+			// newest one already appended are dropped instead of being appended out of order. Resetting cand makes
+			// the new owner's own stale marker be accepted if the series vanishes there too, instead of handing it
+			// back and forth.
+			last := max(s.ownerLastTs, s.candLastTs)
+			s.owner, s.ownerLastTs = s.cand, last
+			s.cand, s.candLastTs = noReplica, last
 			return false, failoverReasonStaleHandover
+		}
+		if ts > s.ownerLastTs {
+			s.intervalMs = learnInterval(s.intervalMs, ts-s.ownerLastTs)
+			s.ownerLastTs = ts
 		}
 		return true, ""
 	}
 
 	if ts > s.ownerLastTs+t.timeout(s.intervalMs) {
-		*s = seriesState{owner: r, ownerLastTs: ts, intervalMs: s.intervalMs, cand: noReplica}
+		*s = seriesState{owner: r, ownerLastTs: ts, intervalMs: s.intervalMs, cand: noReplica, candLastTs: noTs}
 		return true, failoverReasonTimeout
 	}
 
 	if stale {
 		// A replica that sent a stale marker no longer produces the series, so it can't take it over.
 		if s.cand == r {
-			s.cand, s.candLastTs = noReplica, 0
+			s.cand, s.candLastTs = noReplica, noTs
 		}
 		return false, ""
 	}
@@ -345,26 +381,32 @@ func (t *Tracker) timeout(intervalMs uint32) int64 {
 	return min(max(int64(t.failoverIntervals*float64(intervalMs)), t.minTimeoutMs), t.maxTimeoutMs)
 }
 
-// learnInterval keeps the smallest plausible delta between consecutive owner samples. Deltas of at least twice the
-// current interval are treated as gaps (missed scrapes, restarts) and ignored.
+// learnInterval tracks the smallest recent delta between consecutive owner samples: smaller deltas are adopted
+// immediately, larger ones move the interval by 1/8 of the difference, at most up to double the current interval.
+// Occasional gaps are thus undone by the next regular sample, while a real interval change is learned over a few
+// dozen samples.
 func learnInterval(cur uint32, delta int64) uint32 {
 	if delta <= 0 || delta > math.MaxUint32 {
 		return cur
 	}
-	if cur == 0 || delta < 2*int64(cur) {
+	if cur == 0 || delta <= int64(cur) {
 		return uint32(delta)
 	}
-	return cur
+	target := min(delta, 2*int64(cur))
+	return cur + uint32(max((target-int64(cur))/8, 1))
 }
 
-// GC removes the state of series whose newest sample is older than the state TTL, relative to the newest sample
-// seen by the tracker. It returns the number of removed series.
+// GC removes the state of series whose newest sample is older than the state TTL, and frees replica values that
+// were not used for longer than the state TTL and are not referenced by any series. Unlike failover decisions, GC is
+// based on the current time, so that samples with timestamps in the future can't keep other state from being removed.
+// It returns the number of removed series.
 func (t *Tracker) GC() int {
-	maxTs := t.maxTs.Load()
-	if maxTs == math.MinInt64 {
-		return 0
-	}
-	cutoff := maxTs - t.stateTTLMs
+	now := t.now()
+	cutoff := now.Add(-t.stateTTL).UnixMilli()
+
+	t.replicasMtx.RLock()
+	referenced := make([]bool, len(t.replicas))
+	t.replicasMtx.RUnlock()
 
 	var removed int
 	for i := range t.stripes {
@@ -374,6 +416,11 @@ func (t *Tracker) GC() int {
 			if max(st.ownerLastTs, st.candLastTs) < cutoff {
 				delete(s.series, ref)
 				removed++
+				continue
+			}
+			markReferenced(referenced, st.owner)
+			if st.cand != noReplica {
+				markReferenced(referenced, st.cand)
 			}
 		}
 		s.mtx.Unlock()
@@ -381,5 +428,31 @@ func (t *Tracker) GC() int {
 
 	t.metrics.trackedSeries.Sub(float64(removed))
 	t.metrics.gcRemoved.Add(float64(removed))
+
+	t.replicasMtx.Lock()
+	defer t.replicasMtx.Unlock()
+	for i, rep := range t.replicas {
+		if rep == nil {
+			continue
+		}
+		// Replicas interned after the series were scanned are always seen, so they are never freed here.
+		if rep.seen.Swap(false) {
+			rep.lastSeen = now
+			continue
+		}
+		if (i < len(referenced) && referenced[i]) || now.Sub(rep.lastSeen) <= t.stateTTL {
+			continue
+		}
+		delete(t.replicaIdx, rep.value)
+		t.replicas[i] = nil
+		t.freeReplicas = append(t.freeReplicas, uint16(i))
+	}
+	t.metrics.replicas.Set(float64(len(t.replicaIdx)))
 	return removed
+}
+
+func markReferenced(referenced []bool, r uint16) {
+	if int(r) < len(referenced) {
+		referenced[r] = true
+	}
 }

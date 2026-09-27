@@ -252,7 +252,8 @@ func TestWriterHADedup(t *testing.T) {
 			require.Equal(t, expectedSeries, got)
 			results[name] = got
 
-			tracker := m.TenantHADedupTracker(tenancy.DefaultTenant)
+			tracker, err := m.TenantHADedupTracker(tenancy.DefaultTenant)
+			require.NoError(t, err)
 			require.NotNil(t, tracker)
 		})
 	}
@@ -273,7 +274,9 @@ func TestWriterHADedupDisabled(t *testing.T) {
 			m := newHADedupMultiTSDB(t, prometheus.NewRegistry(), labels.FromStrings("replica", "01"))
 			writeHADedupRequests(t, m, capnp, writes)
 
-			require.Nil(t, m.TenantHADedupTracker(tenancy.DefaultTenant))
+			tracker, err := m.TenantHADedupTracker(tenancy.DefaultTenant)
+			require.NoError(t, err)
+			require.Nil(t, tracker)
 			got := readTenantSeries(t, m)
 			require.Len(t, got, 6)
 			require.Contains(t, got, `{__name__="up", instance="a", prometheus_replica="prometheus-0"}`)
@@ -316,6 +319,57 @@ func TestWriterHADedupStaleHandover(t *testing.T) {
 			}, got)
 		})
 	}
+}
+
+func TestMultiTSDBHADedupTrackerCreatedWithTenant(t *testing.T) {
+	t.Parallel()
+
+	m := newHADedupMultiTSDB(t, prometheus.NewRegistry(), labels.FromStrings("replica", "01"), WithHADedup(testHADedupConfig()))
+
+	_, err := m.TenantHADedupTracker("unknown")
+	require.ErrorIs(t, err, tsdb.ErrNotReady)
+
+	app, err := m.TenantAppendable("foo")
+	require.NoError(t, err)
+	require.NotNil(t, app.(*ReadyStorage).Get())
+
+	tenant := m.testGetTenant("foo")
+	require.NotNil(t, tenant.haDedupTracker(), "a ready tenant must have its tracker")
+
+	tracker, err := m.TenantHADedupTracker("foo")
+	require.NoError(t, err)
+	require.Same(t, tenant.haDedupTracker(), tracker)
+}
+
+type notReadyHADedupStorage struct {
+	TenantStorage
+}
+
+func (notReadyHADedupStorage) TenantHADedupTracker(string) (*hadedup.Tracker, error) {
+	return nil, tsdb.ErrNotReady
+}
+
+func TestWriterHADedupTrackerNotReady(t *testing.T) {
+	t.Parallel()
+
+	m := newHADedupMultiTSDB(t, prometheus.NewRegistry(), labels.FromStrings("replica", "01"))
+	s := notReadyHADedupStorage{TenantStorage: m}
+	series := haReplicaScrape("prometheus-0", time.Now().Add(-time.Hour).UnixMilli())
+
+	require.ErrorIs(t, NewWriter(log.NewNopLogger(), s, &WriterOptions{}).Write(context.Background(), tenancy.DefaultTenant, series), tsdb.ErrNotReady)
+
+	capnpReq, err := writecapnp.Build(tenancy.DefaultTenant, series)
+	require.NoError(t, err)
+	syms, err := capnpReq.Symbols()
+	require.NoError(t, err)
+	data, err := capnpReq.Data()
+	require.NoError(t, err)
+	req, err := writecapnp.NewRequest(data.At(0), syms, tenancy.DefaultTenant)
+	require.NoError(t, err)
+	require.ErrorIs(t, NewCapNProtoWriter(log.NewNopLogger(), s, &CapNProtoWriterOptions{}).Write(context.Background(), req), tsdb.ErrNotReady)
+	require.NoError(t, req.Close())
+
+	require.Empty(t, readTenantSeries(t, m))
 }
 
 func TestHADedupWriterPrepare(t *testing.T) {

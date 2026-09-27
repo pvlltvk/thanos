@@ -18,7 +18,7 @@ import (
 // haDedupTenantStorage is implemented by tenant storages that deduplicate samples of HA Prometheus replicas.
 type haDedupTenantStorage interface {
 	// TenantHADedupTracker returns the tracker of the given tenant, or nil if deduplication is disabled.
-	TenantHADedupTracker(tenantID string) *hadedup.Tracker
+	TenantHADedupTracker(tenantID string) (*hadedup.Tracker, error)
 }
 
 // haDedupWriter applies HA replica deduplication to the series of a single write request.
@@ -28,12 +28,13 @@ type haDedupWriter struct {
 	scratch []labelpb.ZLabel
 }
 
-func newHADedupWriter(s TenantStorage, tenantID string) haDedupWriter {
+func newHADedupWriter(s TenantStorage, tenantID string) (haDedupWriter, error) {
 	ds, ok := s.(haDedupTenantStorage)
 	if !ok {
-		return haDedupWriter{}
+		return haDedupWriter{}, nil
 	}
-	return haDedupWriter{tracker: ds.TenantHADedupTracker(tenantID)}
+	tracker, err := ds.TenantHADedupTracker(tenantID)
+	return haDedupWriter{tracker: tracker}, err
 }
 
 // prepare looks up the replica label of the given sorted labels. For deduplicated series it returns the labels

@@ -322,46 +322,19 @@ func DeepCopy(lbls []ZLabel) []ZLabel {
 
 // HashWithPrefix returns a hash for the given prefix and labels.
 func HashWithPrefix(prefix string, lbls []ZLabel) uint64 {
-	// Use xxhash.Sum64(b) for fast path as it's faster.
-	b := make([]byte, 0, 1024)
-	b = append(b, prefix...)
-	b = append(b, sep[0])
-
-	for i, v := range lbls {
-		if len(b)+len(v.Name)+len(v.Value)+2 >= cap(b) {
-			// If labels entry is 1KB allocate do not allocate whole entry.
-			h := xxhash.New()
-			_, _ = h.Write(b)
-			for _, v := range lbls[i:] {
-				_, _ = h.WriteString(v.Name)
-				_, _ = h.Write(sep)
-				_, _ = h.WriteString(v.Value)
-				_, _ = h.Write(sep)
-			}
-			return h.Sum64()
-		}
-		b = append(b, v.Name...)
-		b = append(b, sep[0])
-		b = append(b, v.Value...)
-		b = append(b, sep[0])
-	}
-	return xxhash.Sum64(b)
+	return HashWithPrefixIgnoring(prefix, lbls, "")
 }
 
 // HashWithPrefixIgnoring returns a hash for the given prefix and labels, skipping the label named ignore.
-// For label sets without that label the result is identical to HashWithPrefix.
+// For label sets without that label, or an empty ignore, the result is identical to HashWithPrefix.
 func HashWithPrefixIgnoring(prefix string, lbls []ZLabel, ignore string) uint64 {
-	if ignore == "" {
-		return HashWithPrefix(prefix, lbls)
-	}
-
 	// Use xxhash.Sum64(b) for fast path as it's faster.
 	b := make([]byte, 0, 1024)
 	b = append(b, prefix...)
 	b = append(b, sep[0])
 
 	for i, v := range lbls {
-		if v.Name == ignore {
+		if ignore != "" && v.Name == ignore {
 			continue
 		}
 		if len(b)+len(v.Name)+len(v.Value)+2 >= cap(b) {
@@ -369,7 +342,7 @@ func HashWithPrefixIgnoring(prefix string, lbls []ZLabel, ignore string) uint64 
 			h := xxhash.New()
 			_, _ = h.Write(b)
 			for _, v := range lbls[i:] {
-				if v.Name == ignore {
+				if ignore != "" && v.Name == ignore {
 					continue
 				}
 				_, _ = h.WriteString(v.Name)

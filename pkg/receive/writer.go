@@ -79,6 +79,13 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq []prompb.TimeS
 	if err != nil {
 		return errors.Wrap(err, "get tenant appendable")
 	}
+	dedup, err := newHADedupWriter(r.multiTSDB, tenantID)
+	if err == tsdb.ErrNotReady {
+		return err
+	}
+	if err != nil {
+		return errors.Wrap(err, "get HA dedup tracker")
+	}
 
 	app, err := s.Appender(ctx)
 	if err == tsdb.ErrNotReady {
@@ -97,7 +104,6 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq []prompb.TimeS
 		tooFarInFuture: r.opts.TooFarInFutureTimeWindow,
 		Appender:       app,
 	}
-	dedup := newHADedupWriter(r.multiTSDB, tenantID)
 
 	for _, t := range wreq {
 		// Check if time series labels are valid. If not, skip the time series

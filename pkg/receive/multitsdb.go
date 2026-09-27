@@ -548,26 +548,9 @@ func (t *tenant) startPeriodicUploader() {
 
 const haDedupGCInterval = time.Minute
 
-// haDedupTracker returns the tenant's HA dedup tracker, creating it on first use.
-// It returns nil if the tenant's TSDB is not running.
-func (t *tenant) haDedupTracker(cfg hadedup.Config) *hadedup.Tracker {
+func (t *tenant) haDedupTracker() *hadedup.Tracker {
 	t.mtx.RLock()
-	tracker := t.haDedup
-	t.mtx.RUnlock()
-	if tracker != nil {
-		return tracker
-	}
-
-	t.mtx.Lock()
-	defer t.mtx.Unlock()
-	if t.haDedup != nil {
-		return t.haDedup
-	}
-	if t.reg == nil {
-		return nil
-	}
-	t.haDedup = hadedup.NewTracker(cfg, t.reg)
-	t.startPeriodicHADedupGC(t.haDedup)
+	defer t.mtx.RUnlock()
 	return t.haDedup
 }
 
@@ -655,7 +638,7 @@ func (t *tenant) close(cd closeDelete) {
 		}
 
 		t.readyS.set(nil)
-		t.setComponents(nil, nil, nil, nil, nil)
+		t.setComponents(nil, nil, nil, nil, nil, nil)
 	})
 }
 
@@ -687,14 +670,15 @@ func (t *tenant) shipper() *shipper.Shipper {
 	return t.ship
 }
 
-func (t *tenant) set(storeTSDB *store.TSDBStore, tenantTSDB *tsdb.DB, ship *shipper.Shipper, exemplarsTSDB *exemplars.TSDB, reg *UnRegisterer) {
-	t.readyS.Set(tenantTSDB)
+func (t *tenant) set(storeTSDB *store.TSDBStore, tenantTSDB *tsdb.DB, ship *shipper.Shipper, exemplarsTSDB *exemplars.TSDB, reg *UnRegisterer, haDedup *hadedup.Tracker) {
+	// Components must be set before the storage becomes ready, so that writes to a ready tenant see all of them.
 	t.mtx.Lock()
-	t.setComponents(storeTSDB, ship, exemplarsTSDB, tenantTSDB, reg)
+	t.setComponents(storeTSDB, ship, exemplarsTSDB, tenantTSDB, reg, haDedup)
 	t.mtx.Unlock()
+	t.readyS.Set(tenantTSDB)
 }
 
-func (t *tenant) setComponents(storeTSDB *store.TSDBStore, ship *shipper.Shipper, exemplarsTSDB *exemplars.TSDB, tenantTSDB *tsdb.DB, reg *UnRegisterer) {
+func (t *tenant) setComponents(storeTSDB *store.TSDBStore, ship *shipper.Shipper, exemplarsTSDB *exemplars.TSDB, tenantTSDB *tsdb.DB, reg *UnRegisterer, haDedup *hadedup.Tracker) {
 	if storeTSDB == nil && t.storeTSDB != nil {
 		t.storeTSDB.Close()
 	}
@@ -703,6 +687,7 @@ func (t *tenant) setComponents(storeTSDB *store.TSDBStore, ship *shipper.Shipper
 	t.ship = ship
 	t.exemplarsTSDB = exemplarsTSDB
 	t.tsdb = tenantTSDB
+	t.haDedup = haDedup
 }
 
 func (t *MultiTSDB) Open() error {
@@ -1103,7 +1088,12 @@ func (t *MultiTSDB) startTSDB(logger log.Logger, tenantID string, tenant *tenant
 	if t.matcherCache != nil {
 		options = append(options, store.WithMatcherCacheInstance(t.matcherCache))
 	}
-	tenant.set(store.NewTSDBStore(logger, s, component.Receive, lset, options...), s, ship, exemplars.NewTSDB(s, lset), reg.(*UnRegisterer))
+	var haDedup *hadedup.Tracker
+	if t.haDedupConfig != nil {
+		haDedup = hadedup.NewTracker(*t.haDedupConfig, reg)
+		tenant.startPeriodicHADedupGC(haDedup)
+	}
+	tenant.set(store.NewTSDBStore(logger, s, component.Receive, lset, options...), s, ship, exemplars.NewTSDB(s, lset), reg.(*UnRegisterer), haDedup)
 	t.addTenantLocked(tenantID, tenant) // need to update the client list once store is ready & client != nil
 	level.Info(logger).Log("msg", "TSDB is now ready")
 	return nil
@@ -1134,18 +1124,23 @@ func (t *MultiTSDB) TenantAppendable(tenantID string) (Appendable, error) {
 }
 
 // TenantHADedupTracker returns the HA dedup tracker of the given tenant, or nil if HA deduplication is disabled.
-func (t *MultiTSDB) TenantHADedupTracker(tenantID string) *hadedup.Tracker {
+// It returns tsdb.ErrNotReady if deduplication is enabled but the tenant's TSDB is not running.
+func (t *MultiTSDB) TenantHADedupTracker(tenantID string) (*hadedup.Tracker, error) {
 	if t.haDedupConfig == nil {
-		return nil
+		return nil, nil
 	}
 
 	t.mtx.RLock()
 	tenant, ok := t.tenants[tenantID]
 	t.mtx.RUnlock()
 	if !ok {
-		return nil
+		return nil, tsdb.ErrNotReady
 	}
-	return tenant.haDedupTracker(*t.haDedupConfig)
+	tracker := tenant.haDedupTracker()
+	if tracker == nil {
+		return nil, tsdb.ErrNotReady
+	}
+	return tracker, nil
 }
 
 func (t *MultiTSDB) SetHashringConfig(cfg []HashringConfig) error {

@@ -716,8 +716,9 @@ Flags:
                                  series. If set, routers hash series ignoring
                                  this label and ingestors keep samples of only
                                  one replica per series and strip the label.
-                                 Must be set to the same value on routers and
-                                 ingestors. Empty disables HA deduplication.
+                                 Must be set to the same value on routers
+                                 and ingestors and must not start with __.
+                                 Empty disables HA deduplication.
       --receive.ha-dedup.failover-intervals=1.5
                                  [EXPERIMENTAL] Number of the series' learned
                                  sample intervals without samples from the
@@ -740,8 +741,10 @@ Flags:
                                  deduplication.
       --receive.ha-dedup.state-ttl=0s
                                  [EXPERIMENTAL] How long HA dedup state of
-                                 a series is kept after its newest sample,
-                                 relative to the newest sample of the tenant.
+                                 a series is kept once its newest sample
+                                 is older than the current time, and how
+                                 long unused replica label values are kept.
+                                 Must not be less than max-failover-timeout.
                                  0s means max-failover-timeout + 10m.
 
 ```
