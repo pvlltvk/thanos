@@ -45,8 +45,7 @@ func TestTrackerAccept(t *testing.T) {
 		name              string
 		steps             []step
 		expectedOwner     string
-		expectedTimeouts  float64
-		expectedHandovers float64
+		expectedFailovers float64
 	}{
 		{
 			name:          "first sample elects its replica",
@@ -102,8 +101,8 @@ func TestTrackerAccept(t *testing.T) {
 				{replica: a, ts: 45000, accept: false},
 				{replica: b, ts: 52500, accept: true},
 			},
-			expectedOwner:    b,
-			expectedTimeouts: 1,
+			expectedOwner:     b,
+			expectedFailovers: 1,
 		},
 		{
 			name: "default timeout until an interval is learned",
@@ -112,8 +111,8 @@ func TestTrackerAccept(t *testing.T) {
 				{replica: b, ts: 60000, accept: false},
 				{replica: b, ts: 60001, accept: true},
 			},
-			expectedOwner:    b,
-			expectedTimeouts: 1,
+			expectedOwner:     b,
+			expectedFailovers: 1,
 		},
 		{
 			name: "min timeout clamp",
@@ -124,8 +123,8 @@ func TestTrackerAccept(t *testing.T) {
 				{replica: b, ts: 1000 + 10000, accept: false},
 				{replica: b, ts: 1000 + 10000 + 1, accept: true},
 			},
-			expectedOwner:    b,
-			expectedTimeouts: 1,
+			expectedOwner:     b,
+			expectedFailovers: 1,
 		},
 		{
 			name: "max timeout clamp",
@@ -136,8 +135,8 @@ func TestTrackerAccept(t *testing.T) {
 				{replica: b, ts: 600000 + 300000, accept: false},
 				{replica: b, ts: 600000 + 300000 + 1, accept: true},
 			},
-			expectedOwner:    b,
-			expectedTimeouts: 1,
+			expectedOwner:     b,
+			expectedFailovers: 1,
 		},
 		{
 			name: "gaps do not grow the learned interval",
@@ -150,8 +149,8 @@ func TestTrackerAccept(t *testing.T) {
 				{replica: b, ts: 90000 + 22500, accept: false},
 				{replica: b, ts: 90000 + 22500 + 1, accept: true},
 			},
-			expectedOwner:    b,
-			expectedTimeouts: 1,
+			expectedOwner:     b,
+			expectedFailovers: 1,
 		},
 		{
 			name: "smaller interval replaces the learned one",
@@ -163,8 +162,8 @@ func TestTrackerAccept(t *testing.T) {
 				{replica: b, ts: 40000 + 15000, accept: false},
 				{replica: b, ts: 40000 + 15000 + 1, accept: true},
 			},
-			expectedOwner:    b,
-			expectedTimeouts: 1,
+			expectedOwner:     b,
+			expectedFailovers: 1,
 		},
 		{
 			name: "stale marker of the owner is handed over to a live replica",
@@ -178,8 +177,7 @@ func TestTrackerAccept(t *testing.T) {
 				{replica: a, ts: 45000, accept: false},
 				{replica: b, ts: 50000, accept: true},
 			},
-			expectedOwner:     b,
-			expectedHandovers: 1,
+			expectedOwner: b,
 		},
 		{
 			name: "samples of a lagging new owner older than the handed over ones are dropped",
@@ -194,8 +192,7 @@ func TestTrackerAccept(t *testing.T) {
 				{replica: b, ts: 25000, accept: true},
 				{replica: b, ts: 20000, accept: true},
 			},
-			expectedOwner:     b,
-			expectedHandovers: 1,
+			expectedOwner: b,
 		},
 		{
 			name: "stale marker of the owner is accepted without a live replica",
@@ -230,8 +227,7 @@ func TestTrackerAccept(t *testing.T) {
 				{replica: b, ts: 35000, stale: true, accept: true},
 				{replica: a, ts: 45000, stale: true, accept: false},
 			},
-			expectedOwner:     b,
-			expectedHandovers: 1,
+			expectedOwner: b,
 		},
 		{
 			name: "stale on the non-owner first does not steal the owner's stale marker",
@@ -254,8 +250,8 @@ func TestTrackerAccept(t *testing.T) {
 				{replica: a, ts: 45000, accept: false},
 				{replica: b, ts: 115000, accept: true},
 			},
-			expectedOwner:    b,
-			expectedTimeouts: 1,
+			expectedOwner:     b,
+			expectedFailovers: 1,
 		},
 		{
 			name: "three replicas",
@@ -269,8 +265,7 @@ func TestTrackerAccept(t *testing.T) {
 				{replica: c, ts: 40000, accept: true},
 				{replica: b, ts: 50000, accept: false},
 			},
-			expectedOwner:     c,
-			expectedHandovers: 1,
+			expectedOwner: c,
 		},
 	} {
 		t.Run(tcase.name, func(t *testing.T) {
@@ -286,8 +281,7 @@ func TestTrackerAccept(t *testing.T) {
 			owner, ok := tr.Replica(tcase.expectedOwner)
 			require.True(t, ok)
 			require.True(t, tr.IsOwner(1, owner))
-			require.Equal(t, tcase.expectedTimeouts, promtest.ToFloat64(tr.metrics.failoversTimeout))
-			require.Equal(t, tcase.expectedHandovers, promtest.ToFloat64(tr.metrics.failoversStale))
+			require.Equal(t, tcase.expectedFailovers, promtest.ToFloat64(tr.metrics.failovers))
 			require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.trackedSeries))
 		})
 	}
