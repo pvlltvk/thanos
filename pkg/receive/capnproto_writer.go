@@ -127,6 +127,12 @@ func (r *CapNProtoWriter) Write(ctx context.Context, wreq *writecapnp.Request) e
 		}
 
 		for _, hp := range series.Histograms {
+			if dedupSeries.tracker != nil {
+				if err := ra.checkTooFarInFuture(lset, hp.Timestamp); err != nil {
+					errorTracker.addHistogramError(err, tLogger, lset, hp.Timestamp)
+					continue
+				}
+			}
 			if !dedupSeries.accept(ref, hp.Timestamp, isStaleHistogram(hp.Histogram, hp.FloatHistogram)) {
 				continue
 			}

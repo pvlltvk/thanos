@@ -384,7 +384,7 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, stale 
 			s.intervalMs &^= handoverFlag
 			s.ownerLastTs = ts
 		}
-		if stale && s.cand != noReplica && s.candLastTs >= ts-t.timeout(s.interval()) {
+		if stale && s.cand != noReplica && !later(ts, s.candLastTs, t.timeout(s.interval())) {
 			// The series vanished only on the owner while another replica still produces it: hand the series
 			// over and drop the stale marker. The new owner may lag behind the old one, so its samples up to the
 			// newest one already appended are dropped instead of being appended out of order. Resetting cand makes
@@ -402,7 +402,7 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, stale 
 		return true, false
 	}
 
-	if ts > s.ownerLastTs+t.timeout(s.interval()) {
+	if later(ts, s.ownerLastTs, t.timeout(s.interval())) {
 		*s = seriesState{owner: r, ownerLastTs: ts, intervalMs: s.interval(), cand: noReplica, candLastTs: noTs}
 		return true, true
 	}
@@ -420,6 +420,12 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, stale 
 		s.cand, s.candLastTs = r, ts
 	}
 	return false, false
+}
+
+// later reports whether ts is more than d after last. Written without last+d, which overflows for timestamps near
+// the int64 limits that a writer may send.
+func later(ts, last, d int64) bool {
+	return ts > last && uint64(ts-last) > uint64(d)
 }
 
 func (t *Tracker) timeout(intervalMs uint32) int64 {

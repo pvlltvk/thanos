@@ -5,6 +5,7 @@ package hadedup
 
 import (
 	"fmt"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -225,6 +226,16 @@ func TestTrackerAccept(t *testing.T) {
 			expectedOwner: b,
 		},
 		{
+			name: "timestamps near the int64 limits don't overflow the timeout",
+			steps: []step{
+				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: math.MaxInt64 - 1000, accept: true},
+				{replica: b, ts: 30000, accept: false},
+				{replica: b, ts: math.MaxInt64, accept: false},
+			},
+			expectedOwner: a,
+		},
+		{
 			name: "interval is not learned from the handover floor",
 			steps: []step{
 				{replica: a, ts: 0, accept: true},
@@ -340,6 +351,25 @@ func TestTrackerAccept(t *testing.T) {
 			require.Equal(t, tcase.expectedFailovers, promtest.ToFloat64(tr.metrics.failovers))
 			require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.trackedSeries))
 		})
+	}
+}
+
+func TestLater(t *testing.T) {
+	t.Parallel()
+
+	for _, tcase := range []struct {
+		ts, last, d int64
+		expected    bool
+	}{
+		{ts: 20001, last: 10000, d: 10000, expected: true},
+		{ts: 20000, last: 10000, d: 10000, expected: false},
+		{ts: 5000, last: 10000, d: 10000, expected: false},
+		{ts: 30000, last: math.MaxInt64 - 1000, d: 10000, expected: false},
+		{ts: math.MaxInt64, last: math.MaxInt64 - 1000, d: 10000, expected: false},
+		{ts: math.MaxInt64, last: math.MinInt64, d: 10000, expected: true},
+		{ts: math.MinInt64 + 1000, last: math.MinInt64, d: 10000, expected: false},
+	} {
+		require.Equal(t, tcase.expected, later(tcase.ts, tcase.last, tcase.d), "%+v", tcase)
 	}
 }
 

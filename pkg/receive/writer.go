@@ -156,6 +156,12 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq []prompb.TimeS
 		}
 
 		for _, hp := range t.Histograms {
+			if dedupSeries.tracker != nil {
+				if err := ra.checkTooFarInFuture(lset, hp.Timestamp); err != nil {
+					errorTracker.addHistogramError(err, tLogger, lset, hp.Timestamp)
+					continue
+				}
+			}
 			if !dedupSeries.accept(ref, hp.Timestamp, value.IsStaleNaN(hp.Sum)) {
 				continue
 			}

@@ -15,6 +15,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/storage"
@@ -326,7 +327,7 @@ func TestWriterHADedupStaleHandover(t *testing.T) {
 	}
 }
 
-// failingAppendStorage fails float appends at failTs like the TSDB rejecting a sample.
+// failingAppendStorage fails float and histogram appends at failTs like the TSDB rejecting a sample.
 type failingAppendStorage struct {
 	*MultiTSDB
 	failTs int64
@@ -367,20 +368,31 @@ func (a failingAppender) Append(ref storage.SeriesRef, l labels.Labels, t int64,
 	return a.Appender.Append(ref, l, t, v)
 }
 
+func (a failingAppender) AppendHistogram(ref storage.SeriesRef, l labels.Labels, t int64, h *histogram.Histogram, fh *histogram.FloatHistogram) (storage.SeriesRef, error) {
+	if t == a.failTs {
+		return 0, storage.ErrOutOfOrderSample
+	}
+	return a.Appender.AppendHistogram(ref, l, t, h, fh)
+}
+
 func TestWriterHADedupRejectedSamples(t *testing.T) {
 	t.Parallel()
 
 	base := time.Now().Add(-time.Hour).UnixMilli()
 	year := (365 * 24 * time.Hour).Milliseconds()
-	sample := func(replica string, ts int64) []prompb.TimeSeries {
-		return []prompb.TimeSeries{{
-			Labels:  withReplicaLabel([]labelpb.ZLabel{{Name: "__name__", Value: "up"}}, replica),
-			Samples: []prompb.Sample{{Value: 1, Timestamp: ts}},
-		}}
+	sample := func(replica string, ts int64, hist bool) []prompb.TimeSeries {
+		series := prompb.TimeSeries{Labels: withReplicaLabel([]labelpb.ZLabel{{Name: "__name__", Value: "up"}}, replica)}
+		if hist {
+			series.Histograms = []prompb.Histogram{prompb.HistogramToHistogramProto(ts, tsdbutil.GenerateTestHistogram(1))}
+		} else {
+			series.Samples = []prompb.Sample{{Value: 1, Timestamp: ts}}
+		}
+		return []prompb.TimeSeries{series}
 	}
 
 	for _, tcase := range []struct {
 		name     string
+		hist     bool
 		failTs   int64
 		writes   []haDedupWrite
 		expected []int64
@@ -396,6 +408,29 @@ func TestWriterHADedupRejectedSamples(t *testing.T) {
 		},
 		{
 			name:   "rejected by the TSDB after a failover",
+			failTs: base + 40000,
+			writes: []haDedupWrite{
+				{replica: "prometheus-0", ts: base},
+				{replica: "prometheus-0", ts: base + 15000},
+				{replica: "prometheus-1", ts: base + 40000},
+				{replica: "prometheus-0", ts: base + 30000},
+				{replica: "prometheus-1", ts: base + 45000},
+			},
+			expected: []int64{base, base + 15000, base + 30000},
+		},
+		{
+			name: "histogram too far in the future",
+			hist: true,
+			writes: []haDedupWrite{
+				{replica: "prometheus-0", ts: base},
+				{replica: "prometheus-1", ts: base + year},
+				{replica: "prometheus-0", ts: base + 15000},
+			},
+			expected: []int64{base, base + 15000},
+		},
+		{
+			name:   "histogram rejected by the TSDB after a failover",
+			hist:   true,
 			failTs: base + 40000,
 			writes: []haDedupWrite{
 				{replica: "prometheus-0", ts: base},
@@ -424,7 +459,7 @@ func TestWriterHADedupRejectedSamples(t *testing.T) {
 				m := newHADedupMultiTSDB(t, prometheus.NewRegistry(), labels.FromStrings("replica", "01"), WithHADedup(testHADedupConfig()))
 				s := failingAppendStorage{MultiTSDB: m, failTs: tcase.failTs}
 				for _, wr := range tcase.writes {
-					err := writeHADedupRequest(t, s, capnp, time.Minute, sample(wr.replica, wr.ts))
+					err := writeHADedupRequest(t, s, capnp, time.Minute, sample(wr.replica, wr.ts, tcase.hist))
 					if wr.ts == base+year || wr.ts == tcase.failTs {
 						require.Error(t, err)
 						continue
@@ -432,9 +467,11 @@ func TestWriterHADedupRejectedSamples(t *testing.T) {
 					require.NoError(t, err)
 				}
 
-				require.Equal(t, map[string]storedSeries{
-					`{__name__="up"}`: {floats: tcase.expected},
-				}, readTenantSeries(t, m))
+				expected := storedSeries{floats: tcase.expected}
+				if tcase.hist {
+					expected = storedSeries{histograms: tcase.expected}
+				}
+				require.Equal(t, map[string]storedSeries{`{__name__="up"}`: expected}, readTenantSeries(t, m))
 			})
 		}
 	}
