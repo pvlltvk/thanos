@@ -8,13 +8,16 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
+	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/value"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/tsdbutil"
@@ -159,34 +162,36 @@ type haDedupWrite struct {
 func writeHADedupRequests(t *testing.T, m *MultiTSDB, capnp bool, writes []haDedupWrite) {
 	t.Helper()
 
+	for _, wr := range writes {
+		require.NoError(t, writeHADedupRequest(t, m, capnp, 0, wr.series))
+	}
+}
+
+func writeHADedupRequest(t *testing.T, s TenantStorage, capnp bool, tooFarInFuture time.Duration, series []prompb.TimeSeries) error {
+	t.Helper()
+
 	if !capnp {
-		w := NewWriter(log.NewNopLogger(), m, &WriterOptions{})
-		for _, wr := range writes {
-			before := make([][]labelpb.ZLabel, 0, len(wr.series))
-			for _, s := range wr.series {
-				before = append(before, labelpb.DeepCopy(s.Labels))
-			}
-			require.NoError(t, w.Write(context.Background(), tenancy.DefaultTenant, wr.series))
-			for i, s := range wr.series {
-				require.Equal(t, before[i], s.Labels, "request labels must not be modified")
-			}
+		before := make([][]labelpb.ZLabel, 0, len(series))
+		for _, s := range series {
+			before = append(before, labelpb.DeepCopy(s.Labels))
 		}
-		return
+		err := NewWriter(log.NewNopLogger(), s, &WriterOptions{TooFarInFutureTimeWindow: int64(tooFarInFuture)}).Write(context.Background(), tenancy.DefaultTenant, series)
+		for i, s := range series {
+			require.Equal(t, before[i], s.Labels, "request labels must not be modified")
+		}
+		return err
 	}
 
-	w := NewCapNProtoWriter(log.NewNopLogger(), m, &CapNProtoWriterOptions{})
-	for _, wr := range writes {
-		capnpReq, err := writecapnp.Build(tenancy.DefaultTenant, wr.series)
-		require.NoError(t, err)
-		syms, err := capnpReq.Symbols()
-		require.NoError(t, err)
-		data, err := capnpReq.Data()
-		require.NoError(t, err)
-		req, err := writecapnp.NewRequest(data.At(0), syms, tenancy.DefaultTenant)
-		require.NoError(t, err)
-		require.NoError(t, w.Write(context.Background(), req))
-		require.NoError(t, req.Close())
-	}
+	capnpReq, err := writecapnp.Build(tenancy.DefaultTenant, series)
+	require.NoError(t, err)
+	syms, err := capnpReq.Symbols()
+	require.NoError(t, err)
+	data, err := capnpReq.Data()
+	require.NoError(t, err)
+	req, err := writecapnp.NewRequest(data.At(0), syms, tenancy.DefaultTenant)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, req.Close()) }()
+	return NewCapNProtoWriter(log.NewNopLogger(), s, &CapNProtoWriterOptions{TooFarInFutureTimeWindow: int64(tooFarInFuture)}).Write(context.Background(), req)
 }
 
 func TestWriterHADedup(t *testing.T) {
@@ -321,6 +326,152 @@ func TestWriterHADedupStaleHandover(t *testing.T) {
 	}
 }
 
+// failingAppendStorage fails float appends at failTs like the TSDB rejecting a sample.
+type failingAppendStorage struct {
+	*MultiTSDB
+	failTs int64
+}
+
+func (s failingAppendStorage) TenantAppendable(tenantID string) (Appendable, error) {
+	a, err := s.MultiTSDB.TenantAppendable(tenantID)
+	return failingAppendable{Appendable: a, failTs: s.failTs}, err
+}
+
+type failingAppendable struct {
+	Appendable
+	failTs int64
+}
+
+func (a failingAppendable) Appender(ctx context.Context) (storage.Appender, error) {
+	app, err := a.Appendable.Appender(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return failingAppender{Appender: app, getRef: app.(storage.GetRef), failTs: a.failTs}, nil
+}
+
+type failingAppender struct {
+	storage.Appender
+	getRef storage.GetRef
+	failTs int64
+}
+
+func (a failingAppender) GetRef(lset labels.Labels, hash uint64) (storage.SeriesRef, labels.Labels) {
+	return a.getRef.GetRef(lset, hash)
+}
+
+func (a failingAppender) Append(ref storage.SeriesRef, l labels.Labels, t int64, v float64) (storage.SeriesRef, error) {
+	if t == a.failTs {
+		return 0, storage.ErrOutOfOrderSample
+	}
+	return a.Appender.Append(ref, l, t, v)
+}
+
+func TestWriterHADedupRejectedSamples(t *testing.T) {
+	t.Parallel()
+
+	base := time.Now().Add(-time.Hour).UnixMilli()
+	year := (365 * 24 * time.Hour).Milliseconds()
+	sample := func(replica string, ts int64) []prompb.TimeSeries {
+		return []prompb.TimeSeries{{
+			Labels:  withReplicaLabel([]labelpb.ZLabel{{Name: "__name__", Value: "up"}}, replica),
+			Samples: []prompb.Sample{{Value: 1, Timestamp: ts}},
+		}}
+	}
+
+	for _, tcase := range []struct {
+		name     string
+		failTs   int64
+		writes   []haDedupWrite
+		expected []int64
+	}{
+		{
+			name: "too far in the future",
+			writes: []haDedupWrite{
+				{replica: "prometheus-0", ts: base},
+				{replica: "prometheus-1", ts: base + year},
+				{replica: "prometheus-0", ts: base + 15000},
+			},
+			expected: []int64{base, base + 15000},
+		},
+		{
+			name:   "rejected by the TSDB after a failover",
+			failTs: base + 40000,
+			writes: []haDedupWrite{
+				{replica: "prometheus-0", ts: base},
+				{replica: "prometheus-0", ts: base + 15000},
+				{replica: "prometheus-1", ts: base + 40000},
+				{replica: "prometheus-0", ts: base + 30000},
+				{replica: "prometheus-1", ts: base + 45000},
+			},
+			expected: []int64{base, base + 15000, base + 30000},
+		},
+		{
+			name:   "rejected first sample of a series",
+			failTs: base,
+			writes: []haDedupWrite{
+				{replica: "prometheus-0", ts: base},
+				{replica: "prometheus-1", ts: base + 5000},
+				{replica: "prometheus-0", ts: base + 15000},
+			},
+			expected: []int64{base + 5000},
+		},
+	} {
+		for _, capnp := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/capnp=%v", tcase.name, capnp), func(t *testing.T) {
+				t.Parallel()
+
+				m := newHADedupMultiTSDB(t, prometheus.NewRegistry(), labels.FromStrings("replica", "01"), WithHADedup(testHADedupConfig()))
+				s := failingAppendStorage{MultiTSDB: m, failTs: tcase.failTs}
+				for _, wr := range tcase.writes {
+					err := writeHADedupRequest(t, s, capnp, time.Minute, sample(wr.replica, wr.ts))
+					if wr.ts == base+year || wr.ts == tcase.failTs {
+						require.Error(t, err)
+						continue
+					}
+					require.NoError(t, err)
+				}
+
+				require.Equal(t, map[string]storedSeries{
+					`{__name__="up"}`: {floats: tcase.expected},
+				}, readTenantSeries(t, m))
+			})
+		}
+	}
+}
+
+// All writers of a dedup-enabled tenant must set the replica label. A series without it is written as it is,
+// even if another replica writes the same series with the label.
+func TestWriterHADedupMissingReplicaLabel(t *testing.T) {
+	t.Parallel()
+
+	base := time.Now().Add(-time.Hour).UnixMilli()
+	lbls := []labelpb.ZLabel{{Name: "__name__", Value: "up"}}
+
+	for _, capnp := range []bool{false, true} {
+		t.Run(fmt.Sprintf("capnp=%v", capnp), func(t *testing.T) {
+			t.Parallel()
+
+			reg := prometheus.NewRegistry()
+			m := newHADedupMultiTSDB(t, reg, labels.FromStrings("replica", "01"), WithHADedup(testHADedupConfig()))
+			writeHADedupRequests(t, m, capnp, []haDedupWrite{
+				{series: []prompb.TimeSeries{{Labels: withReplicaLabel(lbls, "prometheus-0"), Samples: []prompb.Sample{{Value: 1, Timestamp: base}}}}},
+				{series: []prompb.TimeSeries{{Labels: lbls, Samples: []prompb.Sample{{Value: 1, Timestamp: base + 5000}}}}},
+			})
+
+			require.Equal(t, map[string]storedSeries{
+				`{__name__="up"}`: {floats: []int64{base, base + 5000}},
+			}, readTenantSeries(t, m))
+			require.NoError(t, promtest.GatherAndCompare(reg, strings.NewReader(fmt.Sprintf(`
+# HELP thanos_receive_ha_dedup_passthrough_total Total number of series written without HA deduplication, by reason.
+# TYPE thanos_receive_ha_dedup_passthrough_total counter
+thanos_receive_ha_dedup_passthrough_total{reason="no_label",tenant=%q} 1
+thanos_receive_ha_dedup_passthrough_total{reason="replica_table_full",tenant=%q} 0
+`, tenancy.DefaultTenant, tenancy.DefaultTenant)), "thanos_receive_ha_dedup_passthrough_total"))
+		})
+	}
+}
+
 func TestMultiTSDBHADedupTrackerCreatedWithTenant(t *testing.T) {
 	t.Parallel()
 
@@ -448,10 +599,24 @@ func TestHADedupSeries(t *testing.T) {
 	// A failed append returns a zero reference, later samples must still be checked against the tracker.
 	s1 := haDedupSeries{tracker: tracker, replica: r1}
 	require.False(t, s1.accept(7, 5000, false))
-	s1.ref = 7
 	require.False(t, s1.accept(0, 6000, false))
 	require.False(t, s1.acceptExemplars(7))
 	require.True(t, s0.acceptExemplars(7))
+
+	// A failed append of an accepted sample reverts its ownership change.
+	require.True(t, s1.accept(0, 5000+(365*24*time.Hour).Milliseconds(), false))
+	require.True(t, tracker.IsOwner(7, r1))
+	s1.appended(0)
+	require.True(t, tracker.IsOwner(7, r0))
+
+	// The reference is known from the first sample even if its append fails.
+	tracker.Init(8, r0, 15000)
+	require.False(t, tracker.Accept(8, r1, 20000, false))
+	s2 := haDedupSeries{tracker: tracker, replica: r0}
+	require.True(t, s2.accept(8, 0, false))
+	s2.appended(0)
+	require.False(t, s2.accept(0, 30000, true), "stale marker must be handed over to the live replica")
+	require.True(t, tracker.IsOwner(8, r1))
 }
 
 func BenchmarkWriterHADedup(b *testing.B) {

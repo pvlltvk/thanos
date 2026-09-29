@@ -84,6 +84,7 @@ type haDedupSeries struct {
 	ref       storage.SeriesRef
 	pending   bool
 	pendingTs int64
+	change    hadedup.Change
 }
 
 // accept reports whether a sample at ts must be appended to the series with the given head reference.
@@ -92,20 +93,31 @@ func (s *haDedupSeries) accept(ref storage.SeriesRef, ts int64, stale bool) bool
 	if s.tracker == nil {
 		return true
 	}
-	if ref == 0 {
-		ref = s.ref
+	if ref != 0 {
+		s.ref = ref
 	}
-	if ref == 0 {
+	s.change = hadedup.Change{}
+	if s.ref == 0 {
 		// The series doesn't exist in the head yet, so there's no state to decide on: the appended sample elects
 		// its replica once the series has a reference.
 		s.pending, s.pendingTs = true, ts
 		return true
 	}
-	return s.tracker.Accept(ref, s.replica, ts, stale)
+	accept, change := s.tracker.AcceptRevertible(s.ref, s.replica, ts, stale)
+	s.change = change
+	return accept
 }
 
+// appended must be called with the reference returned by appending an accepted sample, which is zero if the append
+// failed. The ownership change of a rejected sample is reverted, so that it can't make later valid samples be dropped.
+// Samples that fail only on commit are not reverted: the request fails with a server error and is retried.
 func (s *haDedupSeries) appended(ref storage.SeriesRef) {
-	if s.tracker == nil || ref == 0 {
+	if s.tracker == nil {
+		return
+	}
+	if ref == 0 {
+		s.tracker.Revert(s.change)
+		s.change = hadedup.Change{}
 		return
 	}
 	s.ref = ref

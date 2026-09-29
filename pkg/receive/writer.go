@@ -39,16 +39,23 @@ type ReceiveAppender struct {
 }
 
 func (ra *ReceiveAppender) Append(ref storage.SeriesRef, lset labels.Labels, t int64, v float64) (storage.SeriesRef, error) {
+	if err := ra.checkTooFarInFuture(lset, t); err != nil {
+		return 0, err
+	}
+	return ra.Appender.Append(ref, lset, t, v)
+}
+
+func (ra *ReceiveAppender) checkTooFarInFuture(lset labels.Labels, t int64) error {
 	if ra.tooFarInFuture > 0 {
 		tooFar := model.Now().Add(time.Duration(ra.tooFarInFuture))
 		if tooFar.Before(model.Time(t)) {
 			level.Warn(ra.tLogger).Log("msg", "block metric too far in the future", "lset", lset,
 				"timestamp", t, "bound", tooFar)
 			// now + tooFarInFutureTimeWindow < sample timestamp
-			return 0, storage.ErrOutOfBounds
+			return storage.ErrOutOfBounds
 		}
 	}
-	return ra.Appender.Append(ref, lset, t, v)
+	return nil
 }
 
 type WriterOptions struct {
@@ -99,11 +106,12 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq []prompb.TimeS
 		ref          storage.SeriesRef
 		errorTracker writeErrorTracker
 	)
-	app = &ReceiveAppender{
+	ra := &ReceiveAppender{
 		tLogger:        tLogger,
 		tooFarInFuture: r.opts.TooFarInFutureTimeWindow,
 		Appender:       app,
 	}
+	app = ra
 
 	for _, t := range wreq {
 		// Check if time series labels are valid. If not, skip the time series
@@ -132,6 +140,13 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq []prompb.TimeS
 
 		// Append as many valid samples as possible, but keep track of the errors.
 		for _, s := range t.Samples {
+			if dedupSeries.tracker != nil {
+				// A rejected sample must not take part in the ownership decision, see haDedupSeries.appended.
+				if err := ra.checkTooFarInFuture(lset, s.Timestamp); err != nil {
+					errorTracker.addSampleError(err, tLogger, lset, s.Timestamp, s.Value)
+					continue
+				}
+			}
 			if !dedupSeries.accept(ref, s.Timestamp, value.IsStaleNaN(s.Value)) {
 				continue
 			}

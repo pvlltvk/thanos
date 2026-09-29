@@ -718,6 +718,11 @@ Flags:
                                  one replica per series and strip the label.
                                  Must be set to the same value on routers
                                  and ingestors and must not start with __.
+                                 All writers of a tenant must set this label:
+                                 series without it are written without
+                                 deduplication, even if another replica writes
+                                 the same series with it, and are counted in
+                                 thanos_receive_ha_dedup_passthrough_total{reason="no_label"}.
                                  Empty disables HA deduplication.
       --receive.ha-dedup.failover-intervals=1.5
                                  [EXPERIMENTAL] Number of the series' learned

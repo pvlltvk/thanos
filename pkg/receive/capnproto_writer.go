@@ -68,11 +68,12 @@ func (r *CapNProtoWriter) Write(ctx context.Context, wreq *writecapnp.Request) e
 		ref          storage.SeriesRef
 		errorTracker = &writeErrorTracker{}
 	)
-	app = &ReceiveAppender{
+	ra := &ReceiveAppender{
 		tLogger:        tLogger,
 		tooFarInFuture: r.opts.TooFarInFutureTimeWindow,
 		Appender:       app,
 	}
+	app = ra
 
 	var (
 		series  writecapnp.Series
@@ -110,6 +111,13 @@ func (r *CapNProtoWriter) Write(ctx context.Context, wreq *writecapnp.Request) e
 
 		// Append as many valid samples as possible, but keep track of the errors.
 		for _, s := range series.Samples {
+			if dedupSeries.tracker != nil {
+				// A rejected sample must not take part in the ownership decision, see haDedupSeries.appended.
+				if err := ra.checkTooFarInFuture(lset, s.Timestamp); err != nil {
+					errorTracker.addSampleError(err, tLogger, lset, s.Timestamp, s.Value)
+					continue
+				}
+			}
 			if !dedupSeries.accept(ref, s.Timestamp, value.IsStaleNaN(s.Value)) {
 				continue
 			}

@@ -25,6 +25,11 @@ const (
 	noReplica  = math.MaxUint16
 	noTs       = math.MinInt64
 
+	// handoverFlag is set in seriesState.intervalMs while ownerLastTs holds the stale handover floor. Learned
+	// intervals are capped below it.
+	handoverFlag  = 1 << 31
+	maxIntervalMs = handoverFlag - 1
+
 	// MaxReplicasLimit is the maximum allowed value of Config.MaxReplicas.
 	MaxReplicasLimit = noReplica
 
@@ -34,7 +39,8 @@ const (
 
 // Config configures a Tracker.
 type Config struct {
-	// ReplicaLabel is the name of the label identifying the HA replica.
+	// ReplicaLabel is the name of the label identifying the HA replica. All writers of a tenant must set it: series
+	// without it are written without deduplication, even if another replica writes the same series with it.
 	ReplicaLabel string
 	// FailoverIntervals is the number of learned scrape intervals of owner silence after which another replica takes over.
 	FailoverIntervals float64
@@ -83,16 +89,20 @@ func (c Config) Validate() error {
 }
 
 type seriesState struct {
-	// ownerLastTs is the timestamp of the newest sample accepted from the owner.
+	// ownerLastTs is the timestamp of the newest sample accepted from the owner. After a stale handover, while
+	// handoverFlag is set, it is the timestamp up to which samples of the new owner are dropped.
 	ownerLastTs int64
-	// candLastTs is the timestamp of the newest sample seen from cand. While cand is noReplica it holds the
-	// timestamp up to which samples of the owner are dropped after a stale handover, or noTs.
+	// candLastTs is the timestamp of the newest sample seen from cand, noTs if cand is noReplica.
 	candLastTs int64
-	// intervalMs is the learned sample interval of the owner, 0 if unknown.
+	// intervalMs is the learned sample interval of the owner, 0 if unknown, possibly with handoverFlag set.
 	intervalMs uint32
 	owner      uint16
-	// cand is the most recent non-owner replica that is still sending samples, noReplica if none.
+	// cand is the non-owner replica with the newest samples that is still sending them, noReplica if none.
 	cand uint16
+}
+
+func (s *seriesState) interval() uint32 {
+	return s.intervalMs &^ handoverFlag
 }
 
 type stripe struct {
@@ -253,12 +263,27 @@ func (t *Tracker) Passthrough(reason string) {
 	}
 }
 
+// Change is the state change of a series made by accepting a sample, see Tracker.Revert. The zero value is no change.
+type Change struct {
+	ref        storage.SeriesRef
+	prev, next seriesState
+	created    bool
+}
+
 // Accept decides whether the sample at ts written by replica to the series with the given head reference
 // should be appended, and updates the series state accordingly.
 func (t *Tracker) Accept(ref storage.SeriesRef, replica uint16, ts int64, stale bool) bool {
+	accept, _ := t.AcceptRevertible(ref, replica, ts, stale)
+	return accept
+}
+
+// AcceptRevertible is like Accept, but for accepted samples it also returns the change of the series state, which
+// must be reverted if appending the sample fails.
+func (t *Tracker) AcceptRevertible(ref storage.SeriesRef, replica uint16, ts int64, stale bool) (bool, Change) {
 	s := &t.stripes[uint64(ref)%numStripes]
 	s.mtx.Lock()
-	st, exists := s.series[ref]
+	prev, exists := s.series[ref]
+	st := prev
 	accept, failover := t.decide(&st, exists, replica, ts, stale)
 	if s.series == nil {
 		s.series = map[storage.SeriesRef]seriesState{}
@@ -270,7 +295,35 @@ func (t *Tracker) Accept(ref storage.SeriesRef, replica uint16, ts int64, stale 
 		t.metrics.trackedSeries.Inc()
 	}
 	t.observe(accept, failover)
-	return accept
+	if !accept {
+		return false, Change{}
+	}
+	return true, Change{ref: ref, prev: prev, next: st, created: !exists}
+}
+
+// Revert restores the state of a series from before the given change, unless the state has been changed since.
+func (t *Tracker) Revert(c Change) {
+	if !c.created && c.prev == c.next {
+		return
+	}
+	s := &t.stripes[uint64(c.ref)%numStripes]
+	s.mtx.Lock()
+	cur, ok := s.series[c.ref]
+	// Another writer may have taken a decision based on the changed state in the meantime. Its decision is kept
+	// rather than overwritten, as it may have appended a sample already.
+	reverted := ok && cur == c.next
+	if reverted {
+		if c.created {
+			delete(s.series, c.ref)
+		} else {
+			s.series[c.ref] = c.prev
+		}
+	}
+	s.mtx.Unlock()
+
+	if reverted && c.created {
+		t.metrics.trackedSeries.Dec()
+	}
 }
 
 // Init records replica as the owner of a series created by appending its sample at ts, unless another
@@ -323,18 +376,23 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, stale 
 	}
 
 	if r == s.owner {
-		if s.cand == noReplica && ts <= s.candLastTs {
-			return false, false
+		if s.intervalMs&handoverFlag != 0 {
+			if ts <= s.ownerLastTs {
+				return false, false
+			}
+			// The distance to the floor is the phase offset between the replicas, not an interval of the new owner.
+			s.intervalMs &^= handoverFlag
+			s.ownerLastTs = ts
 		}
-		if stale && s.cand != noReplica && s.candLastTs >= ts-t.timeout(s.intervalMs) {
+		if stale && s.cand != noReplica && s.candLastTs >= ts-t.timeout(s.interval()) {
 			// The series vanished only on the owner while another replica still produces it: hand the series
 			// over and drop the stale marker. The new owner may lag behind the old one, so its samples up to the
 			// newest one already appended are dropped instead of being appended out of order. Resetting cand makes
 			// the new owner's own stale marker be accepted if the series vanishes there too, instead of handing it
 			// back and forth.
-			last := max(s.ownerLastTs, s.candLastTs)
-			s.owner, s.ownerLastTs = s.cand, last
-			s.cand, s.candLastTs = noReplica, last
+			s.owner, s.ownerLastTs = s.cand, max(s.ownerLastTs, s.candLastTs)
+			s.cand, s.candLastTs = noReplica, noTs
+			s.intervalMs |= handoverFlag
 			return false, false
 		}
 		if ts > s.ownerLastTs {
@@ -344,8 +402,8 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, stale 
 		return true, false
 	}
 
-	if ts > s.ownerLastTs+t.timeout(s.intervalMs) {
-		*s = seriesState{owner: r, ownerLastTs: ts, intervalMs: s.intervalMs, cand: noReplica, candLastTs: noTs}
+	if ts > s.ownerLastTs+t.timeout(s.interval()) {
+		*s = seriesState{owner: r, ownerLastTs: ts, intervalMs: s.interval(), cand: noReplica, candLastTs: noTs}
 		return true, true
 	}
 
@@ -356,10 +414,10 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, stale 
 		}
 		return false, false
 	}
-	if s.cand != r {
+	// Replacing cand by arrival order would let a lagging replica evict a live one, and the owner's stale marker
+	// would then be accepted instead of handing the series over.
+	if ts > s.candLastTs {
 		s.cand, s.candLastTs = r, ts
-	} else if ts > s.candLastTs {
-		s.candLastTs = ts
 	}
 	return false, false
 }
@@ -376,7 +434,7 @@ func (t *Tracker) timeout(intervalMs uint32) int64 {
 // Occasional gaps are thus undone by the next regular sample, while a real interval change is learned over a few
 // dozen samples.
 func learnInterval(cur uint32, delta int64) uint32 {
-	if delta <= 0 || delta > math.MaxUint32 {
+	if delta <= 0 || delta > maxIntervalMs {
 		return cur
 	}
 	if cur == 0 || delta <= int64(cur) {

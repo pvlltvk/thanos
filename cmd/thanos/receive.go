@@ -1197,7 +1197,7 @@ func (rc *receiveConfig) registerFlag(cmd extkingpin.FlagClause) {
 
 	cmd.Flag("receive.retry-after-jitter", "Fraction of the backoff duration to use as random jitter for the Retry-After header (e.g. 0.5 = ±50%).").Default("0.5").Float64Var(&rc.retryAfterJitter)
 
-	cmd.Flag("receive.ha-dedup.replica-label", "[EXPERIMENTAL] Label name identifying HA Prometheus replicas that write identical series. If set, routers hash series ignoring this label and ingestors keep samples of only one replica per series and strip the label. Must be set to the same value on routers and ingestors and must not start with __. Empty disables HA deduplication.").
+	cmd.Flag("receive.ha-dedup.replica-label", "[EXPERIMENTAL] Label name identifying HA Prometheus replicas that write identical series. If set, routers hash series ignoring this label and ingestors keep samples of only one replica per series and strip the label. Must be set to the same value on routers and ingestors and must not start with __. All writers of a tenant must set this label: series without it are written without deduplication, even if another replica writes the same series with it, and are counted in thanos_receive_ha_dedup_passthrough_total{reason=\"no_label\"}. Empty disables HA deduplication.").
 		Default("").StringVar(&rc.haDedupReplicaLabel)
 	cmd.Flag("receive.ha-dedup.failover-intervals", "[EXPERIMENTAL] Number of the series' learned sample intervals without samples from the owning replica after which another replica takes the series over. Must be greater than 1.").
 		Default("1.5").Float64Var(&rc.haDedupFailoverIntervals)

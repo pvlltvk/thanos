@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/prometheus/client_golang/prometheus"
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
@@ -195,6 +196,49 @@ func TestTrackerAccept(t *testing.T) {
 			expectedOwner: b,
 		},
 		{
+			name: "handover floor is kept when the old owner becomes candidate again",
+			steps: []step{
+				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 1000, accept: true},
+				{replica: a, ts: 2000, accept: true},
+				{replica: b, ts: 500, accept: false},
+				{replica: a, ts: 3000, stale: true, accept: false},
+				{replica: a, ts: 4000, accept: false},
+				{replica: b, ts: 1500, accept: false},
+				{replica: b, ts: 2500, accept: true},
+				{replica: b, ts: 1800, accept: true},
+			},
+			expectedOwner: b,
+		},
+		{
+			name: "handover floor is kept when a third replica becomes candidate",
+			steps: []step{
+				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 1000, accept: true},
+				{replica: a, ts: 2000, accept: true},
+				{replica: b, ts: 500, accept: false},
+				{replica: a, ts: 3000, stale: true, accept: false},
+				{replica: c, ts: 800, accept: false},
+				{replica: b, ts: 1500, accept: false},
+				{replica: b, ts: 2500, accept: true},
+			},
+			expectedOwner: b,
+		},
+		{
+			name: "interval is not learned from the handover floor",
+			steps: []step{
+				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 15000, accept: true},
+				{replica: a, ts: 30000, accept: true},
+				{replica: b, ts: 29000, accept: false},
+				{replica: a, ts: 45000, stale: true, accept: false},
+				{replica: b, ts: 31000, accept: true},
+				{replica: b, ts: 46000, accept: true},
+				{replica: a, ts: 57000, accept: false},
+			},
+			expectedOwner: b,
+		},
+		{
 			name: "stale marker of the owner is accepted without a live replica",
 			steps: []step{
 				{replica: a, ts: 0, accept: true},
@@ -267,6 +311,18 @@ func TestTrackerAccept(t *testing.T) {
 			},
 			expectedOwner: c,
 		},
+		{
+			name: "lagging third replica does not replace a live candidate",
+			steps: []step{
+				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 15000, accept: true},
+				{replica: b, ts: 20000, accept: false},
+				{replica: c, ts: -300000, accept: false},
+				{replica: a, ts: 30000, stale: true, accept: false},
+				{replica: b, ts: 35000, accept: true},
+			},
+			expectedOwner: b,
+		},
 	} {
 		t.Run(tcase.name, func(t *testing.T) {
 			t.Parallel()
@@ -302,6 +358,84 @@ func TestTrackerInit(t *testing.T) {
 	require.False(t, tr.Accept(1, b, 2000, false))
 	require.True(t, tr.Accept(1, a, 15000, false))
 	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.trackedSeries))
+}
+
+func TestTrackerRevert(t *testing.T) {
+	t.Parallel()
+
+	year := (365 * 24 * time.Hour).Milliseconds()
+
+	t.Run("failover", func(t *testing.T) {
+		t.Parallel()
+
+		tr := NewTracker(testConfig(), prometheus.NewRegistry())
+		a, _ := tr.Replica("a")
+		b, _ := tr.Replica("b")
+		require.True(t, tr.Accept(1, a, 0, false))
+		require.True(t, tr.Accept(1, a, 15000, false))
+
+		accept, c := tr.AcceptRevertible(1, b, year, false)
+		require.True(t, accept)
+		require.True(t, tr.IsOwner(1, b))
+		tr.Revert(c)
+		require.True(t, tr.IsOwner(1, a))
+		require.True(t, tr.Accept(1, a, 30000, false))
+		require.False(t, tr.Accept(1, b, 35000, false))
+	})
+
+	t.Run("created state", func(t *testing.T) {
+		t.Parallel()
+
+		tr := NewTracker(testConfig(), prometheus.NewRegistry())
+		a, _ := tr.Replica("a")
+		b, _ := tr.Replica("b")
+
+		accept, c := tr.AcceptRevertible(1, a, year, false)
+		require.True(t, accept)
+		tr.Revert(c)
+		require.Equal(t, 0.0, promtest.ToFloat64(tr.metrics.trackedSeries))
+		require.True(t, tr.Accept(1, b, 0, false))
+		require.True(t, tr.IsOwner(1, b))
+	})
+
+	t.Run("changed since", func(t *testing.T) {
+		t.Parallel()
+
+		tr := NewTracker(testConfig(), prometheus.NewRegistry())
+		a, _ := tr.Replica("a")
+		b, _ := tr.Replica("b")
+		require.True(t, tr.Accept(1, a, 0, false))
+		require.True(t, tr.Accept(1, a, 15000, false))
+
+		accept, c := tr.AcceptRevertible(1, a, 30000, false)
+		require.True(t, accept)
+		require.False(t, tr.Accept(1, b, 40000, false))
+		tr.Revert(c)
+		// Reverting to the owner's last sample at 15s would make this a failover.
+		require.False(t, tr.Accept(1, b, 50000, false))
+		require.True(t, tr.IsOwner(1, a))
+	})
+
+	t.Run("dropped sample", func(t *testing.T) {
+		t.Parallel()
+
+		tr := NewTracker(testConfig(), prometheus.NewRegistry())
+		a, _ := tr.Replica("a")
+		b, _ := tr.Replica("b")
+		require.True(t, tr.Accept(1, a, 0, false))
+
+		accept, c := tr.AcceptRevertible(1, b, 5000, false)
+		require.False(t, accept)
+		require.Equal(t, Change{}, c)
+		tr.Revert(c)
+		require.False(t, tr.Accept(1, a, 10000, true), "b must still be the candidate")
+	})
+}
+
+func TestSeriesStateSize(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, uintptr(24), unsafe.Sizeof(seriesState{}))
 }
 
 func TestTrackerSeriesAreIndependent(t *testing.T) {
@@ -486,6 +620,11 @@ func TestLearnInterval(t *testing.T) {
 	require.Equal(t, uint32(10000), learnInterval(cur, 10000))
 	require.Equal(t, uint32(10000), learnInterval(10000, 0))
 	require.Equal(t, uint32(10000), learnInterval(10000, -5))
+
+	// The top bit is reserved for handoverFlag.
+	require.Equal(t, uint32(10000), learnInterval(10000, maxIntervalMs+1))
+	require.Equal(t, uint32(maxIntervalMs), learnInterval(maxIntervalMs-1, maxIntervalMs))
+	require.Zero(t, learnInterval(maxIntervalMs/2+1, maxIntervalMs)&handoverFlag)
 }
 
 func TestTrackerConcurrent(t *testing.T) {
@@ -501,7 +640,9 @@ func TestTrackerConcurrent(t *testing.T) {
 			for i := range 1000 {
 				ts := int64(i * 15000)
 				ref := storage.SeriesRef(i % 100)
-				tr.Accept(ref, r, ts, false)
+				if _, c := tr.AcceptRevertible(ref, r, ts, false); i%10 == 0 {
+					tr.Revert(c)
+				}
 				tr.IsOwner(ref, r)
 			}
 		})
