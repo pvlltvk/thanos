@@ -642,6 +642,13 @@ func TestTrackerConcurrent(t *testing.T) {
 		})
 	}
 	wg.Go(func() {
+		r, ok := tr.Replica("replica-2")
+		require.True(t, ok)
+		for i := range 1000 {
+			tr.Init(storage.SeriesRef(i%100), r, int64(i*15000))
+		}
+	})
+	wg.Go(func() {
 		for i := range 1000 {
 			tr.Forget(storage.SeriesRef(i % 100))
 		}
@@ -658,7 +665,7 @@ func TestTrackerConcurrent(t *testing.T) {
 		tracked += len(tr.stripes[i].series)
 	}
 	require.Equal(t, float64(tracked), promtest.ToFloat64(tr.metrics.trackedSeries))
-	require.Equal(t, 4000.0, promtest.ToFloat64(tr.metrics.accepted)+promtest.ToFloat64(tr.metrics.dropped))
+	require.Equal(t, 5000.0, promtest.ToFloat64(tr.metrics.accepted)+promtest.ToFloat64(tr.metrics.dropped))
 }
 
 func TestConfigValidate(t *testing.T) {

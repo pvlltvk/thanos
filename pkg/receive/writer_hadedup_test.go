@@ -390,13 +390,17 @@ func TestWriterHADedupRejectedSamples(t *testing.T) {
 		}
 		return []prompb.TimeSeries{series}
 	}
+	exemplar := func(ts int64) []prompb.Exemplar {
+		return []prompb.Exemplar{{Labels: []labelpb.ZLabel{{Name: "trace_id", Value: "a"}}, Value: 1, Timestamp: ts}}
+	}
 
 	for _, tcase := range []struct {
-		name     string
-		hist     bool
-		failTs   int64
-		writes   []haDedupWrite
-		expected []int64
+		name              string
+		hist              bool
+		failTs            int64
+		writes            []haDedupWrite
+		expected          []int64
+		expectedExemplars []int64
 	}{
 		{
 			name: "too far in the future",
@@ -452,6 +456,31 @@ func TestWriterHADedupRejectedSamples(t *testing.T) {
 			},
 			expected: []int64{base + 5000},
 		},
+		{
+			// Accepted limit: the rejected sample's series is forgotten, so exemplars of the rejected replica that
+			// follow in the request are appended. Those of the rejected series itself are not, as the failed append
+			// leaves no reference to append them to.
+			name:   "exemplars of a rejected failover sample",
+			failTs: base + 40000,
+			writes: []haDedupWrite{
+				{replica: "prometheus-0", ts: base},
+				{replica: "prometheus-0", ts: base + 15000},
+				{replica: "prometheus-1", ts: base + 40000, series: []prompb.TimeSeries{
+					{
+						Labels:    withReplicaLabel([]labelpb.ZLabel{{Name: "__name__", Value: "up"}}, "prometheus-1"),
+						Samples:   []prompb.Sample{{Value: 1, Timestamp: base + 40000}},
+						Exemplars: exemplar(base + 40000),
+					},
+					{
+						Labels:    withReplicaLabel([]labelpb.ZLabel{{Name: "__name__", Value: "up"}}, "prometheus-1"),
+						Exemplars: exemplar(base + 41000),
+					},
+				}},
+				{replica: "prometheus-0", ts: base + 30000},
+			},
+			expected:          []int64{base, base + 15000, base + 30000},
+			expectedExemplars: []int64{base + 41000},
+		},
 	} {
 		for _, capnp := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/capnp=%v", tcase.name, capnp), func(t *testing.T) {
@@ -460,7 +489,11 @@ func TestWriterHADedupRejectedSamples(t *testing.T) {
 				m := newHADedupMultiTSDB(t, prometheus.NewRegistry(), labels.FromStrings("replica", "01"), WithHADedup(testHADedupConfig()))
 				s := failingAppendStorage{MultiTSDB: m, failTs: tcase.failTs}
 				for _, wr := range tcase.writes {
-					err := writeHADedupRequest(t, s, capnp, time.Minute, sample(wr.replica, wr.ts, tcase.hist))
+					series := wr.series
+					if series == nil {
+						series = sample(wr.replica, wr.ts, tcase.hist)
+					}
+					err := writeHADedupRequest(t, s, capnp, time.Minute, series)
 					if wr.ts == base+year || wr.ts == tcase.failTs {
 						require.Error(t, err)
 						continue
@@ -468,9 +501,9 @@ func TestWriterHADedupRejectedSamples(t *testing.T) {
 					require.NoError(t, err)
 				}
 
-				expected := storedSeries{floats: tcase.expected}
+				expected := storedSeries{floats: tcase.expected, exemplars: tcase.expectedExemplars}
 				if tcase.hist {
-					expected = storedSeries{histograms: tcase.expected}
+					expected = storedSeries{histograms: tcase.expected, exemplars: tcase.expectedExemplars}
 				}
 				require.Equal(t, map[string]storedSeries{`{__name__="up"}`: expected}, readTenantSeries(t, m))
 			})
@@ -541,6 +574,15 @@ func TestWriterHADedupFailedWrites(t *testing.T) {
 	floats := func(replica string, samples ...prompb.Sample) []prompb.TimeSeries {
 		return []prompb.TimeSeries{{Labels: withReplicaLabel([]labelpb.ZLabel{{Name: "__name__", Value: "up"}}, replica), Samples: samples}}
 	}
+	otherFloats := func(replica string, samples ...prompb.Sample) []prompb.TimeSeries {
+		return []prompb.TimeSeries{{Labels: withReplicaLabel([]labelpb.ZLabel{{Name: "__name__", Value: "other"}}, replica), Samples: samples}}
+	}
+	histograms := func(replica string, ts int64) []prompb.TimeSeries {
+		return []prompb.TimeSeries{{
+			Labels:     withReplicaLabel([]labelpb.ZLabel{{Name: "__name__", Value: "latency"}}, replica),
+			Histograms: []prompb.Histogram{prompb.HistogramToHistogramProto(ts, tsdbutil.GenerateTestHistogram(1))},
+		}}
+	}
 	// A histogram with a count not matching its buckets passes the checks before the tracker and is rejected only
 	// by the TSDB.
 	malformedHistogram := func(replica string, ts int64) []prompb.TimeSeries {
@@ -559,9 +601,10 @@ func TestWriterHADedupFailedWrites(t *testing.T) {
 	}
 	base := time.Now().Add(-time.Minute).UnixMilli()
 	for _, tcase := range []struct {
-		name     string
-		writes   []failedWrite
-		expected []int64
+		name          string
+		writes        []failedWrite
+		expected      []int64
+		expectedOther []int64
 	}{
 		{
 			name: "owner writes while a rejected failover sample is appended",
@@ -609,12 +652,111 @@ func TestWriterHADedupFailedWrites(t *testing.T) {
 			},
 			expected: []int64{base + 5000, base + 20000},
 		},
+		{
+			name: "rejected failover histogram",
+			writes: []failedWrite{
+				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base})},
+				{series: malformedHistogram("prometheus-1", base+90000)},
+				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 30000})},
+			},
+			expected: []int64{base, base + 30000},
+		},
+		{
+			name: "rejected histogram of a new series",
+			writes: []failedWrite{
+				{series: malformedHistogram("prometheus-0", base)},
+				{series: floats("prometheus-1", prompb.Sample{Value: 1, Timestamp: base + 5000})},
+				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 15000})},
+			},
+			expected: []int64{base + 5000},
+		},
+		{
+			name: "commit failure after a timeout failover is retried",
+			writes: []failedWrite{
+				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base})},
+				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 15000})},
+				{series: floats("prometheus-1", prompb.Sample{Value: 1, Timestamp: base + 40000}), failCommit: true, err: true},
+				{series: floats("prometheus-1", prompb.Sample{Value: 1, Timestamp: base + 40000})},
+				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 30000})},
+			},
+			expected: []int64{base, base + 15000, base + 40000},
+		},
+		{
+			name: "commit failure after a timeout failover keeps the old owner",
+			writes: []failedWrite{
+				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base})},
+				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 15000})},
+				{series: floats("prometheus-1", prompb.Sample{Value: 1, Timestamp: base + 40000}), failCommit: true, err: true},
+				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 30000})},
+				{series: floats("prometheus-1", prompb.Sample{Value: 1, Timestamp: base + 40000})},
+			},
+			expected: []int64{base, base + 15000, base + 30000},
+		},
+		{
+			name: "commit failure after a failover and a handover of the same series is retried",
+			writes: []failedWrite{
+				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base})},
+				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 15000})},
+				{
+					series: slices.Concat(
+						floats("prometheus-1", prompb.Sample{Value: 1, Timestamp: base + 40000}),
+						floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 45000}),
+						floats("prometheus-1", prompb.Sample{Value: stale, Timestamp: base + 50000}),
+					),
+					failCommit: true,
+					err:        true,
+				},
+				{series: slices.Concat(
+					floats("prometheus-1", prompb.Sample{Value: 1, Timestamp: base + 40000}),
+					floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 45000}),
+					floats("prometheus-1", prompb.Sample{Value: stale, Timestamp: base + 50000}),
+				)},
+				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 60000})},
+			},
+			expected: []int64{base, base + 15000, base + 40000, base + 60000},
+		},
+		{
+			name: "commit failure keeps the state of series whose owner did not change",
+			writes: []failedWrite{
+				{series: slices.Concat(floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base}), otherFloats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base}))},
+				{series: slices.Concat(floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 15000}), otherFloats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 15000}))},
+				{
+					series:     slices.Concat(floats("prometheus-1", prompb.Sample{Value: 1, Timestamp: base + 40000}), otherFloats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 40000})),
+					failCommit: true,
+					err:        true,
+				},
+				{series: otherFloats("prometheus-1", prompb.Sample{Value: 1, Timestamp: base + 25000})},
+				{series: slices.Concat(floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 30000}), otherFloats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 40000}))},
+			},
+			expected:      []int64{base, base + 15000, base + 30000},
+			expectedOther: []int64{base, base + 15000, base + 40000},
+		},
+		{
+			// Accepted limit: forgetting the failed request's failover also drops the state established by the
+			// concurrent request, like a restart. The re-elected old owner's lagging sample is rejected as out of order.
+			name: "commit failure while a successful request writes the same series",
+			writes: []failedWrite{
+				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base})},
+				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 15000})},
+				{
+					series:     slices.Concat(floats("prometheus-1", prompb.Sample{Value: 1, Timestamp: base + 40000}), histograms("prometheus-1", base+40000)),
+					concurrent: floats("prometheus-1", prompb.Sample{Value: 1, Timestamp: base + 50000}),
+					failCommit: true,
+					err:        true,
+				},
+				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 45000}), err: true},
+				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 60000})},
+				{series: floats("prometheus-1", prompb.Sample{Value: 1, Timestamp: base + 55000})},
+			},
+			expected: []int64{base, base + 15000, base + 50000, base + 60000},
+		},
 	} {
 		for _, capnp := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/capnp=%v", tcase.name, capnp), func(t *testing.T) {
 				t.Parallel()
 
-				m := newHADedupMultiTSDB(t, prometheus.NewRegistry(), labels.FromStrings("replica", "01"), WithHADedup(testHADedupConfig()))
+				reg := prometheus.NewRegistry()
+				m := newHADedupMultiTSDB(t, reg, labels.FromStrings("replica", "01"), WithHADedup(testHADedupConfig()))
 				s := &faultyAppendStorage{MultiTSDB: m}
 				for _, wr := range tcase.writes {
 					s.failCommit = wr.failCommit
@@ -632,10 +774,70 @@ func TestWriterHADedupFailedWrites(t *testing.T) {
 					require.NoError(t, err)
 				}
 
-				require.Equal(t, map[string]storedSeries{`{__name__="up"}`: {floats: tcase.expected}}, readTenantSeries(t, m))
+				expected := map[string]storedSeries{`{__name__="up"}`: {floats: tcase.expected}}
+				if tcase.expectedOther != nil {
+					expected[`{__name__="other"}`] = storedSeries{floats: tcase.expectedOther}
+				}
+				require.Equal(t, expected, readTenantSeries(t, m))
+				require.NoError(t, promtest.GatherAndCompare(reg, strings.NewReader(fmt.Sprintf(`
+# HELP thanos_receive_ha_dedup_tracked_series Number of series tracked by HA deduplication.
+# TYPE thanos_receive_ha_dedup_tracked_series gauge
+thanos_receive_ha_dedup_tracked_series{tenant=%q} %d
+`, tenancy.DefaultTenant, len(expected))), "thanos_receive_ha_dedup_tracked_series"))
 			})
 		}
 	}
+}
+
+// capnpRequestFailingAt returns a request of the given series whose decoding fails once the samples read exceed
+// readLimit bytes. It emulates a corrupt message without depending on its memory layout.
+func capnpRequestFailingAt(t *testing.T, series []prompb.TimeSeries, readLimit uint64) *writecapnp.Request {
+	t.Helper()
+
+	capnpReq, err := writecapnp.Build(tenancy.DefaultTenant, series)
+	require.NoError(t, err)
+	syms, err := capnpReq.Symbols()
+	require.NoError(t, err)
+	data, err := capnpReq.Data()
+	require.NoError(t, err)
+	req, err := writecapnp.NewRequest(data.At(0), syms, tenancy.DefaultTenant)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, req.Close()) })
+	capnpReq.Message().ResetReadLimit(readLimit)
+	return req
+}
+
+func TestCapNProtoWriterHADedupRequestError(t *testing.T) {
+	t.Parallel()
+
+	base := time.Now().Add(-time.Minute).UnixMilli()
+	floats := func(name, replica string, samples ...prompb.Sample) prompb.TimeSeries {
+		return prompb.TimeSeries{Labels: withReplicaLabel([]labelpb.ZLabel{{Name: "__name__", Value: name}}, replica), Samples: samples}
+	}
+
+	reg := prometheus.NewRegistry()
+	m := newHADedupMultiTSDB(t, reg, labels.FromStrings("replica", "01"), WithHADedup(testHADedupConfig()))
+	for _, ts := range []int64{base, base + 15000} {
+		require.NoError(t, writeHADedupRequest(t, m, true, time.Minute, []prompb.TimeSeries{floats("up", "prometheus-0", prompb.Sample{Value: 1, Timestamp: ts})}))
+	}
+
+	// The failover of the first series is decided before the samples of the second one exceed the read limit.
+	req := capnpRequestFailingAt(t, []prompb.TimeSeries{
+		floats("up", "prometheus-1", prompb.Sample{Value: 1, Timestamp: base + 40000}),
+		floats("other", "prometheus-1", make([]prompb.Sample, 1024)...),
+	}, 4096)
+	err := NewCapNProtoWriter(log.NewNopLogger(), m, &CapNProtoWriterOptions{TooFarInFutureTimeWindow: int64(time.Minute)}).Write(context.Background(), req)
+	require.ErrorContains(t, err, "request.At")
+	require.NoError(t, promtest.GatherAndCompare(reg, strings.NewReader(fmt.Sprintf(`
+# HELP thanos_receive_ha_dedup_failovers_total Total number of series taken over by another HA replica after the owning replica stopped writing them.
+# TYPE thanos_receive_ha_dedup_failovers_total counter
+thanos_receive_ha_dedup_failovers_total{tenant=%q} 1
+`, tenancy.DefaultTenant)), "thanos_receive_ha_dedup_failovers_total"))
+
+	require.NoError(t, writeHADedupRequest(t, m, true, time.Minute, []prompb.TimeSeries{floats("up", "prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 30000})}))
+	require.Equal(t, map[string]storedSeries{
+		`{__name__="up"}`: {floats: []int64{base, base + 15000, base + 30000}},
+	}, readTenantSeries(t, m))
 }
 
 // All writers of a dedup-enabled tenant must set the replica label. A series without it is written as it is,
@@ -784,7 +986,8 @@ func TestHADedupWriterPrepare(t *testing.T) {
 func TestHADedupSeries(t *testing.T) {
 	t.Parallel()
 
-	tracker := hadedup.NewTracker(testHADedupConfig(), prometheus.NewRegistry())
+	reg := prometheus.NewRegistry()
+	tracker := hadedup.NewTracker(testHADedupConfig(), reg)
 	r0, _ := tracker.Replica("prometheus-0")
 	r1, _ := tracker.Replica("prometheus-1")
 	w := haDedupWriter{tracker: tracker}
@@ -833,6 +1036,26 @@ func TestHADedupSeries(t *testing.T) {
 	require.Nil(t, w.ownerChanged)
 	require.True(t, tracker.IsOwner(7, r1))
 	require.True(t, tracker.IsOwner(8, r0))
+
+	// A failover and a handover of the same series in one request record it twice.
+	require.True(t, tracker.Init(9, r0, 0))
+	s3 := haDedupSeries{tracker: tracker, replica: r1}
+	require.True(t, w.accept(&s3, 9, 90000, false))
+	w.appended(&s3, 9)
+	s4 := haDedupSeries{tracker: tracker, replica: r0}
+	require.False(t, w.accept(&s4, 9, 95000, false))
+	require.False(t, w.accept(&s3, 9, 100000, true))
+	require.True(t, tracker.IsOwner(9, r0))
+	require.Equal(t, []storage.SeriesRef{9, 9}, w.ownerChanged)
+
+	w.forget()
+	require.True(t, tracker.IsOwner(9, r0))
+	require.True(t, tracker.IsOwner(9, r1))
+	require.NoError(t, promtest.GatherAndCompare(reg, strings.NewReader(`
+# HELP thanos_receive_ha_dedup_tracked_series Number of series tracked by HA deduplication.
+# TYPE thanos_receive_ha_dedup_tracked_series gauge
+thanos_receive_ha_dedup_tracked_series 0
+`), "thanos_receive_ha_dedup_tracked_series"))
 }
 
 func BenchmarkWriterHADedup(b *testing.B) {
