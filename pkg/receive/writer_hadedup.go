@@ -28,6 +28,15 @@ type haDedupWriter struct {
 	scratch []labelpb.ZLabel
 	// ownerChanged lists the series whose owner was changed by the request, see forget.
 	ownerChanged []storage.SeriesRef
+	counts       hadedup.Counts
+
+	// The series of a request normally come from a single Prometheus, so the lookup of the last replica value is
+	// reused while it repeats. The value references request memory without being copied: the request's label
+	// strings stay unmodified until the request is written, prepare with inPlace only moves label headers.
+	lastReplicaValue string
+	lastReplica      uint16
+	lastReplicaOK    bool
+	lastReplicaSet   bool
 }
 
 func newHADedupWriter(s TenantStorage, tenantID string) (haDedupWriter, error) {
@@ -52,12 +61,12 @@ func (w *haDedupWriter) prepare(lbls []labelpb.ZLabel, inPlace bool) ([]labelpb.
 		return strings.Compare(l.Name, name)
 	})
 	if !ok {
-		w.tracker.Passthrough(hadedup.PassthroughReasonNoLabel)
+		w.counts.NoLabel++
 		return lbls, haDedupSeries{}
 	}
-	replica, ok := w.tracker.Replica(lbls[i].Value)
+	replica, ok := w.replica(lbls[i].Value)
 	if !ok {
-		w.tracker.Passthrough(hadedup.PassthroughReasonReplicaTableFull)
+		w.counts.ReplicaTableFull++
 		return lbls, haDedupSeries{}
 	}
 
@@ -67,7 +76,24 @@ func (w *haDedupWriter) prepare(lbls []labelpb.ZLabel, inPlace bool) ([]labelpb.
 		w.scratch = removeLabelAt(w.scratch, lbls, i)
 		lbls = w.scratch
 	}
-	return lbls, haDedupSeries{tracker: w.tracker, replica: replica}
+	return lbls, haDedupSeries{dedup: true, replica: replica}
+}
+
+func (w *haDedupWriter) replica(value string) (uint16, bool) {
+	if !w.lastReplicaSet || value != w.lastReplicaValue {
+		w.lastReplica, w.lastReplicaOK = w.tracker.Replica(value)
+		w.lastReplicaValue, w.lastReplicaSet = value, true
+	}
+	return w.lastReplica, w.lastReplicaOK
+}
+
+// flush records the outcomes of the request's decisions in the tracker's metrics.
+func (w *haDedupWriter) flush() {
+	if w.tracker == nil {
+		return
+	}
+	w.tracker.Record(w.counts)
+	w.counts = hadedup.Counts{}
 }
 
 // forget removes the state of the series whose owner was changed by the request. It must be called if the request's
@@ -87,7 +113,7 @@ func removeLabelAt(dst, lbls []labelpb.ZLabel, i int) []labelpb.ZLabel {
 
 // haDedupSeries is the deduplication state of a single series of a request. The zero value accepts everything.
 type haDedupSeries struct {
-	tracker *hadedup.Tracker
+	dedup   bool
 	replica uint16
 
 	// ref is the last known head reference of the series. Appends return a zero reference on error, which must not
@@ -101,7 +127,7 @@ type haDedupSeries struct {
 // accept reports whether a sample at ts must be appended to the series with the given head reference.
 // Every accepted sample must be followed by a call to appended with the reference returned by the append.
 func (w *haDedupWriter) accept(s *haDedupSeries, ref storage.SeriesRef, ts int64, stale bool) bool {
-	if s.tracker == nil {
+	if !s.dedup {
 		return true
 	}
 	if ref != 0 {
@@ -113,7 +139,15 @@ func (w *haDedupWriter) accept(s *haDedupSeries, ref storage.SeriesRef, ts int64
 		s.pending, s.pendingTs = true, ts
 		return true
 	}
-	accept, ownerChanged := s.tracker.Accept(s.ref, s.replica, ts, stale)
+	accept, failover, ownerChanged := w.tracker.Accept(s.ref, s.replica, ts, stale)
+	if accept {
+		w.counts.Accepted++
+	} else {
+		w.counts.Dropped++
+	}
+	if failover {
+		w.counts.Failovers++
+	}
 	if ownerChanged && !accept {
 		w.ownerChanged = append(w.ownerChanged, s.ref)
 	}
@@ -125,20 +159,21 @@ func (w *haDedupWriter) accept(s *haDedupSeries, ref storage.SeriesRef, ts int64
 // failed. A rejected sample that changed the owner makes the series be forgotten, so that it can't make later valid
 // samples be dropped.
 func (w *haDedupWriter) appended(s *haDedupSeries, ref storage.SeriesRef) {
-	if s.tracker == nil {
+	if !s.dedup {
 		return
 	}
 	if ref == 0 {
 		if s.ownerChanged {
-			s.tracker.Forget(s.ref)
+			w.tracker.Forget(s.ref)
 			s.ownerChanged = false
 		}
 		return
 	}
 	s.ref = ref
 	if s.pending {
-		s.ownerChanged = s.tracker.Init(ref, s.replica, s.pendingTs)
+		s.ownerChanged = w.tracker.Init(ref, s.replica, s.pendingTs)
 		s.pending = false
+		w.counts.Accepted++
 	}
 	if s.ownerChanged {
 		w.ownerChanged = append(w.ownerChanged, ref)
@@ -146,9 +181,9 @@ func (w *haDedupWriter) appended(s *haDedupSeries, ref storage.SeriesRef) {
 	}
 }
 
-// acceptExemplars reports whether exemplars of the series must be appended.
-func (s *haDedupSeries) acceptExemplars(ref storage.SeriesRef) bool {
-	return s.tracker == nil || s.tracker.IsOwner(ref, s.replica)
+// acceptExemplars reports whether exemplars of the series with the given head reference must be appended.
+func (w *haDedupWriter) acceptExemplars(s *haDedupSeries, ref storage.SeriesRef) bool {
+	return !s.dedup || w.tracker.IsOwner(ref, s.replica)
 }
 
 func isStaleHistogram(h *histogram.Histogram, fh *histogram.FloatHistogram) bool {

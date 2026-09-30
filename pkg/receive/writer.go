@@ -93,6 +93,7 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq []prompb.TimeS
 	if err != nil {
 		return errors.Wrap(err, "get HA dedup tracker")
 	}
+	defer dedup.flush()
 
 	app, err := s.Appender(ctx)
 	if err == tsdb.ErrNotReady {
@@ -140,7 +141,7 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq []prompb.TimeS
 
 		// Append as many valid samples as possible, but keep track of the errors.
 		for _, s := range t.Samples {
-			if dedupSeries.tracker != nil {
+			if dedupSeries.dedup {
 				// A rejected sample must not take part in the ownership decision, see haDedupWriter.appended.
 				if err := ra.checkTooFarInFuture(lset, s.Timestamp); err != nil {
 					errorTracker.addSampleError(err, tLogger, lset, s.Timestamp, s.Value)
@@ -156,7 +157,7 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq []prompb.TimeS
 		}
 
 		for _, hp := range t.Histograms {
-			if dedupSeries.tracker != nil {
+			if dedupSeries.dedup {
 				if err := ra.checkTooFarInFuture(lset, hp.Timestamp); err != nil {
 					errorTracker.addHistogramError(err, tLogger, lset, hp.Timestamp)
 					continue
@@ -183,7 +184,7 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq []prompb.TimeS
 
 		// Current implementation of app.AppendExemplar doesn't create a new series, so it must be already present.
 		// We drop the exemplars in case the series doesn't exist.
-		if ref != 0 && len(t.Exemplars) > 0 && dedupSeries.acceptExemplars(ref) {
+		if ref != 0 && len(t.Exemplars) > 0 && dedup.acceptExemplars(&dedupSeries, ref) {
 			for _, ex := range t.Exemplars {
 				labelpb.ReAllocZLabelsStrings(&ex.Labels)
 				exLset := labelpb.ZLabelsToPromLabels(ex.Labels)

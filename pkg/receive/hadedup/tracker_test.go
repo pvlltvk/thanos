@@ -6,6 +6,7 @@ package hadedup
 import (
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/atomic"
 )
 
 func testConfig() Config {
@@ -48,7 +50,7 @@ func TestTrackerAccept(t *testing.T) {
 		name              string
 		steps             []step
 		expectedOwner     string
-		expectedFailovers float64
+		expectedFailovers int
 	}{
 		{
 			name:          "first sample elects its replica",
@@ -340,18 +342,23 @@ func TestTrackerAccept(t *testing.T) {
 			t.Parallel()
 
 			tr := NewTracker(testConfig(), prometheus.NewRegistry())
+			var failovers int
 			for i, s := range tcase.steps {
 				r, ok := tr.Replica(s.replica)
 				require.True(t, ok)
-				accept, ownerChanged := tr.Accept(1, r, s.ts, s.stale)
+				accept, failover, ownerChanged := tr.Accept(1, r, s.ts, s.stale)
 				require.Equal(t, s.accept, accept, "step %d: %+v", i, s)
 				require.Equal(t, s.ownerChanged, ownerChanged, "step %d: %+v", i, s)
+				if failover {
+					require.True(t, ownerChanged, "step %d: %+v", i, s)
+					failovers++
+				}
 			}
 
 			owner, ok := tr.Replica(tcase.expectedOwner)
 			require.True(t, ok)
 			require.True(t, tr.IsOwner(1, owner))
-			require.Equal(t, tcase.expectedFailovers, promtest.ToFloat64(tr.metrics.failovers))
+			require.Equal(t, tcase.expectedFailovers, failovers)
 			require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.trackedSeries))
 		})
 	}
@@ -377,7 +384,7 @@ func TestLater(t *testing.T) {
 }
 
 func acceptOnly(tr *Tracker, ref storage.SeriesRef, replica uint16, ts int64) bool {
-	accept, _ := tr.Accept(ref, replica, ts, false)
+	accept, _, _ := tr.Accept(ref, replica, ts, false)
 	return accept
 }
 
@@ -420,7 +427,7 @@ func TestTrackerForget(t *testing.T) {
 	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.trackedSeries))
 
 	// The next sample elects its replica, also one older than the forgotten owner's samples.
-	accepted, ownerChanged := tr.Accept(1, b, 10000, false)
+	accepted, _, ownerChanged := tr.Accept(1, b, 10000, false)
 	require.True(t, accepted)
 	require.True(t, ownerChanged)
 	require.True(t, tr.IsOwner(1, b))
@@ -633,11 +640,20 @@ func TestTrackerConcurrent(t *testing.T) {
 		wg.Go(func() {
 			r, ok := tr.Replica(fmt.Sprintf("replica-%d", w%2))
 			require.True(t, ok)
+			var c Counts
 			for i := range 1000 {
 				ts := int64(i * 15000)
 				ref := storage.SeriesRef(i % 100)
-				tr.Accept(ref, r, ts, i%7 == 0)
+				if accept, _, _ := tr.Accept(ref, r, ts, i%7 == 0); accept {
+					c.Accepted++
+				} else {
+					c.Dropped++
+				}
 				tr.IsOwner(ref, r)
+				if i%100 == 99 {
+					tr.Record(c)
+					c = Counts{}
+				}
 			}
 		})
 	}
@@ -647,6 +663,7 @@ func TestTrackerConcurrent(t *testing.T) {
 		for i := range 1000 {
 			tr.Init(storage.SeriesRef(i%100), r, int64(i*15000))
 		}
+		tr.Record(Counts{Accepted: 1000})
 	})
 	wg.Go(func() {
 		for i := range 1000 {
@@ -666,6 +683,30 @@ func TestTrackerConcurrent(t *testing.T) {
 	}
 	require.Equal(t, float64(tracked), promtest.ToFloat64(tr.metrics.trackedSeries))
 	require.Equal(t, 5000.0, promtest.ToFloat64(tr.metrics.accepted)+promtest.ToFloat64(tr.metrics.dropped))
+}
+
+func TestTrackerRecord(t *testing.T) {
+	t.Parallel()
+
+	reg := prometheus.NewRegistry()
+	tr := NewTracker(testConfig(), reg)
+	tr.Record(Counts{})
+	tr.Record(Counts{Accepted: 3, Dropped: 2, Failovers: 1, NoLabel: 4})
+	tr.Record(Counts{Accepted: 1, ReplicaTableFull: 5})
+
+	require.NoError(t, promtest.GatherAndCompare(reg, strings.NewReader(`
+# HELP thanos_receive_ha_dedup_failovers_total Total number of series taken over by another HA replica after the owning replica stopped writing them.
+# TYPE thanos_receive_ha_dedup_failovers_total counter
+thanos_receive_ha_dedup_failovers_total 1
+# HELP thanos_receive_ha_dedup_passthrough_total Total number of series written without HA deduplication, by reason.
+# TYPE thanos_receive_ha_dedup_passthrough_total counter
+thanos_receive_ha_dedup_passthrough_total{reason="no_label"} 4
+thanos_receive_ha_dedup_passthrough_total{reason="replica_table_full"} 5
+# HELP thanos_receive_ha_dedup_samples_total Total number of samples from HA replicas processed by deduplication, by outcome.
+# TYPE thanos_receive_ha_dedup_samples_total counter
+thanos_receive_ha_dedup_samples_total{outcome="accepted"} 4
+thanos_receive_ha_dedup_samples_total{outcome="dropped"} 2
+`), "thanos_receive_ha_dedup_failovers_total", "thanos_receive_ha_dedup_passthrough_total", "thanos_receive_ha_dedup_samples_total"))
 }
 
 func TestConfigValidate(t *testing.T) {
@@ -722,4 +763,27 @@ func BenchmarkTrackerAccept(b *testing.B) {
 		tr.Accept(ref, rb, ts+5000, false)
 		i++
 	}
+}
+
+func BenchmarkTrackerAcceptParallel(b *testing.B) {
+	tr := NewTracker(testConfig(), prometheus.NewRegistry())
+	a, _ := tr.Replica("a")
+	rb, _ := tr.Replica("b")
+
+	const numSeries = 100000
+	var worker atomic.Int64
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		// Every goroutine writes its own series, like concurrent requests of different targets of a tenant.
+		base := worker.Add(1) * numSeries
+		var i int64
+		for pb.Next() {
+			ref := storage.SeriesRef(base + i%numSeries)
+			ts := (i / numSeries) * 15000
+			tr.Accept(ref, a, ts, false)
+			tr.Accept(ref, rb, ts+5000, false)
+			i++
+		}
+	})
 }

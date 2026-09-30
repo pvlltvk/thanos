@@ -24,6 +24,7 @@ import (
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/tsdbutil"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/atomic"
 
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/receive/hadedup"
@@ -173,8 +174,14 @@ func writeHADedupRequest(t *testing.T, s TenantStorage, capnp bool, tooFarInFutu
 	t.Helper()
 
 	if !capnp {
+		// Writer reallocates exemplar label strings in place, and tests write the same series from parallel subtests.
+		series = slices.Clone(series)
 		before := make([][]labelpb.ZLabel, 0, len(series))
-		for _, s := range series {
+		for i, s := range series {
+			series[i].Exemplars = slices.Clone(s.Exemplars)
+			for j := range series[i].Exemplars {
+				series[i].Exemplars[j].Labels = labelpb.DeepCopy(s.Exemplars[j].Labels)
+			}
 			before = append(before, labelpb.DeepCopy(s.Labels))
 		}
 		err := NewWriter(log.NewNopLogger(), s, &WriterOptions{TooFarInFutureTimeWindow: int64(tooFarInFuture)}).Write(context.Background(), tenancy.DefaultTenant, series)
@@ -831,8 +838,12 @@ func TestCapNProtoWriterHADedupRequestError(t *testing.T) {
 	require.NoError(t, promtest.GatherAndCompare(reg, strings.NewReader(fmt.Sprintf(`
 # HELP thanos_receive_ha_dedup_failovers_total Total number of series taken over by another HA replica after the owning replica stopped writing them.
 # TYPE thanos_receive_ha_dedup_failovers_total counter
-thanos_receive_ha_dedup_failovers_total{tenant=%q} 1
-`, tenancy.DefaultTenant)), "thanos_receive_ha_dedup_failovers_total"))
+thanos_receive_ha_dedup_failovers_total{tenant=%[1]q} 1
+# HELP thanos_receive_ha_dedup_samples_total Total number of samples from HA replicas processed by deduplication, by outcome.
+# TYPE thanos_receive_ha_dedup_samples_total counter
+thanos_receive_ha_dedup_samples_total{outcome="accepted",tenant=%[1]q} 3
+thanos_receive_ha_dedup_samples_total{outcome="dropped",tenant=%[1]q} 0
+`, tenancy.DefaultTenant)), "thanos_receive_ha_dedup_failovers_total", "thanos_receive_ha_dedup_samples_total"))
 
 	require.NoError(t, writeHADedupRequest(t, m, true, time.Minute, []prompb.TimeSeries{floats("up", "prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 30000})}))
 	require.Equal(t, map[string]storedSeries{
@@ -944,12 +955,12 @@ func TestHADedupWriterPrepare(t *testing.T) {
 
 		got, s := w.prepare(lbls, false)
 		require.Equal(t, stripped, got)
-		require.NotNil(t, s.tracker)
+		require.True(t, s.dedup)
 		require.Equal(t, orig, lbls)
 
 		got, s = w.prepare(noReplica, false)
 		require.Equal(t, noReplica, got)
-		require.Nil(t, s.tracker)
+		require.False(t, s.dedup)
 
 		require.Zero(t, testing.AllocsPerRun(100, func() {
 			got, _ = w.prepare(lbls, false)
@@ -963,7 +974,7 @@ func TestHADedupWriterPrepare(t *testing.T) {
 
 		got, s := w.prepare(buf, true)
 		require.Equal(t, stripped, got)
-		require.NotNil(t, s.tracker)
+		require.True(t, s.dedup)
 		require.Equal(t, &buf[0], &got[0])
 
 		var gotInPlace []labelpb.ZLabel
@@ -979,7 +990,7 @@ func TestHADedupWriterPrepare(t *testing.T) {
 		got, s := w.prepare(lbls, true)
 		require.Equal(t, lbls, got)
 		require.True(t, w.accept(&s, 0, 0, false))
-		require.True(t, s.acceptExemplars(1))
+		require.True(t, w.acceptExemplars(&s, 1))
 	})
 }
 
@@ -993,7 +1004,7 @@ func TestHADedupSeries(t *testing.T) {
 	w := haDedupWriter{tracker: tracker}
 
 	// New series: the first sample is appended without state and elects its replica.
-	s0 := haDedupSeries{tracker: tracker, replica: r0}
+	s0 := haDedupSeries{dedup: true, replica: r0}
 	require.True(t, w.accept(&s0, 0, 0, false))
 	w.appended(&s0, 7)
 	require.True(t, tracker.IsOwner(7, r0))
@@ -1005,11 +1016,11 @@ func TestHADedupSeries(t *testing.T) {
 	require.Equal(t, []storage.SeriesRef{7}, w.ownerChanged)
 
 	// A failed append returns a zero reference, later samples must still be checked against the tracker.
-	s1 := haDedupSeries{tracker: tracker, replica: r1}
+	s1 := haDedupSeries{dedup: true, replica: r1}
 	require.False(t, w.accept(&s1, 7, 5000, false))
 	require.False(t, w.accept(&s1, 0, 6000, false))
-	require.False(t, s1.acceptExemplars(7))
-	require.True(t, s0.acceptExemplars(7))
+	require.False(t, w.acceptExemplars(&s1, 7))
+	require.True(t, w.acceptExemplars(&s0, 7))
 
 	// A failed append of an accepted sample that changed the owner forgets the series.
 	require.True(t, w.accept(&s1, 0, 5000+(365*24*time.Hour).Milliseconds(), false))
@@ -1022,9 +1033,9 @@ func TestHADedupSeries(t *testing.T) {
 
 	// The reference is known from the first sample even if its append fails.
 	require.True(t, tracker.Init(8, r0, 15000))
-	accept, _ := tracker.Accept(8, r1, 20000, false)
+	accept, _, _ := tracker.Accept(8, r1, 20000, false)
 	require.False(t, accept)
-	s2 := haDedupSeries{tracker: tracker, replica: r0}
+	s2 := haDedupSeries{dedup: true, replica: r0}
 	require.True(t, w.accept(&s2, 8, 0, false))
 	w.appended(&s2, 0)
 	// A handover drops the sample, but must be forgotten if the request fails.
@@ -1039,10 +1050,10 @@ func TestHADedupSeries(t *testing.T) {
 
 	// A failover and a handover of the same series in one request record it twice.
 	require.True(t, tracker.Init(9, r0, 0))
-	s3 := haDedupSeries{tracker: tracker, replica: r1}
+	s3 := haDedupSeries{dedup: true, replica: r1}
 	require.True(t, w.accept(&s3, 9, 90000, false))
 	w.appended(&s3, 9)
-	s4 := haDedupSeries{tracker: tracker, replica: r0}
+	s4 := haDedupSeries{dedup: true, replica: r0}
 	require.False(t, w.accept(&s4, 9, 95000, false))
 	require.False(t, w.accept(&s3, 9, 100000, true))
 	require.True(t, tracker.IsOwner(9, r0))
@@ -1058,6 +1069,120 @@ thanos_receive_ha_dedup_tracked_series 0
 `), "thanos_receive_ha_dedup_tracked_series"))
 }
 
+func TestHADedupWriterReplicaCache(t *testing.T) {
+	t.Parallel()
+
+	series := func(replica string) []labelpb.ZLabel {
+		return withReplicaLabel([]labelpb.ZLabel{{Name: "__name__", Value: "up"}, {Name: "zone", Value: "z-" + replica}}, replica)
+	}
+	// The replica table holds two replicas, so prometheus-2 is passed through.
+	request := []string{"prometheus-0", "prometheus-0", "prometheus-1", "prometheus-2", "prometheus-2", "prometheus-0", "prometheus-2", "prometheus-1"}
+
+	for _, inPlace := range []bool{false, true} {
+		t.Run(fmt.Sprintf("inPlace=%v", inPlace), func(t *testing.T) {
+			t.Parallel()
+
+			tracker := hadedup.NewTracker(testHADedupConfig(), prometheus.NewRegistry())
+			w := haDedupWriter{tracker: tracker}
+			// Like a Cap'n Proto request, every series is decoded into the same label buffer, which the in-place
+			// removal of the replica label then modifies.
+			var buf []labelpb.ZLabel
+			for i, replica := range request {
+				lbls := series(replica)
+				if inPlace {
+					buf = append(buf[:0], lbls...)
+					lbls = buf
+				}
+
+				got, s := w.prepare(lbls, inPlace)
+				if replica == "prometheus-2" {
+					require.False(t, s.dedup, "series %d", i)
+					require.Equal(t, series(replica), got, "series %d", i)
+					continue
+				}
+				require.True(t, s.dedup, "series %d", i)
+				expected, ok := tracker.Replica(replica)
+				require.True(t, ok)
+				require.Equal(t, expected, s.replica, "series %d", i)
+				require.Equal(t, []labelpb.ZLabel{{Name: "__name__", Value: "up"}, {Name: "zone", Value: "z-" + replica}}, got, "series %d", i)
+			}
+			require.Equal(t, hadedup.Counts{ReplicaTableFull: 3}, w.counts)
+		})
+	}
+}
+
+func TestWriterHADedupMetrics(t *testing.T) {
+	t.Parallel()
+
+	base := time.Now().Add(-time.Hour).UnixMilli()
+	floats := func(instance, replica string, ts int64) prompb.TimeSeries {
+		lbls := []labelpb.ZLabel{{Name: "__name__", Value: "up"}, {Name: "instance", Value: instance}}
+		if replica != "" {
+			lbls = withReplicaLabel(lbls, replica)
+		}
+		return prompb.TimeSeries{Labels: lbls, Samples: []prompb.Sample{{Value: 1, Timestamp: ts}}}
+	}
+
+	for _, capnp := range []bool{false, true} {
+		t.Run(fmt.Sprintf("capnp=%v", capnp), func(t *testing.T) {
+			t.Parallel()
+
+			reg := prometheus.NewRegistry()
+			m := newHADedupMultiTSDB(t, reg, labels.FromStrings("replica", "01"), WithHADedup(testHADedupConfig()))
+			s := &faultyAppendStorage{MultiTSDB: m}
+			require.NoError(t, writeHADedupRequest(t, s, capnp, time.Minute, []prompb.TimeSeries{
+				floats("a", "prometheus-0", base),
+				floats("b", "prometheus-0", base),
+				floats("c", "", base),
+			}))
+			// The replica table holds two replicas, so the series of prometheus-2 are passed through.
+			require.NoError(t, writeHADedupRequest(t, s, capnp, time.Minute, []prompb.TimeSeries{
+				floats("a", "prometheus-1", base+5000),
+				floats("a", "prometheus-2", base+5000),
+				floats("b", "prometheus-1", base+5000),
+				floats("b", "prometheus-2", base+5000),
+			}))
+			// The decisions of a request whose commit fails are counted too.
+			s.failCommit = true
+			require.Error(t, writeHADedupRequest(t, s, capnp, time.Minute, []prompb.TimeSeries{floats("a", "prometheus-1", base+90000)}))
+
+			require.NoError(t, promtest.GatherAndCompare(reg, strings.NewReader(fmt.Sprintf(`
+# HELP thanos_receive_ha_dedup_failovers_total Total number of series taken over by another HA replica after the owning replica stopped writing them.
+# TYPE thanos_receive_ha_dedup_failovers_total counter
+thanos_receive_ha_dedup_failovers_total{tenant=%[1]q} 1
+# HELP thanos_receive_ha_dedup_passthrough_total Total number of series written without HA deduplication, by reason.
+# TYPE thanos_receive_ha_dedup_passthrough_total counter
+thanos_receive_ha_dedup_passthrough_total{reason="no_label",tenant=%[1]q} 1
+thanos_receive_ha_dedup_passthrough_total{reason="replica_table_full",tenant=%[1]q} 2
+# HELP thanos_receive_ha_dedup_samples_total Total number of samples from HA replicas processed by deduplication, by outcome.
+# TYPE thanos_receive_ha_dedup_samples_total counter
+thanos_receive_ha_dedup_samples_total{outcome="accepted",tenant=%[1]q} 3
+thanos_receive_ha_dedup_samples_total{outcome="dropped",tenant=%[1]q} 2
+`, tenancy.DefaultTenant)), "thanos_receive_ha_dedup_failovers_total", "thanos_receive_ha_dedup_passthrough_total", "thanos_receive_ha_dedup_samples_total"))
+		})
+	}
+}
+
+// haReplicaRequests returns a request of 1000 series with a single sample for each of two HA replicas.
+func haReplicaRequests(instancePrefix string) [][]prompb.TimeSeries {
+	const numSeries = 1000
+	replicas := make([][]prompb.TimeSeries, 2)
+	for r := range replicas {
+		replicas[r] = make([]prompb.TimeSeries, numSeries)
+		for i := range numSeries {
+			replicas[r][i] = prompb.TimeSeries{
+				Labels: withReplicaLabel([]labelpb.ZLabel{
+					{Name: "__name__", Value: "bench"},
+					{Name: "instance", Value: fmt.Sprintf("%s-%d", instancePrefix, i)},
+					{Name: "job", Value: "node"},
+				}, fmt.Sprintf("prometheus-%d", r)),
+				Samples: []prompb.Sample{{Value: 1}},
+			}
+		}
+	}
+	return replicas
+}
+
 func BenchmarkWriterHADedup(b *testing.B) {
 	for _, dedup := range []bool{false, true} {
 		b.Run(fmt.Sprintf("dedup=%v", dedup), func(b *testing.B) {
@@ -1068,22 +1193,7 @@ func BenchmarkWriterHADedup(b *testing.B) {
 			m := newHADedupMultiTSDB(b, prometheus.NewRegistry(), labels.FromStrings("replica", "01"), opts...)
 			w := NewWriter(log.NewNopLogger(), m, &WriterOptions{})
 
-			const numSeries = 1000
-			replicas := make([][]prompb.TimeSeries, 2)
-			for r := range replicas {
-				replicas[r] = make([]prompb.TimeSeries, numSeries)
-				for i := range numSeries {
-					replicas[r][i] = prompb.TimeSeries{
-						Labels: withReplicaLabel([]labelpb.ZLabel{
-							{Name: "__name__", Value: "test"},
-							{Name: "instance", Value: fmt.Sprintf("host-%d", i)},
-							{Name: "job", Value: "node"},
-						}, fmt.Sprintf("prometheus-%d", r)),
-						Samples: []prompb.Sample{{Value: 1}},
-					}
-				}
-			}
-
+			replicas := haReplicaRequests("host")
 			ts := time.Now().Add(-time.Hour).UnixMilli()
 			b.ReportAllocs()
 			b.ResetTimer()
@@ -1100,4 +1210,34 @@ func BenchmarkWriterHADedup(b *testing.B) {
 			}
 		})
 	}
+}
+
+func BenchmarkWriterHADedupParallel(b *testing.B) {
+	m := newHADedupMultiTSDB(b, prometheus.NewRegistry(), labels.FromStrings("replica", "01"), WithHADedup(testHADedupConfig()))
+	w := NewWriter(log.NewNopLogger(), m, &WriterOptions{})
+
+	start := time.Now().Add(-time.Hour).UnixMilli()
+	var worker atomic.Int64
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		// Every goroutine writes the requests of both replicas for its own targets, like the Prometheus pairs of
+		// different teams writing to the same tenant.
+		replicas := haReplicaRequests(fmt.Sprintf("host-%d", worker.Add(1)))
+
+		ts := start
+		for i := 0; pb.Next(); i++ {
+			r := i % len(replicas)
+			if r == 0 {
+				ts += 15000
+			}
+			for j := range replicas[r] {
+				replicas[r][j].Samples[0].Timestamp = ts + int64(r)*5000
+			}
+			if err := w.Write(context.Background(), tenancy.DefaultTenant, replicas[r]); err != nil {
+				b.Error(err)
+				return
+			}
+		}
+	})
 }

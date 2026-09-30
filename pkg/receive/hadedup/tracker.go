@@ -21,7 +21,8 @@ import (
 )
 
 const (
-	numStripes = 64
+	// numStripes bounds the time GC holds a stripe lock, as it scans the stripes one at a time.
+	numStripes = 256
 	noReplica  = math.MaxUint16
 	noTs       = math.MinInt64
 
@@ -32,9 +33,6 @@ const (
 
 	// MaxReplicasLimit is the maximum allowed value of Config.MaxReplicas.
 	MaxReplicasLimit = noReplica
-
-	PassthroughReasonNoLabel          = "no_label"
-	PassthroughReasonReplicaTableFull = "replica_table_full"
 )
 
 // Config configures a Tracker.
@@ -110,7 +108,7 @@ type stripe struct {
 	series map[storage.SeriesRef]seriesState
 }
 
-type replica struct {
+type replicaEntry struct {
 	value string
 	// seen is set on every lookup and consumed by GC to update lastSeen, so lookups don't need to read the clock.
 	seen     atomic.Bool
@@ -118,25 +116,30 @@ type replica struct {
 }
 
 type metrics struct {
-	samplesTotal     *prometheus.CounterVec
-	failovers        prometheus.Counter
-	trackedSeries    prometheus.Gauge
-	replicas         prometheus.Gauge
-	passthroughTotal *prometheus.CounterVec
-	gcRemoved        prometheus.Counter
-
 	accepted           prometheus.Counter
 	dropped            prometheus.Counter
+	failovers          prometheus.Counter
 	passthroughNoLabel prometheus.Counter
 	passthroughFull    prometheus.Counter
+	trackedSeries      prometheus.Gauge
+	replicas           prometheus.Gauge
+	gcRemoved          prometheus.Counter
 }
 
 func newMetrics(reg prometheus.Registerer) *metrics {
-	m := &metrics{
-		samplesTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
-			Name: "thanos_receive_ha_dedup_samples_total",
-			Help: "Total number of samples from HA replicas processed by deduplication, by outcome.",
-		}, []string{"outcome"}),
+	samplesTotal := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+		Name: "thanos_receive_ha_dedup_samples_total",
+		Help: "Total number of samples from HA replicas processed by deduplication, by outcome.",
+	}, []string{"outcome"})
+	passthroughTotal := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+		Name: "thanos_receive_ha_dedup_passthrough_total",
+		Help: "Total number of series written without HA deduplication, by reason.",
+	}, []string{"reason"})
+	return &metrics{
+		accepted:           samplesTotal.WithLabelValues("accepted"),
+		dropped:            samplesTotal.WithLabelValues("dropped"),
+		passthroughNoLabel: passthroughTotal.WithLabelValues("no_label"),
+		passthroughFull:    passthroughTotal.WithLabelValues("replica_table_full"),
 		failovers: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "thanos_receive_ha_dedup_failovers_total",
 			Help: "Total number of series taken over by another HA replica after the owning replica stopped writing them.",
@@ -149,20 +152,11 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			Name: "thanos_receive_ha_dedup_replicas",
 			Help: "Number of distinct HA replica label values tracked.",
 		}),
-		passthroughTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
-			Name: "thanos_receive_ha_dedup_passthrough_total",
-			Help: "Total number of series written without HA deduplication, by reason.",
-		}, []string{"reason"}),
 		gcRemoved: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "thanos_receive_ha_dedup_gc_removed_total",
 			Help: "Total number of series states removed by HA deduplication garbage collection.",
 		}),
 	}
-	m.accepted = m.samplesTotal.WithLabelValues("accepted")
-	m.dropped = m.samplesTotal.WithLabelValues("dropped")
-	m.passthroughNoLabel = m.passthroughTotal.WithLabelValues(PassthroughReasonNoLabel)
-	m.passthroughFull = m.passthroughTotal.WithLabelValues(PassthroughReasonReplicaTableFull)
-	return m
 }
 
 // Tracker keeps per-series ownership state of HA replicas for a single tenant. It is safe for concurrent use.
@@ -178,7 +172,7 @@ type Tracker struct {
 	replicasMtx sync.RWMutex
 	replicaIdx  map[string]uint16
 	// replicas is indexed by interned replica index; freed slots are nil and listed in freeReplicas.
-	replicas     []*replica
+	replicas     []*replicaEntry
 	freeReplicas []uint16
 
 	stripes [numStripes]stripe
@@ -213,7 +207,8 @@ func (t *Tracker) ReplicaLabel() string {
 }
 
 // Replica returns the interned index of the given replica label value. It returns false if the replica table is full,
-// in which case the series must be written without deduplication.
+// in which case the series must be written without deduplication. A returned index stays valid for at least the
+// state TTL, as the lookup keeps GC from freeing it for that long.
 func (t *Tracker) Replica(value string) (uint16, bool) {
 	t.replicasMtx.RLock()
 	r, ok := t.replicaIdx[value]
@@ -229,7 +224,7 @@ func (t *Tracker) Replica(value string) (uint16, bool) {
 
 	t.replicasMtx.Lock()
 	defer t.replicasMtx.Unlock()
-	if r, ok := t.replicaIdx[value]; ok {
+	if r, ok = t.replicaIdx[value]; ok {
 		t.replicas[r].seen.Store(true)
 		return r, true
 	}
@@ -238,7 +233,7 @@ func (t *Tracker) Replica(value string) (uint16, bool) {
 	}
 
 	// The value references request memory, detach it before keeping it.
-	rep := &replica{value: strings.Clone(value), lastSeen: t.now()}
+	rep := &replicaEntry{value: strings.Clone(value), lastSeen: t.now()}
 	rep.seen.Store(true)
 	if n := len(t.freeReplicas); n > 0 {
 		r = t.freeReplicas[n-1]
@@ -253,21 +248,40 @@ func (t *Tracker) Replica(value string) (uint16, bool) {
 	return r, true
 }
 
-// Passthrough records a series written without deduplication.
-func (t *Tracker) Passthrough(reason string) {
-	switch reason {
-	case PassthroughReasonNoLabel:
-		t.metrics.passthroughNoLabel.Inc()
-	case PassthroughReasonReplicaTableFull:
-		t.metrics.passthroughFull.Inc()
+// Counts are the outcomes of the deduplication decisions taken for a write request, see Record.
+type Counts struct {
+	// Accepted and Dropped count the samples of deduplicated series.
+	Accepted int
+	Dropped  int
+	// Failovers counts the series taken over by another replica after the owner timed out.
+	Failovers int
+	// NoLabel and ReplicaTableFull count the series written without deduplication, by reason.
+	NoLabel          int
+	ReplicaTableFull int
+}
+
+// Record adds the outcomes of a write request to the metrics. Writers count decisions per request instead of the
+// tracker counting them per sample, so that concurrent writers of a tenant don't contend on the shared counters.
+func (t *Tracker) Record(c Counts) {
+	addCount(t.metrics.accepted, c.Accepted)
+	addCount(t.metrics.dropped, c.Dropped)
+	addCount(t.metrics.failovers, c.Failovers)
+	addCount(t.metrics.passthroughNoLabel, c.NoLabel)
+	addCount(t.metrics.passthroughFull, c.ReplicaTableFull)
+}
+
+func addCount(c prometheus.Counter, n int) {
+	if n > 0 {
+		c.Add(float64(n))
 	}
 }
 
 // Accept decides whether the sample at ts written by replica to the series with the given head reference
-// should be appended, and updates the series state accordingly. ownerChanged reports whether the series state was
-// created or its owner replaced, also for a dropped sample: the caller must Forget the series if the samples the
-// decision is based on are not stored.
-func (t *Tracker) Accept(ref storage.SeriesRef, replica uint16, ts int64, stale bool) (accept, ownerChanged bool) {
+// should be appended, and updates the series state accordingly. failover reports whether replica took the series
+// over from an owner that timed out. ownerChanged reports whether the series state was created or its owner
+// replaced, also for a dropped sample: the caller must Forget the series if the samples the decision is based on
+// are not stored.
+func (t *Tracker) Accept(ref storage.SeriesRef, replica uint16, ts int64, stale bool) (accept, failover, ownerChanged bool) {
 	s := &t.stripes[uint64(ref)%numStripes]
 	s.mtx.Lock()
 	st, exists := s.series[ref]
@@ -281,8 +295,7 @@ func (t *Tracker) Accept(ref storage.SeriesRef, replica uint16, ts int64, stale 
 	if !exists {
 		t.metrics.trackedSeries.Inc()
 	}
-	t.observe(accept, failover)
-	return accept, !exists || failover || handover
+	return accept, failover, !exists || failover || handover
 }
 
 // Forget removes the state of a series, so that its next sample elects the owner again.
@@ -316,7 +329,6 @@ func (t *Tracker) Init(ref storage.SeriesRef, replica uint16, ts int64) bool {
 	if !exists {
 		t.metrics.trackedSeries.Inc()
 	}
-	t.observe(true, false)
 	return !exists
 }
 
@@ -327,17 +339,6 @@ func (t *Tracker) IsOwner(ref storage.SeriesRef, replica uint16) bool {
 	st, exists := s.series[ref]
 	s.mtx.Unlock()
 	return !exists || st.owner == replica
-}
-
-func (t *Tracker) observe(accept, failover bool) {
-	if accept {
-		t.metrics.accepted.Inc()
-	} else {
-		t.metrics.dropped.Inc()
-	}
-	if failover {
-		t.metrics.failovers.Inc()
-	}
 }
 
 // decide implements the per-sample state machine. All times are sample timestamps, never wall clock: this makes

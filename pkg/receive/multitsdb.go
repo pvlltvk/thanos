@@ -563,7 +563,7 @@ func (t *tenant) startPeriodicHADedupGC(tracker *hadedup.Tracker) {
 			select {
 			case <-ticker.C:
 				removed := tracker.GC()
-				level.Debug(t.logger).Log("msg", "garbage collected HA dedup state", "removed_series", removed)
+				level.Debug(t.logger).Log("msg", "garbage collected HA dedup state", "removed", removed)
 			case <-t.doneC:
 				return
 			}

@@ -255,7 +255,7 @@ func runReceive(
 	multiTSDBOptions = append(multiTSDBOptions, receive.WithUploadConcurrency(conf.uploadConcurrency))
 	if conf.haDedupReplicaLabel != "" {
 		multiTSDBOptions = append(multiTSDBOptions, receive.WithHADedup(conf.haDedupConfig()))
-		level.Info(logger).Log("msg", "HA replica deduplication enabled", "replica_label", conf.haDedupReplicaLabel)
+		level.Info(logger).Log("msg", "HA replica deduplication enabled", "replicaLabel", conf.haDedupReplicaLabel)
 	}
 
 	dbs := receive.NewMultiTSDB(

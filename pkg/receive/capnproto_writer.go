@@ -55,6 +55,7 @@ func (r *CapNProtoWriter) Write(ctx context.Context, wreq *writecapnp.Request) e
 	if err != nil {
 		return errors.Wrap(err, "get HA dedup tracker")
 	}
+	defer dedup.flush()
 
 	app, err := s.Appender(ctx)
 	if err == tsdb.ErrNotReady {
@@ -112,7 +113,7 @@ func (r *CapNProtoWriter) Write(ctx context.Context, wreq *writecapnp.Request) e
 
 		// Append as many valid samples as possible, but keep track of the errors.
 		for _, s := range series.Samples {
-			if dedupSeries.tracker != nil {
+			if dedupSeries.dedup {
 				// A rejected sample must not take part in the ownership decision, see haDedupWriter.appended.
 				if err := ra.checkTooFarInFuture(lset, s.Timestamp); err != nil {
 					errorTracker.addSampleError(err, tLogger, lset, s.Timestamp, s.Value)
@@ -128,7 +129,7 @@ func (r *CapNProtoWriter) Write(ctx context.Context, wreq *writecapnp.Request) e
 		}
 
 		for _, hp := range series.Histograms {
-			if dedupSeries.tracker != nil {
+			if dedupSeries.dedup {
 				if err := ra.checkTooFarInFuture(lset, hp.Timestamp); err != nil {
 					errorTracker.addHistogramError(err, tLogger, lset, hp.Timestamp)
 					continue
@@ -144,7 +145,7 @@ func (r *CapNProtoWriter) Write(ctx context.Context, wreq *writecapnp.Request) e
 
 		// Current implementation of app.AppendExemplar doesn't create a new series, so it must be already present.
 		// We drop the exemplars in case the series doesn't exist.
-		if ref != 0 && len(series.Exemplars) > 0 && dedupSeries.acceptExemplars(ref) {
+		if ref != 0 && len(series.Exemplars) > 0 && dedup.acceptExemplars(&dedupSeries, ref) {
 			for _, ex := range series.Exemplars {
 				exLogger := log.With(tLogger, "exemplarLset", ex.Labels)
 
