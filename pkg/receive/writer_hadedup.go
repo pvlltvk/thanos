@@ -26,6 +26,8 @@ type haDedupTenantStorage interface {
 type haDedupWriter struct {
 	tracker *hadedup.Tracker
 	scratch []labelpb.ZLabel
+	// ownerChanged lists the series whose owner was changed by the request, see forget.
+	ownerChanged []storage.SeriesRef
 }
 
 func newHADedupWriter(s TenantStorage, tenantID string) (haDedupWriter, error) {
@@ -68,62 +70,79 @@ func (w *haDedupWriter) prepare(lbls []labelpb.ZLabel, inPlace bool) ([]labelpb.
 	return lbls, haDedupSeries{tracker: w.tracker, replica: replica}
 }
 
+// forget removes the state of the series whose owner was changed by the request. It must be called if the request's
+// samples are not stored, as a retry would otherwise be dropped by the ownership they established.
+func (w *haDedupWriter) forget() {
+	for _, ref := range w.ownerChanged {
+		w.tracker.Forget(ref)
+	}
+	w.ownerChanged = nil
+}
+
 // removeLabelAt appends lbls without the label at index i to dst[:0]. dst may share memory with lbls.
 func removeLabelAt(dst, lbls []labelpb.ZLabel, i int) []labelpb.ZLabel {
 	dst = append(dst[:0], lbls[:i]...)
 	return append(dst, lbls[i+1:]...)
 }
 
-// haDedupSeries takes deduplication decisions for the samples of a single series. The zero value accepts everything.
+// haDedupSeries is the deduplication state of a single series of a request. The zero value accepts everything.
 type haDedupSeries struct {
 	tracker *hadedup.Tracker
 	replica uint16
 
 	// ref is the last known head reference of the series. Appends return a zero reference on error, which must not
 	// make later samples of the series bypass the tracker.
-	ref       storage.SeriesRef
-	pending   bool
-	pendingTs int64
-	change    hadedup.Change
+	ref          storage.SeriesRef
+	pending      bool
+	pendingTs    int64
+	ownerChanged bool
 }
 
 // accept reports whether a sample at ts must be appended to the series with the given head reference.
 // Every accepted sample must be followed by a call to appended with the reference returned by the append.
-func (s *haDedupSeries) accept(ref storage.SeriesRef, ts int64, stale bool) bool {
+func (w *haDedupWriter) accept(s *haDedupSeries, ref storage.SeriesRef, ts int64, stale bool) bool {
 	if s.tracker == nil {
 		return true
 	}
 	if ref != 0 {
 		s.ref = ref
 	}
-	s.change = hadedup.Change{}
 	if s.ref == 0 {
 		// The series doesn't exist in the head yet, so there's no state to decide on: the appended sample elects
 		// its replica once the series has a reference.
 		s.pending, s.pendingTs = true, ts
 		return true
 	}
-	accept, change := s.tracker.AcceptRevertible(s.ref, s.replica, ts, stale)
-	s.change = change
+	accept, ownerChanged := s.tracker.Accept(s.ref, s.replica, ts, stale)
+	if ownerChanged && !accept {
+		w.ownerChanged = append(w.ownerChanged, s.ref)
+	}
+	s.ownerChanged = ownerChanged && accept
 	return accept
 }
 
 // appended must be called with the reference returned by appending an accepted sample, which is zero if the append
-// failed. The ownership change of a rejected sample is reverted, so that it can't make later valid samples be dropped.
-// Samples that fail only on commit are not reverted: the request fails with a server error and is retried.
-func (s *haDedupSeries) appended(ref storage.SeriesRef) {
+// failed. A rejected sample that changed the owner makes the series be forgotten, so that it can't make later valid
+// samples be dropped.
+func (w *haDedupWriter) appended(s *haDedupSeries, ref storage.SeriesRef) {
 	if s.tracker == nil {
 		return
 	}
 	if ref == 0 {
-		s.tracker.Revert(s.change)
-		s.change = hadedup.Change{}
+		if s.ownerChanged {
+			s.tracker.Forget(s.ref)
+			s.ownerChanged = false
+		}
 		return
 	}
 	s.ref = ref
 	if s.pending {
-		s.tracker.Init(ref, s.replica, s.pendingTs)
+		s.ownerChanged = s.tracker.Init(ref, s.replica, s.pendingTs)
 		s.pending = false
+	}
+	if s.ownerChanged {
+		w.ownerChanged = append(w.ownerChanged, ref)
+		s.ownerChanged = false
 	}
 }
 

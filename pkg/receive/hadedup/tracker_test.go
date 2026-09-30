@@ -29,10 +29,11 @@ func testConfig() Config {
 }
 
 type step struct {
-	replica string
-	ts      int64
-	stale   bool
-	accept  bool
+	replica      string
+	ts           int64
+	stale        bool
+	accept       bool
+	ownerChanged bool
 }
 
 func TestTrackerAccept(t *testing.T) {
@@ -51,13 +52,13 @@ func TestTrackerAccept(t *testing.T) {
 	}{
 		{
 			name:          "first sample elects its replica",
-			steps:         []step{{replica: a, ts: 0, accept: true}},
+			steps:         []step{{replica: a, ts: 0, accept: true, ownerChanged: true}},
 			expectedOwner: a,
 		},
 		{
 			name: "steady owner, other replica is dropped",
 			steps: []step{
-				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
 				{replica: b, ts: 5000, accept: false},
 				{replica: a, ts: 15000, accept: true},
 				{replica: b, ts: 20000, accept: false},
@@ -69,7 +70,7 @@ func TestTrackerAccept(t *testing.T) {
 		{
 			name: "owner samples not newer than the last one are accepted",
 			steps: []step{
-				{replica: a, ts: 15000, accept: true},
+				{replica: a, ts: 15000, accept: true, ownerChanged: true},
 				{replica: a, ts: 15000, accept: true},
 				{replica: a, ts: 10000, accept: true},
 			},
@@ -78,7 +79,7 @@ func TestTrackerAccept(t *testing.T) {
 		{
 			name: "failover just before the timeout",
 			steps: []step{
-				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
 				{replica: a, ts: 15000, accept: true},
 				// Timeout is 1.5 * 15s = 22.5s.
 				{replica: b, ts: 15000 + 22500 - 1, accept: false},
@@ -88,7 +89,7 @@ func TestTrackerAccept(t *testing.T) {
 		{
 			name: "failover exactly at the timeout",
 			steps: []step{
-				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
 				{replica: a, ts: 15000, accept: true},
 				{replica: b, ts: 15000 + 22500, accept: false},
 			},
@@ -97,9 +98,9 @@ func TestTrackerAccept(t *testing.T) {
 		{
 			name: "failover just after the timeout",
 			steps: []step{
-				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
 				{replica: a, ts: 15000, accept: true},
-				{replica: b, ts: 15000 + 22500 + 1, accept: true},
+				{replica: b, ts: 15000 + 22500 + 1, accept: true, ownerChanged: true},
 				{replica: a, ts: 45000, accept: false},
 				{replica: b, ts: 52500, accept: true},
 			},
@@ -109,9 +110,9 @@ func TestTrackerAccept(t *testing.T) {
 		{
 			name: "default timeout until an interval is learned",
 			steps: []step{
-				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
 				{replica: b, ts: 60000, accept: false},
-				{replica: b, ts: 60001, accept: true},
+				{replica: b, ts: 60001, accept: true, ownerChanged: true},
 			},
 			expectedOwner:     b,
 			expectedFailovers: 1,
@@ -119,11 +120,11 @@ func TestTrackerAccept(t *testing.T) {
 		{
 			name: "min timeout clamp",
 			steps: []step{
-				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
 				{replica: a, ts: 1000, accept: true},
 				// 1.5 * 1s is clamped to 10s.
 				{replica: b, ts: 1000 + 10000, accept: false},
-				{replica: b, ts: 1000 + 10000 + 1, accept: true},
+				{replica: b, ts: 1000 + 10000 + 1, accept: true, ownerChanged: true},
 			},
 			expectedOwner:     b,
 			expectedFailovers: 1,
@@ -131,11 +132,11 @@ func TestTrackerAccept(t *testing.T) {
 		{
 			name: "max timeout clamp",
 			steps: []step{
-				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
 				{replica: a, ts: 600000, accept: true},
 				// 1.5 * 10m is clamped to 5m.
 				{replica: b, ts: 600000 + 300000, accept: false},
-				{replica: b, ts: 600000 + 300000 + 1, accept: true},
+				{replica: b, ts: 600000 + 300000 + 1, accept: true, ownerChanged: true},
 			},
 			expectedOwner:     b,
 			expectedFailovers: 1,
@@ -143,13 +144,13 @@ func TestTrackerAccept(t *testing.T) {
 		{
 			name: "gaps do not grow the learned interval",
 			steps: []step{
-				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
 				{replica: a, ts: 15000, accept: true},
 				// A 60s gap is undone by the next regular sample, the interval stays 15s.
 				{replica: a, ts: 75000, accept: true},
 				{replica: a, ts: 90000, accept: true},
 				{replica: b, ts: 90000 + 22500, accept: false},
-				{replica: b, ts: 90000 + 22500 + 1, accept: true},
+				{replica: b, ts: 90000 + 22500 + 1, accept: true, ownerChanged: true},
 			},
 			expectedOwner:     b,
 			expectedFailovers: 1,
@@ -157,12 +158,12 @@ func TestTrackerAccept(t *testing.T) {
 		{
 			name: "smaller interval replaces the learned one",
 			steps: []step{
-				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
 				{replica: a, ts: 30000, accept: true},
 				{replica: a, ts: 40000, accept: true},
 				// Interval is now 10s, timeout 15s.
 				{replica: b, ts: 40000 + 15000, accept: false},
-				{replica: b, ts: 40000 + 15000 + 1, accept: true},
+				{replica: b, ts: 40000 + 15000 + 1, accept: true, ownerChanged: true},
 			},
 			expectedOwner:     b,
 			expectedFailovers: 1,
@@ -170,11 +171,11 @@ func TestTrackerAccept(t *testing.T) {
 		{
 			name: "stale marker of the owner is handed over to a live replica",
 			steps: []step{
-				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
 				{replica: b, ts: 5000, accept: false},
 				{replica: a, ts: 15000, accept: true},
 				{replica: b, ts: 20000, accept: false},
-				{replica: a, ts: 30000, stale: true, accept: false},
+				{replica: a, ts: 30000, stale: true, accept: false, ownerChanged: true},
 				{replica: b, ts: 35000, accept: true},
 				{replica: a, ts: 45000, accept: false},
 				{replica: b, ts: 50000, accept: true},
@@ -184,10 +185,10 @@ func TestTrackerAccept(t *testing.T) {
 		{
 			name: "samples of a lagging new owner older than the handed over ones are dropped",
 			steps: []step{
-				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
 				{replica: a, ts: 15000, accept: true},
 				{replica: b, ts: 10000, accept: false},
-				{replica: a, ts: 30000, stale: true, accept: false},
+				{replica: a, ts: 30000, stale: true, accept: false, ownerChanged: true},
 				// prometheus-0 already delivered samples up to 15s.
 				{replica: b, ts: 12000, accept: false},
 				{replica: b, ts: 15000, accept: false},
@@ -199,11 +200,11 @@ func TestTrackerAccept(t *testing.T) {
 		{
 			name: "handover floor is kept when the old owner becomes candidate again",
 			steps: []step{
-				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
 				{replica: a, ts: 1000, accept: true},
 				{replica: a, ts: 2000, accept: true},
 				{replica: b, ts: 500, accept: false},
-				{replica: a, ts: 3000, stale: true, accept: false},
+				{replica: a, ts: 3000, stale: true, accept: false, ownerChanged: true},
 				{replica: a, ts: 4000, accept: false},
 				{replica: b, ts: 1500, accept: false},
 				{replica: b, ts: 2500, accept: true},
@@ -214,11 +215,11 @@ func TestTrackerAccept(t *testing.T) {
 		{
 			name: "handover floor is kept when a third replica becomes candidate",
 			steps: []step{
-				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
 				{replica: a, ts: 1000, accept: true},
 				{replica: a, ts: 2000, accept: true},
 				{replica: b, ts: 500, accept: false},
-				{replica: a, ts: 3000, stale: true, accept: false},
+				{replica: a, ts: 3000, stale: true, accept: false, ownerChanged: true},
 				{replica: c, ts: 800, accept: false},
 				{replica: b, ts: 1500, accept: false},
 				{replica: b, ts: 2500, accept: true},
@@ -228,7 +229,7 @@ func TestTrackerAccept(t *testing.T) {
 		{
 			name: "timestamps near the int64 limits don't overflow the timeout",
 			steps: []step{
-				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
 				{replica: a, ts: math.MaxInt64 - 1000, accept: true},
 				{replica: b, ts: 30000, accept: false},
 				{replica: b, ts: math.MaxInt64, accept: false},
@@ -238,11 +239,11 @@ func TestTrackerAccept(t *testing.T) {
 		{
 			name: "interval is not learned from the handover floor",
 			steps: []step{
-				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
 				{replica: a, ts: 15000, accept: true},
 				{replica: a, ts: 30000, accept: true},
 				{replica: b, ts: 29000, accept: false},
-				{replica: a, ts: 45000, stale: true, accept: false},
+				{replica: a, ts: 45000, stale: true, accept: false, ownerChanged: true},
 				{replica: b, ts: 31000, accept: true},
 				{replica: b, ts: 46000, accept: true},
 				{replica: a, ts: 57000, accept: false},
@@ -252,7 +253,7 @@ func TestTrackerAccept(t *testing.T) {
 		{
 			name: "stale marker of the owner is accepted without a live replica",
 			steps: []step{
-				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
 				{replica: a, ts: 15000, accept: true},
 				{replica: a, ts: 30000, stale: true, accept: true},
 			},
@@ -261,7 +262,7 @@ func TestTrackerAccept(t *testing.T) {
 		{
 			name: "stale marker of the owner is accepted if the other replica went silent",
 			steps: []step{
-				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
 				{replica: b, ts: 5000, accept: false},
 				{replica: a, ts: 15000, accept: true},
 				{replica: a, ts: 30000, accept: true},
@@ -274,11 +275,11 @@ func TestTrackerAccept(t *testing.T) {
 		{
 			name: "stale on both replicas ends the series without ping-pong",
 			steps: []step{
-				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
 				{replica: b, ts: 5000, accept: false},
 				{replica: a, ts: 15000, accept: true},
 				{replica: b, ts: 20000, accept: false},
-				{replica: a, ts: 30000, stale: true, accept: false},
+				{replica: a, ts: 30000, stale: true, accept: false, ownerChanged: true},
 				{replica: b, ts: 35000, stale: true, accept: true},
 				{replica: a, ts: 45000, stale: true, accept: false},
 			},
@@ -287,7 +288,7 @@ func TestTrackerAccept(t *testing.T) {
 		{
 			name: "stale on the non-owner first does not steal the owner's stale marker",
 			steps: []step{
-				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
 				{replica: b, ts: 5000, accept: false},
 				{replica: a, ts: 15000, accept: true},
 				{replica: b, ts: 20000, stale: true, accept: false},
@@ -298,9 +299,9 @@ func TestTrackerAccept(t *testing.T) {
 		{
 			name: "lagging owner loses the series to the current replica",
 			steps: []step{
-				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
 				{replica: a, ts: 15000, accept: true},
-				{replica: b, ts: 100000, accept: true},
+				{replica: b, ts: 100000, accept: true, ownerChanged: true},
 				{replica: a, ts: 30000, accept: false},
 				{replica: a, ts: 45000, accept: false},
 				{replica: b, ts: 115000, accept: true},
@@ -311,12 +312,12 @@ func TestTrackerAccept(t *testing.T) {
 		{
 			name: "three replicas",
 			steps: []step{
-				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
 				{replica: b, ts: 5000, accept: false},
 				{replica: c, ts: 10000, accept: false},
 				{replica: a, ts: 15000, accept: true},
 				{replica: c, ts: 25000, accept: false},
-				{replica: a, ts: 30000, stale: true, accept: false},
+				{replica: a, ts: 30000, stale: true, accept: false, ownerChanged: true},
 				{replica: c, ts: 40000, accept: true},
 				{replica: b, ts: 50000, accept: false},
 			},
@@ -325,11 +326,11 @@ func TestTrackerAccept(t *testing.T) {
 		{
 			name: "lagging third replica does not replace a live candidate",
 			steps: []step{
-				{replica: a, ts: 0, accept: true},
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
 				{replica: a, ts: 15000, accept: true},
 				{replica: b, ts: 20000, accept: false},
 				{replica: c, ts: -300000, accept: false},
-				{replica: a, ts: 30000, stale: true, accept: false},
+				{replica: a, ts: 30000, stale: true, accept: false, ownerChanged: true},
 				{replica: b, ts: 35000, accept: true},
 			},
 			expectedOwner: b,
@@ -342,7 +343,9 @@ func TestTrackerAccept(t *testing.T) {
 			for i, s := range tcase.steps {
 				r, ok := tr.Replica(s.replica)
 				require.True(t, ok)
-				require.Equal(t, s.accept, tr.Accept(1, r, s.ts, s.stale), "step %d: %+v", i, s)
+				accept, ownerChanged := tr.Accept(1, r, s.ts, s.stale)
+				require.Equal(t, s.accept, accept, "step %d: %+v", i, s)
+				require.Equal(t, s.ownerChanged, ownerChanged, "step %d: %+v", i, s)
 			}
 
 			owner, ok := tr.Replica(tcase.expectedOwner)
@@ -373,6 +376,11 @@ func TestLater(t *testing.T) {
 	}
 }
 
+func acceptOnly(tr *Tracker, ref storage.SeriesRef, replica uint16, ts int64) bool {
+	accept, _ := tr.Accept(ref, replica, ts, false)
+	return accept
+}
+
 func TestTrackerInit(t *testing.T) {
 	t.Parallel()
 
@@ -380,86 +388,44 @@ func TestTrackerInit(t *testing.T) {
 	a, _ := tr.Replica("a")
 	b, _ := tr.Replica("b")
 
-	tr.Init(1, a, 0)
+	require.True(t, tr.Init(1, a, 0))
 	// A concurrent writer of the other replica created the series too, the first owner is kept.
-	tr.Init(1, b, 1000)
+	require.False(t, tr.Init(1, b, 1000))
 	require.True(t, tr.IsOwner(1, a))
 	require.False(t, tr.IsOwner(1, b))
-	require.False(t, tr.Accept(1, b, 2000, false))
-	require.True(t, tr.Accept(1, a, 15000, false))
+	require.False(t, acceptOnly(tr, 1, b, 2000))
+	require.True(t, acceptOnly(tr, 1, a, 15000))
 	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.trackedSeries))
 }
 
-func TestTrackerRevert(t *testing.T) {
+func TestTrackerForget(t *testing.T) {
 	t.Parallel()
 
-	year := (365 * 24 * time.Hour).Milliseconds()
+	tr := NewTracker(testConfig(), prometheus.NewRegistry())
+	a, _ := tr.Replica("a")
+	b, _ := tr.Replica("b")
+	require.True(t, acceptOnly(tr, 1, a, 0))
+	require.True(t, acceptOnly(tr, 1, a, 15000))
+	require.True(t, acceptOnly(tr, 2, a, 0))
+	require.False(t, acceptOnly(tr, 1, b, 20000))
 
-	t.Run("failover", func(t *testing.T) {
-		t.Parallel()
+	tr.Forget(1)
+	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.trackedSeries))
+	require.True(t, tr.IsOwner(1, b), "forgotten series has no owner to protect")
+	require.True(t, tr.IsOwner(2, a))
+	require.False(t, tr.IsOwner(2, b))
 
-		tr := NewTracker(testConfig(), prometheus.NewRegistry())
-		a, _ := tr.Replica("a")
-		b, _ := tr.Replica("b")
-		require.True(t, tr.Accept(1, a, 0, false))
-		require.True(t, tr.Accept(1, a, 15000, false))
+	tr.Forget(1)
+	tr.Forget(3)
+	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.trackedSeries))
 
-		accept, c := tr.AcceptRevertible(1, b, year, false)
-		require.True(t, accept)
-		require.True(t, tr.IsOwner(1, b))
-		tr.Revert(c)
-		require.True(t, tr.IsOwner(1, a))
-		require.True(t, tr.Accept(1, a, 30000, false))
-		require.False(t, tr.Accept(1, b, 35000, false))
-	})
-
-	t.Run("created state", func(t *testing.T) {
-		t.Parallel()
-
-		tr := NewTracker(testConfig(), prometheus.NewRegistry())
-		a, _ := tr.Replica("a")
-		b, _ := tr.Replica("b")
-
-		accept, c := tr.AcceptRevertible(1, a, year, false)
-		require.True(t, accept)
-		tr.Revert(c)
-		require.Equal(t, 0.0, promtest.ToFloat64(tr.metrics.trackedSeries))
-		require.True(t, tr.Accept(1, b, 0, false))
-		require.True(t, tr.IsOwner(1, b))
-	})
-
-	t.Run("changed since", func(t *testing.T) {
-		t.Parallel()
-
-		tr := NewTracker(testConfig(), prometheus.NewRegistry())
-		a, _ := tr.Replica("a")
-		b, _ := tr.Replica("b")
-		require.True(t, tr.Accept(1, a, 0, false))
-		require.True(t, tr.Accept(1, a, 15000, false))
-
-		accept, c := tr.AcceptRevertible(1, a, 30000, false)
-		require.True(t, accept)
-		require.False(t, tr.Accept(1, b, 40000, false))
-		tr.Revert(c)
-		// Reverting to the owner's last sample at 15s would make this a failover.
-		require.False(t, tr.Accept(1, b, 50000, false))
-		require.True(t, tr.IsOwner(1, a))
-	})
-
-	t.Run("dropped sample", func(t *testing.T) {
-		t.Parallel()
-
-		tr := NewTracker(testConfig(), prometheus.NewRegistry())
-		a, _ := tr.Replica("a")
-		b, _ := tr.Replica("b")
-		require.True(t, tr.Accept(1, a, 0, false))
-
-		accept, c := tr.AcceptRevertible(1, b, 5000, false)
-		require.False(t, accept)
-		require.Equal(t, Change{}, c)
-		tr.Revert(c)
-		require.False(t, tr.Accept(1, a, 10000, true), "b must still be the candidate")
-	})
+	// The next sample elects its replica, also one older than the forgotten owner's samples.
+	accepted, ownerChanged := tr.Accept(1, b, 10000, false)
+	require.True(t, accepted)
+	require.True(t, ownerChanged)
+	require.True(t, tr.IsOwner(1, b))
+	require.False(t, acceptOnly(tr, 1, a, 30000))
+	require.Equal(t, 2.0, promtest.ToFloat64(tr.metrics.trackedSeries))
 }
 
 func TestSeriesStateSize(t *testing.T) {
@@ -475,10 +441,10 @@ func TestTrackerSeriesAreIndependent(t *testing.T) {
 	a, _ := tr.Replica("a")
 	b, _ := tr.Replica("b")
 
-	require.True(t, tr.Accept(1, a, 0, false))
-	require.True(t, tr.Accept(2, b, 0, false))
-	require.False(t, tr.Accept(1, b, 1000, false))
-	require.False(t, tr.Accept(2, a, 1000, false))
+	require.True(t, acceptOnly(tr, 1, a, 0))
+	require.True(t, acceptOnly(tr, 2, b, 0))
+	require.False(t, acceptOnly(tr, 1, b, 1000))
+	require.False(t, acceptOnly(tr, 2, a, 1000))
 	require.True(t, tr.IsOwner(1, a))
 	require.True(t, tr.IsOwner(2, b))
 	require.True(t, tr.IsOwner(3, a), "untracked series has no owner to protect")
@@ -526,18 +492,18 @@ func TestTrackerGC(t *testing.T) {
 	b, _ := tr.Replica("b")
 	ts := now.UnixMilli()
 
-	require.True(t, tr.Accept(1, a, ts-(6*time.Minute).Milliseconds(), false))
-	require.True(t, tr.Accept(2, a, ts-(6*time.Minute).Milliseconds(), false))
+	require.True(t, acceptOnly(tr, 1, a, ts-(6*time.Minute).Milliseconds()))
+	require.True(t, acceptOnly(tr, 2, a, ts-(6*time.Minute).Milliseconds()))
 	// Series 2 is kept alive by a non-owner sample.
-	require.False(t, tr.Accept(2, b, ts-(4*time.Minute).Milliseconds(), false))
-	require.True(t, tr.Accept(3, a, ts, false))
+	require.False(t, acceptOnly(tr, 2, b, ts-(4*time.Minute).Milliseconds()))
+	require.True(t, acceptOnly(tr, 3, a, ts))
 
 	require.Equal(t, 1, tr.GC())
 	require.Equal(t, 2.0, promtest.ToFloat64(tr.metrics.trackedSeries))
 	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.gcRemoved))
 
 	// Removed state is re-created by the next sample of any replica.
-	require.True(t, tr.Accept(1, b, ts, false))
+	require.True(t, acceptOnly(tr, 1, b, ts))
 	require.True(t, tr.IsOwner(1, b))
 
 	// Series 2 was last seen 4m ago, which becomes more than 5m.
@@ -554,8 +520,8 @@ func TestTrackerGCIgnoresFutureSamples(t *testing.T) {
 	a, _ := tr.Replica("a")
 	ts := now.UnixMilli()
 
-	require.True(t, tr.Accept(1, a, ts, false))
-	require.True(t, tr.Accept(2, a, ts+(365*24*time.Hour).Milliseconds(), false))
+	require.True(t, acceptOnly(tr, 1, a, ts))
+	require.True(t, acceptOnly(tr, 2, a, ts+(365*24*time.Hour).Milliseconds()))
 	require.Equal(t, 0, tr.GC())
 
 	// The default TTL is max failover timeout + 10m.
@@ -578,8 +544,8 @@ func TestTrackerReplicaGC(t *testing.T) {
 	require.True(t, ok)
 	b, ok := tr.Replica("b")
 	require.True(t, ok)
-	require.True(t, tr.Accept(1, a, ts(), false))
-	require.True(t, tr.Accept(2, b, ts(), false))
+	require.True(t, acceptOnly(tr, 1, a, ts()))
+	require.True(t, acceptOnly(tr, 2, b, ts()))
 	tr.GC()
 
 	_, ok = tr.Replica("c")
@@ -588,7 +554,7 @@ func TestTrackerReplicaGC(t *testing.T) {
 	// Only series 1 keeps receiving samples. No replica is looked up in the meantime, but a still owns series 1.
 	for range 6 {
 		now = now.Add(time.Minute)
-		require.True(t, tr.Accept(1, a, ts(), false))
+		require.True(t, acceptOnly(tr, 1, a, ts()))
 		tr.GC()
 	}
 	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.replicas))
@@ -596,8 +562,8 @@ func TestTrackerReplicaGC(t *testing.T) {
 	c, ok := tr.Replica("c")
 	require.True(t, ok)
 	require.Equal(t, b, c, "freed index is reused")
-	require.True(t, tr.Accept(3, c, ts(), false))
-	require.False(t, tr.Accept(1, c, ts()+1000, false))
+	require.True(t, acceptOnly(tr, 3, c, ts()))
+	require.False(t, acceptOnly(tr, 1, c, ts()+1000))
 	require.True(t, tr.IsOwner(1, a))
 
 	again, ok := tr.Replica("a")
@@ -615,8 +581,8 @@ func TestTrackerReplicaGC(t *testing.T) {
 		require.True(t, ok, "iteration %d", i)
 		r1, ok := tr.Replica(fmt.Sprintf("churn-%d-1", i))
 		require.True(t, ok, "iteration %d", i)
-		require.True(t, tr.Accept(storage.SeriesRef(100+i), r0, ts(), false))
-		require.False(t, tr.Accept(storage.SeriesRef(100+i), r1, ts()+1000, false))
+		require.True(t, acceptOnly(tr, storage.SeriesRef(100+i), r0, ts()))
+		require.False(t, acceptOnly(tr, storage.SeriesRef(100+i), r1, ts()+1000))
 	}
 }
 
@@ -670,13 +636,16 @@ func TestTrackerConcurrent(t *testing.T) {
 			for i := range 1000 {
 				ts := int64(i * 15000)
 				ref := storage.SeriesRef(i % 100)
-				if _, c := tr.AcceptRevertible(ref, r, ts, false); i%10 == 0 {
-					tr.Revert(c)
-				}
+				tr.Accept(ref, r, ts, i%7 == 0)
 				tr.IsOwner(ref, r)
 			}
 		})
 	}
+	wg.Go(func() {
+		for i := range 1000 {
+			tr.Forget(storage.SeriesRef(i % 100))
+		}
+	})
 	wg.Go(func() {
 		for range 10 {
 			tr.GC()

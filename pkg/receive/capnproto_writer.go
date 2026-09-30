@@ -81,6 +81,7 @@ func (r *CapNProtoWriter) Write(ctx context.Context, wreq *writecapnp.Request) e
 	)
 	for wreq.Next() {
 		if err := wreq.At(&series); err != nil {
+			dedup.forget()
 			return errors.Wrap(err, "request.At")
 		}
 
@@ -112,17 +113,17 @@ func (r *CapNProtoWriter) Write(ctx context.Context, wreq *writecapnp.Request) e
 		// Append as many valid samples as possible, but keep track of the errors.
 		for _, s := range series.Samples {
 			if dedupSeries.tracker != nil {
-				// A rejected sample must not take part in the ownership decision, see haDedupSeries.appended.
+				// A rejected sample must not take part in the ownership decision, see haDedupWriter.appended.
 				if err := ra.checkTooFarInFuture(lset, s.Timestamp); err != nil {
 					errorTracker.addSampleError(err, tLogger, lset, s.Timestamp, s.Value)
 					continue
 				}
 			}
-			if !dedupSeries.accept(ref, s.Timestamp, value.IsStaleNaN(s.Value)) {
+			if !dedup.accept(&dedupSeries, ref, s.Timestamp, value.IsStaleNaN(s.Value)) {
 				continue
 			}
 			ref, err = app.Append(ref, lset, s.Timestamp, s.Value)
-			dedupSeries.appended(ref)
+			dedup.appended(&dedupSeries, ref)
 			errorTracker.addSampleError(err, tLogger, lset, s.Timestamp, s.Value)
 		}
 
@@ -133,11 +134,11 @@ func (r *CapNProtoWriter) Write(ctx context.Context, wreq *writecapnp.Request) e
 					continue
 				}
 			}
-			if !dedupSeries.accept(ref, hp.Timestamp, isStaleHistogram(hp.Histogram, hp.FloatHistogram)) {
+			if !dedup.accept(&dedupSeries, ref, hp.Timestamp, isStaleHistogram(hp.Histogram, hp.FloatHistogram)) {
 				continue
 			}
 			ref, err = app.AppendHistogram(ref, lset, hp.Timestamp, hp.Histogram, hp.FloatHistogram)
-			dedupSeries.appended(ref)
+			dedup.appended(&dedupSeries, ref)
 			errorTracker.addHistogramError(err, tLogger, lset, hp.Timestamp)
 		}
 
@@ -176,6 +177,7 @@ func (r *CapNProtoWriter) Write(ctx context.Context, wreq *writecapnp.Request) e
 
 	errs := errorTracker.collectErrors(tLogger)
 	if err := app.Commit(); err != nil {
+		dedup.forget()
 		errs.Add(errors.Wrap(err, "commit samples"))
 	}
 	return errs.ErrOrNil()

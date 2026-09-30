@@ -141,17 +141,17 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq []prompb.TimeS
 		// Append as many valid samples as possible, but keep track of the errors.
 		for _, s := range t.Samples {
 			if dedupSeries.tracker != nil {
-				// A rejected sample must not take part in the ownership decision, see haDedupSeries.appended.
+				// A rejected sample must not take part in the ownership decision, see haDedupWriter.appended.
 				if err := ra.checkTooFarInFuture(lset, s.Timestamp); err != nil {
 					errorTracker.addSampleError(err, tLogger, lset, s.Timestamp, s.Value)
 					continue
 				}
 			}
-			if !dedupSeries.accept(ref, s.Timestamp, value.IsStaleNaN(s.Value)) {
+			if !dedup.accept(&dedupSeries, ref, s.Timestamp, value.IsStaleNaN(s.Value)) {
 				continue
 			}
 			ref, err = app.Append(ref, lset, s.Timestamp, s.Value)
-			dedupSeries.appended(ref)
+			dedup.appended(&dedupSeries, ref)
 			errorTracker.addSampleError(err, tLogger, lset, s.Timestamp, s.Value)
 		}
 
@@ -162,7 +162,7 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq []prompb.TimeS
 					continue
 				}
 			}
-			if !dedupSeries.accept(ref, hp.Timestamp, value.IsStaleNaN(hp.Sum)) {
+			if !dedup.accept(&dedupSeries, ref, hp.Timestamp, value.IsStaleNaN(hp.Sum)) {
 				continue
 			}
 			var (
@@ -177,7 +177,7 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq []prompb.TimeS
 			}
 
 			ref, err = app.AppendHistogram(ref, lset, hp.Timestamp, h, fh)
-			dedupSeries.appended(ref)
+			dedup.appended(&dedupSeries, ref)
 			errorTracker.addHistogramError(err, tLogger, lset, hp.Timestamp)
 		}
 
@@ -203,6 +203,7 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq []prompb.TimeS
 
 	errs := errorTracker.collectErrors(tLogger)
 	if err := app.Commit(); err != nil {
+		dedup.forget()
 		errs.Add(errors.Wrap(err, "commit samples"))
 	}
 	return errs.ErrOrNil()

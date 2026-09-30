@@ -263,28 +263,15 @@ func (t *Tracker) Passthrough(reason string) {
 	}
 }
 
-// Change is the state change of a series made by accepting a sample, see Tracker.Revert. The zero value is no change.
-type Change struct {
-	ref        storage.SeriesRef
-	prev, next seriesState
-	created    bool
-}
-
 // Accept decides whether the sample at ts written by replica to the series with the given head reference
-// should be appended, and updates the series state accordingly.
-func (t *Tracker) Accept(ref storage.SeriesRef, replica uint16, ts int64, stale bool) bool {
-	accept, _ := t.AcceptRevertible(ref, replica, ts, stale)
-	return accept
-}
-
-// AcceptRevertible is like Accept, but for accepted samples it also returns the change of the series state, which
-// must be reverted if appending the sample fails.
-func (t *Tracker) AcceptRevertible(ref storage.SeriesRef, replica uint16, ts int64, stale bool) (bool, Change) {
+// should be appended, and updates the series state accordingly. ownerChanged reports whether the series state was
+// created or its owner replaced, also for a dropped sample: the caller must Forget the series if the samples the
+// decision is based on are not stored.
+func (t *Tracker) Accept(ref storage.SeriesRef, replica uint16, ts int64, stale bool) (accept, ownerChanged bool) {
 	s := &t.stripes[uint64(ref)%numStripes]
 	s.mtx.Lock()
-	prev, exists := s.series[ref]
-	st := prev
-	accept, failover := t.decide(&st, exists, replica, ts, stale)
+	st, exists := s.series[ref]
+	accept, failover, handover := t.decide(&st, exists, replica, ts, stale)
 	if s.series == nil {
 		s.series = map[storage.SeriesRef]seriesState{}
 	}
@@ -295,41 +282,26 @@ func (t *Tracker) AcceptRevertible(ref storage.SeriesRef, replica uint16, ts int
 		t.metrics.trackedSeries.Inc()
 	}
 	t.observe(accept, failover)
-	if !accept {
-		return false, Change{}
-	}
-	return true, Change{ref: ref, prev: prev, next: st, created: !exists}
+	return accept, !exists || failover || handover
 }
 
-// Revert restores the state of a series from before the given change, unless the state has been changed since.
-func (t *Tracker) Revert(c Change) {
-	if !c.created && c.prev == c.next {
-		return
-	}
-	s := &t.stripes[uint64(c.ref)%numStripes]
+// Forget removes the state of a series, so that its next sample elects the owner again.
+func (t *Tracker) Forget(ref storage.SeriesRef) {
+	s := &t.stripes[uint64(ref)%numStripes]
 	s.mtx.Lock()
-	cur, ok := s.series[c.ref]
-	// Another writer may have taken a decision based on the changed state in the meantime. Its decision is kept
-	// rather than overwritten, as it may have appended a sample already.
-	reverted := ok && cur == c.next
-	if reverted {
-		if c.created {
-			delete(s.series, c.ref)
-		} else {
-			s.series[c.ref] = c.prev
-		}
-	}
+	_, exists := s.series[ref]
+	delete(s.series, ref)
 	s.mtx.Unlock()
 
-	if reverted && c.created {
+	if exists {
 		t.metrics.trackedSeries.Dec()
 	}
 }
 
 // Init records replica as the owner of a series created by appending its sample at ts, unless another
 // writer created state for the series in the meantime. In that case both replicas' first samples may have
-// been appended.
-func (t *Tracker) Init(ref storage.SeriesRef, replica uint16, ts int64) {
+// been appended. It returns true if it created the state.
+func (t *Tracker) Init(ref storage.SeriesRef, replica uint16, ts int64) bool {
 	s := &t.stripes[uint64(ref)%numStripes]
 	s.mtx.Lock()
 	_, exists := s.series[ref]
@@ -345,6 +317,7 @@ func (t *Tracker) Init(ref storage.SeriesRef, replica uint16, ts int64) {
 		t.metrics.trackedSeries.Inc()
 	}
 	t.observe(true, false)
+	return !exists
 }
 
 // IsOwner returns true if replica owns the series or the series is not tracked.
@@ -369,16 +342,16 @@ func (t *Tracker) observe(accept, failover bool) {
 
 // decide implements the per-sample state machine. All times are sample timestamps, never wall clock: this makes
 // decisions independent of remote-write delivery lag, so a lagging owner loses ownership to the most current replica.
-func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, stale bool) (accept, failover bool) {
+func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, stale bool) (accept, failover, handover bool) {
 	if !exists {
 		*s = seriesState{owner: r, ownerLastTs: ts, cand: noReplica, candLastTs: noTs}
-		return true, false
+		return true, false, false
 	}
 
 	if r == s.owner {
 		if s.intervalMs&handoverFlag != 0 {
 			if ts <= s.ownerLastTs {
-				return false, false
+				return false, false, false
 			}
 			// The distance to the floor is the phase offset between the replicas, not an interval of the new owner.
 			s.intervalMs &^= handoverFlag
@@ -393,18 +366,18 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, stale 
 			s.owner, s.ownerLastTs = s.cand, max(s.ownerLastTs, s.candLastTs)
 			s.cand, s.candLastTs = noReplica, noTs
 			s.intervalMs |= handoverFlag
-			return false, false
+			return false, false, true
 		}
 		if ts > s.ownerLastTs {
 			s.intervalMs = learnInterval(s.intervalMs, ts-s.ownerLastTs)
 			s.ownerLastTs = ts
 		}
-		return true, false
+		return true, false, false
 	}
 
 	if later(ts, s.ownerLastTs, t.timeout(s.interval())) {
 		*s = seriesState{owner: r, ownerLastTs: ts, intervalMs: s.interval(), cand: noReplica, candLastTs: noTs}
-		return true, true
+		return true, true, false
 	}
 
 	if stale {
@@ -412,14 +385,14 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, stale 
 		if s.cand == r {
 			s.cand, s.candLastTs = noReplica, noTs
 		}
-		return false, false
+		return false, false, false
 	}
 	// Replacing cand by arrival order would let a lagging replica evict a live one, and the owner's stale marker
 	// would then be accepted instead of handing the series over.
 	if ts > s.candLastTs {
 		s.cand, s.candLastTs = r, ts
 	}
-	return false, false
+	return false, false, false
 }
 
 // later reports whether ts is more than d after last. Written without last+d, which overflows for timestamps near

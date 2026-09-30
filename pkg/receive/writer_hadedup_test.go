@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/prometheus/model/histogram"
@@ -477,6 +478,166 @@ func TestWriterHADedupRejectedSamples(t *testing.T) {
 	}
 }
 
+// faultyAppendStorage fails the commit of the next request after rolling it back, like the TSDB failing to log it,
+// and calls beforeAppendHistogram in histogram appends before delegating to the TSDB.
+type faultyAppendStorage struct {
+	*MultiTSDB
+	failCommit            bool
+	beforeAppendHistogram func()
+}
+
+func (s *faultyAppendStorage) TenantAppendable(tenantID string) (Appendable, error) {
+	a, err := s.MultiTSDB.TenantAppendable(tenantID)
+	return faultyAppendable{Appendable: a, s: s}, err
+}
+
+type faultyAppendable struct {
+	Appendable
+	s *faultyAppendStorage
+}
+
+func (a faultyAppendable) Appender(ctx context.Context) (storage.Appender, error) {
+	app, err := a.Appendable.Appender(ctx)
+	if err != nil {
+		return nil, err
+	}
+	failCommit := a.s.failCommit
+	a.s.failCommit = false
+	return faultyAppender{Appender: app, getRef: app.(storage.GetRef), failCommit: failCommit, beforeAppendHistogram: a.s.beforeAppendHistogram}, nil
+}
+
+type faultyAppender struct {
+	storage.Appender
+	getRef                storage.GetRef
+	failCommit            bool
+	beforeAppendHistogram func()
+}
+
+func (a faultyAppender) GetRef(lset labels.Labels, hash uint64) (storage.SeriesRef, labels.Labels) {
+	return a.getRef.GetRef(lset, hash)
+}
+
+func (a faultyAppender) AppendHistogram(ref storage.SeriesRef, l labels.Labels, t int64, h *histogram.Histogram, fh *histogram.FloatHistogram) (storage.SeriesRef, error) {
+	if a.beforeAppendHistogram != nil {
+		a.beforeAppendHistogram()
+	}
+	return a.Appender.AppendHistogram(ref, l, t, h, fh)
+}
+
+func (a faultyAppender) Commit() error {
+	if a.failCommit {
+		if err := a.Rollback(); err != nil {
+			return err
+		}
+		return errors.New("write WAL")
+	}
+	return a.Appender.Commit()
+}
+
+func TestWriterHADedupFailedWrites(t *testing.T) {
+	t.Parallel()
+
+	stale := math.Float64frombits(value.StaleNaN)
+	floats := func(replica string, samples ...prompb.Sample) []prompb.TimeSeries {
+		return []prompb.TimeSeries{{Labels: withReplicaLabel([]labelpb.ZLabel{{Name: "__name__", Value: "up"}}, replica), Samples: samples}}
+	}
+	// A histogram with a count not matching its buckets passes the checks before the tracker and is rejected only
+	// by the TSDB.
+	malformedHistogram := func(replica string, ts int64) []prompb.TimeSeries {
+		return []prompb.TimeSeries{{
+			Labels:     withReplicaLabel([]labelpb.ZLabel{{Name: "__name__", Value: "up"}}, replica),
+			Histograms: []prompb.Histogram{prompb.HistogramToHistogramProto(ts, &histogram.Histogram{Count: 1, Sum: 1})},
+		}}
+	}
+
+	type failedWrite struct {
+		series     []prompb.TimeSeries
+		failCommit bool
+		// concurrent is written while the histogram of series is being appended.
+		concurrent []prompb.TimeSeries
+		err        bool
+	}
+	base := time.Now().Add(-time.Minute).UnixMilli()
+	for _, tcase := range []struct {
+		name     string
+		writes   []failedWrite
+		expected []int64
+	}{
+		{
+			name: "owner writes while a rejected failover sample is appended",
+			writes: []failedWrite{
+				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base})},
+				{
+					series:     malformedHistogram("prometheus-1", base+90000),
+					concurrent: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 15000}),
+				},
+				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 30000})},
+			},
+			// The concurrent sample at 15s is dropped, as the rejected sample owned the series while it was written.
+			expected: []int64{base, base + 30000},
+		},
+		{
+			name: "commit failure after a stale handover is retried",
+			writes: []failedWrite{
+				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base - 60000})},
+				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base - 45000})},
+				{series: floats("prometheus-1", prompb.Sample{Value: 1, Timestamp: base - 35000})},
+				{
+					series:     floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base - 30000}, prompb.Sample{Value: stale, Timestamp: base - 15000}),
+					failCommit: true,
+					err:        true,
+				},
+				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base - 30000}, prompb.Sample{Value: stale, Timestamp: base - 15000})},
+			},
+			expected: []int64{base - 60000, base - 45000, base - 30000, base - 15000},
+		},
+		{
+			name: "commit failure of a new series is retried",
+			writes: []failedWrite{
+				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base}), failCommit: true, err: true},
+				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base})},
+				{series: floats("prometheus-1", prompb.Sample{Value: 1, Timestamp: base + 5000})},
+			},
+			expected: []int64{base},
+		},
+		{
+			name: "commit failure of a new series does not keep its owner",
+			writes: []failedWrite{
+				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base}), failCommit: true, err: true},
+				{series: floats("prometheus-1", prompb.Sample{Value: 1, Timestamp: base + 5000})},
+				{series: floats("prometheus-1", prompb.Sample{Value: 1, Timestamp: base + 20000})},
+			},
+			expected: []int64{base + 5000, base + 20000},
+		},
+	} {
+		for _, capnp := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/capnp=%v", tcase.name, capnp), func(t *testing.T) {
+				t.Parallel()
+
+				m := newHADedupMultiTSDB(t, prometheus.NewRegistry(), labels.FromStrings("replica", "01"), WithHADedup(testHADedupConfig()))
+				s := &faultyAppendStorage{MultiTSDB: m}
+				for _, wr := range tcase.writes {
+					s.failCommit = wr.failCommit
+					s.beforeAppendHistogram = nil
+					if wr.concurrent != nil {
+						s.beforeAppendHistogram = func() {
+							require.NoError(t, writeHADedupRequest(t, m, capnp, time.Minute, wr.concurrent))
+						}
+					}
+					err := writeHADedupRequest(t, s, capnp, time.Minute, wr.series)
+					if wr.err {
+						require.Error(t, err)
+						continue
+					}
+					require.NoError(t, err)
+				}
+
+				require.Equal(t, map[string]storedSeries{`{__name__="up"}`: {floats: tcase.expected}}, readTenantSeries(t, m))
+			})
+		}
+	}
+}
+
 // All writers of a dedup-enabled tenant must set the replica label. A series without it is written as it is,
 // even if another replica writes the same series with the label.
 func TestWriterHADedupMissingReplicaLabel(t *testing.T) {
@@ -615,7 +776,7 @@ func TestHADedupWriterPrepare(t *testing.T) {
 		var w haDedupWriter
 		got, s := w.prepare(lbls, true)
 		require.Equal(t, lbls, got)
-		require.True(t, s.accept(0, 0, false))
+		require.True(t, w.accept(&s, 0, 0, false))
 		require.True(t, s.acceptExemplars(1))
 	})
 }
@@ -626,34 +787,52 @@ func TestHADedupSeries(t *testing.T) {
 	tracker := hadedup.NewTracker(testHADedupConfig(), prometheus.NewRegistry())
 	r0, _ := tracker.Replica("prometheus-0")
 	r1, _ := tracker.Replica("prometheus-1")
+	w := haDedupWriter{tracker: tracker}
 
 	// New series: the first sample is appended without state and elects its replica.
 	s0 := haDedupSeries{tracker: tracker, replica: r0}
-	require.True(t, s0.accept(0, 0, false))
-	s0.appended(7)
+	require.True(t, w.accept(&s0, 0, 0, false))
+	w.appended(&s0, 7)
 	require.True(t, tracker.IsOwner(7, r0))
+	require.Equal(t, []storage.SeriesRef{7}, w.ownerChanged)
+
+	// Samples that don't change the owner are not recorded.
+	require.True(t, w.accept(&s0, 7, 1000, false))
+	w.appended(&s0, 7)
+	require.Equal(t, []storage.SeriesRef{7}, w.ownerChanged)
 
 	// A failed append returns a zero reference, later samples must still be checked against the tracker.
 	s1 := haDedupSeries{tracker: tracker, replica: r1}
-	require.False(t, s1.accept(7, 5000, false))
-	require.False(t, s1.accept(0, 6000, false))
+	require.False(t, w.accept(&s1, 7, 5000, false))
+	require.False(t, w.accept(&s1, 0, 6000, false))
 	require.False(t, s1.acceptExemplars(7))
 	require.True(t, s0.acceptExemplars(7))
 
-	// A failed append of an accepted sample reverts its ownership change.
-	require.True(t, s1.accept(0, 5000+(365*24*time.Hour).Milliseconds(), false))
+	// A failed append of an accepted sample that changed the owner forgets the series.
+	require.True(t, w.accept(&s1, 0, 5000+(365*24*time.Hour).Milliseconds(), false))
 	require.True(t, tracker.IsOwner(7, r1))
-	s1.appended(0)
+	require.False(t, tracker.IsOwner(7, r0))
+	w.appended(&s1, 0)
 	require.True(t, tracker.IsOwner(7, r0))
+	require.True(t, tracker.IsOwner(7, r1))
+	require.Equal(t, []storage.SeriesRef{7}, w.ownerChanged)
 
 	// The reference is known from the first sample even if its append fails.
-	tracker.Init(8, r0, 15000)
-	require.False(t, tracker.Accept(8, r1, 20000, false))
+	require.True(t, tracker.Init(8, r0, 15000))
+	accept, _ := tracker.Accept(8, r1, 20000, false)
+	require.False(t, accept)
 	s2 := haDedupSeries{tracker: tracker, replica: r0}
-	require.True(t, s2.accept(8, 0, false))
-	s2.appended(0)
-	require.False(t, s2.accept(0, 30000, true), "stale marker must be handed over to the live replica")
+	require.True(t, w.accept(&s2, 8, 0, false))
+	w.appended(&s2, 0)
+	// A handover drops the sample, but must be forgotten if the request fails.
+	require.False(t, w.accept(&s2, 0, 30000, true), "stale marker must be handed over to the live replica")
 	require.True(t, tracker.IsOwner(8, r1))
+	require.Equal(t, []storage.SeriesRef{7, 8}, w.ownerChanged)
+
+	w.forget()
+	require.Nil(t, w.ownerChanged)
+	require.True(t, tracker.IsOwner(7, r1))
+	require.True(t, tracker.IsOwner(8, r0))
 }
 
 func BenchmarkWriterHADedup(b *testing.B) {
