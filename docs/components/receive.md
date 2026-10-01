@@ -360,6 +360,41 @@ NOTE:
 - Thanos Receive performs best-effort limiting. In case meta-monitoring is down/unreachable, Thanos Receive will not impose limits and only log errors for meta-monitoring being unreachable. Similarly to when one receiver cannot be scraped.
 - Support for different limit configuration for different tenants is planned for the future.
 
+## HA replica deduplication (experimental)
+
+When Prometheus runs as an HA pair (or more replicas) with identical configuration that only differs in a replica label, every replica remote-writes the same series. Without deduplication, Receive stores all of them, and Query and Compactor remove the duplicates later. With `--receive.ha-dedup.replica-label`, Receive keeps samples of a single replica per series instead:
+
+- Routers hash series ignoring the replica label, so all replicas' copies of a series are sent to the same ingestors.
+- Every ingestor tracks, per series, which replica currently owns it, appends only the owner's samples and strips the replica label. If the owner stops writing a series, another replica takes it over after `--receive.ha-dedup.failover-intervals` (default `1.5`) times the series' sample interval, which is learned per series and bounded by `--receive.ha-dedup.min-failover-timeout` and `--receive.ha-dedup.max-failover-timeout`. Decisions are based on sample timestamps, not on wall-clock time.
+
+For example, with Prometheus replicas that set `external_labels: {prometheus_replica: <name>}`, start routers and ingestors with:
+
+```bash
+thanos receive \
+    --receive.ha-dedup.replica-label=prometheus_replica \
+    --tsdb.too-far-in-future.time-window=5m \
+    ...
+```
+
+Requirements:
+
+- Set the same `--receive.ha-dedup.replica-label` on routers and ingestors. The other `--receive.ha-dedup.*` flags are only used by ingestors.
+- Every writer of a tenant whose series should be deduplicated must set the replica label, with a value unique per replica. Series without the label are written as they are, even if another replica writes the same series with the label, which can lead to out-of-order rejections and interleaved samples. Such series are counted in `thanos_receive_ha_dedup_passthrough_total{reason="no_label"}`. With vmagent, set the label with `-remoteWrite.label=prometheus_replica=<name>`.
+- Set `--tsdb.too-far-in-future.time-window` on ingestors. Otherwise a sample with a timestamp in the future lets its replica take the series over until that time, and samples of the other replicas are dropped meanwhile. Receive logs a warning on startup if the window is not set.
+- The replica label must differ from the external labels of Receive (e.g. `receive_replica`) and from the split tenant label, and `--receive.relabel-config` must not drop it.
+- Configure both labels as replica labels in Query (`--query.replica-label=receive_replica --query.replica-label=prometheus_replica`) and Compactor (`--deduplication.replica-label`): `receive_replica` for the copies of the replication factor, `prometheus_replica` for data written before deduplication was enabled and for series written without deduplication.
+
+Behaviour to be aware of:
+
+- When a replica stops, each of its series has a gap of between `failover-intervals` and `failover-intervals + 1` sample intervals, e.g. 22.5s to 37.5s for a 15s scrape interval. Prometheus doesn't write stale markers on shutdown, so a restart of a replica always fails over this way.
+- Owners are elected independently by every ingestor. After an ingestor restart, its copy of a series can be owned by another replica than the other copies until the next failover. With `--query.dedup-func=chain`, such series contain the samples of both replicas during that time.
+- Both replicas' samples still reach the routers and ingestors: request-level limits and router resources see the traffic of all replicas, while head series and storage are deduplicated.
+- Every tracked series takes memory on ingestors, roughly 40-75 bytes per series.
+
+Enabling or disabling deduplication changes the identity of the affected series, as the replica label is removed or added again. Routers and ingestors can be switched in any order without losing data: until both are switched, the replicas' copies are stored separately and deduplicated by Query and Compactor as before.
+
+The `thanos_receive_ha_dedup_*` metrics of ingestors show the share of dropped samples (`samples_total{outcome="dropped"}`, about half for a pair of replicas), failovers (`failovers_total`), tracked series and replicas, and series written without deduplication (`passthrough_total`).
+
 ## Asynchronous workers
 
 Instead of spawning a new goroutine each time the Receiver forwards a request to another node, it spawns a fixed number of goroutines (workers) that perform the work. This allows avoiding spawning potentially tens or even hundred thousand goroutines if someone starts sending a lot of small requests.

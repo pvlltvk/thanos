@@ -256,6 +256,9 @@ func runReceive(
 	if conf.haDedupReplicaLabel != "" {
 		multiTSDBOptions = append(multiTSDBOptions, receive.WithHADedup(conf.haDedupConfig()))
 		level.Info(logger).Log("msg", "HA replica deduplication enabled", "replicaLabel", conf.haDedupReplicaLabel)
+		if enableIngestion && *conf.tsdbTooFarInFutureTimeWindow == 0 {
+			level.Warn(logger).Log("msg", "HA replica deduplication is enabled without --tsdb.too-far-in-future.time-window: a sample with a timestamp in the future lets its replica take the series over until that time; set the window, e.g. to 5m, to reject such samples")
+		}
 	}
 
 	dbs := receive.NewMultiTSDB(
