@@ -365,7 +365,7 @@ NOTE:
 When Prometheus runs as an HA pair (or more replicas) with identical configuration that only differs in a replica label, every replica remote-writes the same series. Without deduplication, Receive stores all of them, and Query and Compactor remove the duplicates later. With `--receive.ha-dedup.replica-label`, Receive keeps samples of a single replica per series instead:
 
 - Routers hash series ignoring the replica label, so all replicas' copies of a series are sent to the same ingestors.
-- Every ingestor tracks, per series, which replica currently owns it, appends only the owner's samples and strips the replica label. If the owner stops writing a series, another replica takes it over after `--receive.ha-dedup.failover-intervals` (default `1.5`) times the series' sample interval, which is learned per series and bounded by `--receive.ha-dedup.min-failover-timeout` and `--receive.ha-dedup.max-failover-timeout`. Decisions are based on sample timestamps, not on wall-clock time.
+- Every ingestor tracks, per series, which replica currently owns it, appends only the owner's samples and strips the replica label. If the owner stops writing a series, another replica takes it over after `--receive.ha-dedup.failover-intervals` (default `1.5`) times the series' sample interval, which is learned per series and bounded by `--receive.ha-dedup.min-failover-timeout` and `--receive.ha-dedup.max-failover-timeout`. Decisions compare sample timestamps rather than arrival times, so delivery lag that all replicas share doesn't cause failovers.
 
 For example, with Prometheus replicas that set `external_labels: {prometheus_replica: <name>}`, start routers and ingestors with:
 
@@ -380,20 +380,43 @@ Requirements:
 
 - Set the same `--receive.ha-dedup.replica-label` on routers and ingestors. The other `--receive.ha-dedup.*` flags are only used by ingestors.
 - Every writer of a tenant whose series should be deduplicated must set the replica label, with a value unique per replica. Series without the label are written as they are, even if another replica writes the same series with the label, which can lead to out-of-order rejections and interleaved samples. Such series are counted in `thanos_receive_ha_dedup_passthrough_total{reason="no_label"}`. With vmagent, set the label with `-remoteWrite.label=prometheus_replica=<name>`.
-- Set `--tsdb.too-far-in-future.time-window` on ingestors. Otherwise a sample with a timestamp in the future lets its replica take the series over until that time, and samples of the other replicas are dropped meanwhile. Receive logs a warning on startup if the window is not set.
+- Replica label values must not be longer than 128 bytes. Series with longer values are written without deduplication and counted in `thanos_receive_ha_dedup_passthrough_total{reason="replica_value_too_long"}`.
 - The replica label must differ from the external labels of Receive (e.g. `receive_replica`) and from the split tenant label, and `--receive.relabel-config` must not drop it.
-- Configure both labels as replica labels in Query (`--query.replica-label=receive_replica --query.replica-label=prometheus_replica`) and Compactor (`--deduplication.replica-label`): `receive_replica` for the copies of the replication factor, `prometheus_replica` for data written before deduplication was enabled and for series written without deduplication.
+- Configure both labels as replica labels in Query (`--query.replica-label=receive_replica --query.replica-label=prometheus_replica`): `receive_replica` for the copies of the replication factor, `prometheus_replica` for data written before deduplication was enabled and for series written without deduplication. Compactor's `--deduplication.replica-label` only applies to external labels of blocks, so set it to the external replica label of Receive (`receive_replica`) only. `prometheus_replica` is a series label in Receive blocks, so data written before deduplication was enabled is deduplicated by Query only.
+
+Timestamps in the future:
+
+- A sample that is ahead of the ingestor's clock counts as silence of the owner only up to the current time, so a replica whose clock runs ahead, or a writer sending made-up timestamps, can't take series over from a live owner. Such a replica still takes over the series of an owner that stopped, after the failover timeout.
+- Timestamps from the future are recorded at most `--receive.ha-dedup.max-failover-timeout` ahead of the ingestor's clock, and at most at the current time for a new owner, so they can't keep other replicas from taking over once the owner stops. The owner's own samples from the future are stored as they are without deduplication.
+- Still set `--tsdb.too-far-in-future.time-window` on ingestors, e.g. to `5m`: without it, samples from the future are stored and can make later samples of their series be rejected as out of order. Receive logs a warning on startup if the window is not set.
 
 Behaviour to be aware of:
 
 - When a replica stops, each of its series has a gap of between `failover-intervals` and `failover-intervals + 1` sample intervals, e.g. 22.5s to 37.5s for a 15s scrape interval. Prometheus doesn't write stale markers on shutdown, so a restart of a replica always fails over this way.
-- Owners are elected independently by every ingestor. After an ingestor restart, its copy of a series can be owned by another replica than the other copies until the next failover. With `--query.dedup-func=chain`, such series contain the samples of both replicas during that time.
+- A healthy owner whose remote write is delayed by more than the failover timeout relative to another replica, e.g. because its queue is backlogged or retrying, loses its series to that replica, with the same gap as a failover. Raise `--receive.ha-dedup.failover-intervals` for replicas whose remote write has lag spikes.
+- Owners are elected independently by every ingestor. After an ingestor restart, a tenant being re-opened, a hashring change or a scale-out, an ingestor's copy of a series can be owned by another replica than the other copies. This lasts until the next failover of the series, which can be a long time for stable replicas. With `--query.dedup-func=chain`, such series contain the samples of both replicas during that time.
+- After an ingestor restart, sample intervals are not learned yet, so `--receive.ha-dedup.default-failover-timeout` applies until the owner has written two samples of a series.
+- Series with long sample intervals, e.g. slow recording rules, don't deduplicate well: with intervals above twice `--receive.ha-dedup.max-failover-timeout`, replicas whose samples are offset in time can take turns on every sample, and with intervals above `--receive.ha-dedup.state-ttl`, the state of a series is removed between its samples, so every sample elects the owner again. Write such series without the replica label or raise these flags.
 - Both replicas' samples still reach the routers and ingestors: request-level limits and router resources see the traffic of all replicas, while head series and storage are deduplicated.
-- Every tracked series takes memory on ingestors, roughly 40-75 bytes per series.
+- Every tracked series takes about 70 bytes of memory on ingestors (67 bytes per series measured with 20 million series), plus headroom for the Go garbage collector. The memory is not returned when the number of tracked series shrinks, until the ingestor restarts.
 
-Enabling or disabling deduplication changes the identity of the affected series, as the replica label is removed or added again. Routers and ingestors can be switched in any order without losing data: until both are switched, the replicas' copies are stored separately and deduplicated by Query and Compactor as before.
+Enabling or disabling deduplication changes the identity of the affected series, as the replica label is removed or added again. Enabling it re-identifies the series of all tenants with HA writers at once: until the head is truncated, which takes 2-3 hours with the default block duration, both the old and the new series are in the head, so plan headroom for head series and series limits. Configure the replica labels in Query first, then switch routers and ingestors. They can be switched in any order without losing data: until both are switched, the replicas' copies are stored separately and deduplicated by Query as before. Disabling deduplication causes the same churn.
 
-The `thanos_receive_ha_dedup_*` metrics of ingestors show the share of dropped samples (`samples_total{outcome="dropped"}`, about half for a pair of replicas), failovers (`failovers_total`), tracked series and replicas, and series written without deduplication (`passthrough_total`).
+The `thanos_receive_ha_dedup_*` metrics of ingestors are per tenant. They show the share of dropped samples (`samples_total{outcome="dropped"}`, about half for a pair of replicas), owner changes (`elections_total`, `failovers_total`, `handovers_total`), states removed because their samples were not stored (`forgotten_total`) or by garbage collection (`gc_removed_total`, `gc_duration_seconds`), tracked series and replicas (`tracked_series`, `series_with_standby`, `replicas`), and series written without deduplication (`passthrough_total`). Ingestors log new replica label values, and warn at most once a minute per tenant if series are written without deduplication because the replica table is full or values are too long. Every router and ingestor with deduplication enabled exports `thanos_receive_ha_dedup_config_info{replica_label="..."}`, so that a component with a missing or different replica label can be found.
+
+Example alerts:
+
+```yaml
+# Fewer dropped samples than expected for a pair of replicas: a replica is missing or not deduplicated.
+- expr: sum by (tenant) (rate(thanos_receive_ha_dedup_samples_total{outcome="dropped"}[30m])) / sum by (tenant) (rate(thanos_receive_ha_dedup_samples_total[30m])) < 0.3
+  for: 30m
+# Series change their owner more than once per hour: replicas with lag spikes or long sample intervals.
+- expr: sum by (tenant) (increase(thanos_receive_ha_dedup_failovers_total[1h])) / sum by (tenant) (thanos_receive_ha_dedup_tracked_series) > 1
+# A writer of a deduplicated tenant doesn't set the replica label.
+- expr: sum by (tenant) (rate(thanos_receive_ha_dedup_passthrough_total{reason="no_label"}[10m])) > 0 and on (tenant) sum by (tenant) (rate(thanos_receive_ha_dedup_samples_total[10m])) > 0
+# The replica table is filling up, or series are written without deduplication because of it or of too long values.
+- expr: max by (tenant) (thanos_receive_ha_dedup_replicas) > 0.8 * 1024 or sum by (tenant) (rate(thanos_receive_ha_dedup_passthrough_total{reason=~"replica_table_full|replica_value_too_long"}[10m])) > 0
+```
 
 ## Asynchronous workers
 
@@ -780,10 +803,9 @@ Flags:
                                  Series of further replicas are written without
                                  deduplication.
       --receive.ha-dedup.state-ttl=0s
-                                 [EXPERIMENTAL] How long HA dedup state of
-                                 a series is kept once its newest sample
-                                 is older than the current time, and how
-                                 long unused replica label values are kept.
+                                 [EXPERIMENTAL] How long HA dedup state of a
+                                 series is kept after its newest sample, and
+                                 how long unused replica label values are kept.
                                  Must not be less than max-failover-timeout.
                                  0s means max-failover-timeout + 10m.
 

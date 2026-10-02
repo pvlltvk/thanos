@@ -1090,7 +1090,7 @@ func (t *MultiTSDB) startTSDB(logger log.Logger, tenantID string, tenant *tenant
 	}
 	var haDedup *hadedup.Tracker
 	if t.haDedupConfig != nil {
-		haDedup = hadedup.NewTracker(*t.haDedupConfig, reg)
+		haDedup = hadedup.NewTracker(tenant.logger, *t.haDedupConfig, reg)
 		tenant.startPeriodicHADedupGC(haDedup)
 	}
 	tenant.set(store.NewTSDBStore(logger, s, component.Receive, lset, options...), s, ship, exemplars.NewTSDB(s, lset), reg.(*UnRegisterer), haDedup)

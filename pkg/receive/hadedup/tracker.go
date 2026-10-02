@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -33,6 +35,10 @@ const (
 
 	// MaxReplicasLimit is the maximum allowed value of Config.MaxReplicas.
 	MaxReplicasLimit = noReplica
+	// MaxReplicaValueLength is the maximum length of a replica label value. Replica values are host or pod names,
+	// which are at most 63 bytes as DNS labels, so this leaves room for composite values while bounding the replica
+	// table to 8 MiB per tenant at MaxReplicasLimit. Series with longer values are written without deduplication.
+	MaxReplicaValueLength = 128
 )
 
 // Config configures a Tracker.
@@ -49,8 +55,8 @@ type Config struct {
 	DefaultFailoverTimeout time.Duration
 	// MaxReplicas caps the number of distinct replica label values tracked per tenant.
 	MaxReplicas int
-	// StateTTL is how long state is kept for series whose newest sample is older than the current time, and for
-	// replica values that are no longer used. Zero means MaxFailoverTimeout + 10m.
+	// StateTTL is how long the state of a series is kept after its newest sample, and how long replica values that
+	// are no longer used are kept. Zero means MaxFailoverTimeout + 10m.
 	StateTTL time.Duration
 }
 
@@ -62,8 +68,8 @@ func (c Config) Validate() error {
 	if strings.HasPrefix(c.ReplicaLabel, model.ReservedLabelPrefix) {
 		return errors.Errorf("replica label %s must not use the reserved prefix %s", c.ReplicaLabel, model.ReservedLabelPrefix)
 	}
-	if c.FailoverIntervals <= 1 {
-		return errors.Errorf("failover intervals must be greater than 1, got %v", c.FailoverIntervals)
+	if math.IsNaN(c.FailoverIntervals) || math.IsInf(c.FailoverIntervals, 0) || c.FailoverIntervals <= 1 {
+		return errors.Errorf("failover intervals must be a finite number greater than 1, got %v", c.FailoverIntervals)
 	}
 	if c.MinFailoverTimeout <= 0 || c.MaxFailoverTimeout <= 0 || c.DefaultFailoverTimeout <= 0 {
 		return errors.New("failover timeouts must be positive")
@@ -119,11 +125,17 @@ type metrics struct {
 	accepted           prometheus.Counter
 	dropped            prometheus.Counter
 	failovers          prometheus.Counter
+	elections          prometheus.Counter
+	handovers          prometheus.Counter
+	forgotten          prometheus.Counter
 	passthroughNoLabel prometheus.Counter
 	passthroughFull    prometheus.Counter
+	passthroughTooLong prometheus.Counter
 	trackedSeries      prometheus.Gauge
+	seriesWithStandby  prometheus.Gauge
 	replicas           prometheus.Gauge
 	gcRemoved          prometheus.Counter
+	gcDuration         prometheus.Gauge
 }
 
 func newMetrics(reg prometheus.Registerer) *metrics {
@@ -140,13 +152,30 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		dropped:            samplesTotal.WithLabelValues("dropped"),
 		passthroughNoLabel: passthroughTotal.WithLabelValues("no_label"),
 		passthroughFull:    passthroughTotal.WithLabelValues("replica_table_full"),
+		passthroughTooLong: passthroughTotal.WithLabelValues("replica_value_too_long"),
 		failovers: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "thanos_receive_ha_dedup_failovers_total",
 			Help: "Total number of series taken over by another HA replica after the owning replica stopped writing them.",
 		}),
+		elections: promauto.With(reg).NewCounter(prometheus.CounterOpts{
+			Name: "thanos_receive_ha_dedup_elections_total",
+			Help: "Total number of series whose owning HA replica was elected by their first tracked sample.",
+		}),
+		handovers: promauto.With(reg).NewCounter(prometheus.CounterOpts{
+			Name: "thanos_receive_ha_dedup_handovers_total",
+			Help: "Total number of series handed over to another HA replica after the owning replica wrote a stale marker.",
+		}),
+		forgotten: promauto.With(reg).NewCounter(prometheus.CounterOpts{
+			Name: "thanos_receive_ha_dedup_forgotten_total",
+			Help: "Total number of series states removed because the samples they were based on were not stored.",
+		}),
 		trackedSeries: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
 			Name: "thanos_receive_ha_dedup_tracked_series",
 			Help: "Number of series tracked by HA deduplication.",
+		}),
+		seriesWithStandby: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+			Name: "thanos_receive_ha_dedup_series_with_standby",
+			Help: "Number of tracked series with a standby HA replica, as of the last garbage collection.",
 		}),
 		replicas: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
 			Name: "thanos_receive_ha_dedup_replicas",
@@ -155,6 +184,10 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		gcRemoved: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "thanos_receive_ha_dedup_gc_removed_total",
 			Help: "Total number of series states removed by HA deduplication garbage collection.",
+		}),
+		gcDuration: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+			Name: "thanos_receive_ha_dedup_gc_duration_seconds",
+			Help: "Duration of the last HA deduplication garbage collection.",
 		}),
 	}
 }
@@ -168,6 +201,7 @@ type Tracker struct {
 	defaultTimeoutMs  int64
 	stateTTL          time.Duration
 	maxReplicas       int
+	logger            log.Logger
 
 	replicasMtx sync.RWMutex
 	replicaIdx  map[string]uint16
@@ -179,10 +213,15 @@ type Tracker struct {
 
 	now     func() time.Time
 	metrics *metrics
+
+	// replicaTableFull and replicaValueTooLong count the series written without deduplication for these reasons
+	// since the last GC, which logs them so that the warning is rate limited.
+	replicaTableFull    atomic.Int64
+	replicaValueTooLong atomic.Int64
 }
 
 // NewTracker returns a new Tracker. The config is expected to be valid.
-func NewTracker(cfg Config, reg prometheus.Registerer) *Tracker {
+func NewTracker(logger log.Logger, cfg Config, reg prometheus.Registerer) *Tracker {
 	stateTTL := cfg.StateTTL
 	if stateTTL == 0 {
 		stateTTL = cfg.MaxFailoverTimeout + 10*time.Minute
@@ -195,6 +234,7 @@ func NewTracker(cfg Config, reg prometheus.Registerer) *Tracker {
 		defaultTimeoutMs:  cfg.DefaultFailoverTimeout.Milliseconds(),
 		stateTTL:          stateTTL,
 		maxReplicas:       cfg.MaxReplicas,
+		logger:            logger,
 		replicaIdx:        map[string]uint16{},
 		now:               time.Now,
 		metrics:           newMetrics(reg),
@@ -206,29 +246,39 @@ func (t *Tracker) ReplicaLabel() string {
 	return t.replicaLabel
 }
 
-// Replica returns the interned index of the given replica label value. It returns false if the replica table is full,
-// in which case the series must be written without deduplication. A returned index stays valid for at least the
-// state TTL, as the lookup keeps GC from freeing it for that long.
-func (t *Tracker) Replica(value string) (uint16, bool) {
+// LookupReplica returns the interned index of the given replica label value. If the value is not interned, full
+// reports whether the replica table has no room for it. A returned index stays valid for at least the state TTL, as
+// the lookup keeps GC from freeing it for that long.
+func (t *Tracker) LookupReplica(value string) (r uint16, ok, full bool) {
 	t.replicasMtx.RLock()
-	r, ok := t.replicaIdx[value]
-	if ok {
-		if rep := t.replicas[r]; !rep.seen.Load() {
-			rep.seen.Store(true)
-		}
+	defer t.replicasMtx.RUnlock()
+	r, ok = t.replicaIdx[value]
+	if !ok {
+		return 0, false, len(t.replicaIdx) >= t.maxReplicas
 	}
-	t.replicasMtx.RUnlock()
-	if ok {
-		return r, true
+	if rep := t.replicas[r]; !rep.seen.Load() {
+		rep.seen.Store(true)
+	}
+	return r, true, false
+}
+
+// Replica returns the interned index of the given replica label value, interning it if needed. It returns false if
+// the replica table is full, in which case the series must be written without deduplication. Values must be interned
+// only for samples that take part in a decision, so that series without valid samples can't fill the table.
+func (t *Tracker) Replica(value string) (uint16, bool) {
+	if r, ok, full := t.LookupReplica(value); ok || full {
+		return r, ok
 	}
 
 	t.replicasMtx.Lock()
-	defer t.replicasMtx.Unlock()
-	if r, ok = t.replicaIdx[value]; ok {
+	r, ok := t.replicaIdx[value]
+	if ok {
 		t.replicas[r].seen.Store(true)
+		t.replicasMtx.Unlock()
 		return r, true
 	}
 	if len(t.replicaIdx) >= t.maxReplicas {
+		t.replicasMtx.Unlock()
 		return 0, false
 	}
 
@@ -244,7 +294,11 @@ func (t *Tracker) Replica(value string) (uint16, bool) {
 		t.replicas = append(t.replicas, rep)
 	}
 	t.replicaIdx[rep.value] = r
-	t.metrics.replicas.Set(float64(len(t.replicaIdx)))
+	n := len(t.replicaIdx)
+	t.metrics.replicas.Set(float64(n))
+	t.replicasMtx.Unlock()
+
+	level.Info(t.logger).Log("msg", "tracking new HA replica", "replica", rep.value, "replicas", n)
 	return r, true
 }
 
@@ -253,11 +307,16 @@ type Counts struct {
 	// Accepted and Dropped count the samples of deduplicated series.
 	Accepted int
 	Dropped  int
-	// Failovers counts the series taken over by another replica after the owner timed out.
+	// Elections, Failovers and Handovers count the series whose owner was elected or changed, see Change.
+	Elections int
 	Failovers int
-	// NoLabel and ReplicaTableFull count the series written without deduplication, by reason.
-	NoLabel          int
-	ReplicaTableFull int
+	Handovers int
+	// Forgotten counts the series removed by Forget.
+	Forgotten int
+	// NoLabel, ReplicaTableFull and ReplicaValueTooLong count the series written without deduplication, by reason.
+	NoLabel             int
+	ReplicaTableFull    int
+	ReplicaValueTooLong int
 }
 
 // Record adds the outcomes of a write request to the metrics. Writers count decisions per request instead of the
@@ -266,8 +325,18 @@ func (t *Tracker) Record(c Counts) {
 	addCount(t.metrics.accepted, c.Accepted)
 	addCount(t.metrics.dropped, c.Dropped)
 	addCount(t.metrics.failovers, c.Failovers)
+	addCount(t.metrics.elections, c.Elections)
+	addCount(t.metrics.handovers, c.Handovers)
+	addCount(t.metrics.forgotten, c.Forgotten)
 	addCount(t.metrics.passthroughNoLabel, c.NoLabel)
 	addCount(t.metrics.passthroughFull, c.ReplicaTableFull)
+	addCount(t.metrics.passthroughTooLong, c.ReplicaValueTooLong)
+	if c.ReplicaTableFull > 0 {
+		t.replicaTableFull.Add(int64(c.ReplicaTableFull))
+	}
+	if c.ReplicaValueTooLong > 0 {
+		t.replicaValueTooLong.Add(int64(c.ReplicaValueTooLong))
+	}
 }
 
 func addCount(c prometheus.Counter, n int) {
@@ -276,16 +345,42 @@ func addCount(c prometheus.Counter, n int) {
 	}
 }
 
+// Change is the change of a series' owner by a decision.
+type Change uint8
+
+const (
+	// NoChange means that the owner was kept.
+	NoChange Change = iota
+	// Elected means that the series state was created with the sample's replica as owner.
+	Elected
+	// Failover means that the sample's replica took the series over from an owner that timed out.
+	Failover
+	// Handover means that the owner's stale marker handed the series over to the standby replica.
+	Handover
+)
+
+// Horizon bounds the sample timestamps that ownership decisions take into account. Writers take it once per request,
+// so that deciding on samples doesn't read the clock.
+type Horizon struct {
+	now int64
+	max int64
+}
+
+// Horizon returns the horizon of decisions taken now. Timestamps of an owner's samples are recorded up to the max
+// failover timeout ahead of the current time, for clock skew between the replicas and Receive.
+func (t *Tracker) Horizon() Horizon {
+	now := t.now().UnixMilli()
+	return Horizon{now: now, max: now + t.maxTimeoutMs}
+}
+
 // Accept decides whether the sample at ts written by replica to the series with the given head reference
-// should be appended, and updates the series state accordingly. failover reports whether replica took the series
-// over from an owner that timed out. ownerChanged reports whether the series state was created or its owner
-// replaced, also for a dropped sample: the caller must Forget the series if the samples the decision is based on
-// are not stored.
-func (t *Tracker) Accept(ref storage.SeriesRef, replica uint16, ts int64, stale bool) (accept, failover, ownerChanged bool) {
+// should be appended, and updates the series state accordingly. A change of the owner is also reported for a
+// dropped sample: the caller must Forget the series if the samples the decision is based on are not stored.
+func (t *Tracker) Accept(ref storage.SeriesRef, replica uint16, ts int64, h Horizon, stale bool) (accept bool, change Change) {
 	s := &t.stripes[uint64(ref)%numStripes]
 	s.mtx.Lock()
 	st, exists := s.series[ref]
-	accept, failover, handover := t.decide(&st, exists, replica, ts, stale)
+	accept, change = t.decide(&st, exists, replica, ts, h, stale)
 	if s.series == nil {
 		s.series = map[storage.SeriesRef]seriesState{}
 	}
@@ -295,11 +390,12 @@ func (t *Tracker) Accept(ref storage.SeriesRef, replica uint16, ts int64, stale 
 	if !exists {
 		t.metrics.trackedSeries.Inc()
 	}
-	return accept, failover, !exists || failover || handover
+	return accept, change
 }
 
-// Forget removes the state of a series, so that its next sample elects the owner again.
-func (t *Tracker) Forget(ref storage.SeriesRef) {
+// Forget removes the state of a series, so that its next sample elects the owner again. It returns true if the
+// series was tracked.
+func (t *Tracker) Forget(ref storage.SeriesRef) bool {
 	s := &t.stripes[uint64(ref)%numStripes]
 	s.mtx.Lock()
 	_, exists := s.series[ref]
@@ -309,12 +405,13 @@ func (t *Tracker) Forget(ref storage.SeriesRef) {
 	if exists {
 		t.metrics.trackedSeries.Dec()
 	}
+	return exists
 }
 
 // Init records replica as the owner of a series created by appending its sample at ts, unless another
 // writer created state for the series in the meantime. In that case both replicas' first samples may have
 // been appended. It returns true if it created the state.
-func (t *Tracker) Init(ref storage.SeriesRef, replica uint16, ts int64) bool {
+func (t *Tracker) Init(ref storage.SeriesRef, replica uint16, ts int64, h Horizon) bool {
 	s := &t.stripes[uint64(ref)%numStripes]
 	s.mtx.Lock()
 	_, exists := s.series[ref]
@@ -322,7 +419,7 @@ func (t *Tracker) Init(ref storage.SeriesRef, replica uint16, ts int64) bool {
 		if s.series == nil {
 			s.series = map[storage.SeriesRef]seriesState{}
 		}
-		s.series[ref] = seriesState{owner: replica, ownerLastTs: ts, cand: noReplica, candLastTs: noTs}
+		s.series[ref] = newOwnerState(replica, ts, 0, h)
 	}
 	s.mtx.Unlock()
 
@@ -341,22 +438,25 @@ func (t *Tracker) IsOwner(ref storage.SeriesRef, replica uint16) bool {
 	return !exists || st.owner == replica
 }
 
-// decide implements the per-sample state machine. All times are sample timestamps, never wall clock: this makes
-// decisions independent of remote-write delivery lag, so a lagging owner loses ownership to the most current replica.
-func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, stale bool) (accept, failover, handover bool) {
+// decide implements the per-sample state machine. Decisions compare sample timestamps rather than arrival times, so
+// lag that all replicas share doesn't cause failovers, while an owner lagging behind another replica by more than the
+// failover timeout loses its series. Timestamps are only trusted up to the horizon: no stored timestamp is beyond
+// h.max, and the part of a timestamp beyond the current time isn't taken as evidence that the owner went silent, so
+// that samples from the future can't take series over from a live owner.
+func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, h Horizon, stale bool) (accept bool, change Change) {
 	if !exists {
-		*s = seriesState{owner: r, ownerLastTs: ts, cand: noReplica, candLastTs: noTs}
-		return true, false, false
+		*s = newOwnerState(r, ts, 0, h)
+		return true, Elected
 	}
 
 	if r == s.owner {
 		if s.intervalMs&handoverFlag != 0 {
 			if ts <= s.ownerLastTs {
-				return false, false, false
+				return false, NoChange
 			}
 			// The distance to the floor is the phase offset between the replicas, not an interval of the new owner.
 			s.intervalMs &^= handoverFlag
-			s.ownerLastTs = ts
+			s.ownerLastTs = min(ts, h.max)
 		}
 		if stale && s.cand != noReplica && !later(ts, s.candLastTs, t.timeout(s.interval())) {
 			// The series vanished only on the owner while another replica still produces it: hand the series
@@ -367,18 +467,23 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, stale 
 			s.owner, s.ownerLastTs = s.cand, max(s.ownerLastTs, s.candLastTs)
 			s.cand, s.candLastTs = noReplica, noTs
 			s.intervalMs |= handoverFlag
-			return false, false, true
+			return false, Handover
 		}
-		if ts > s.ownerLastTs {
+		switch {
+		case ts > h.max:
+			// The owner's own data is appended as without deduplication, but recording its timestamp would keep
+			// other replicas from taking over until then. The delta to it isn't an interval either.
+			s.ownerLastTs = max(s.ownerLastTs, h.max)
+		case ts > s.ownerLastTs:
 			s.intervalMs = learnInterval(s.intervalMs, ts-s.ownerLastTs)
 			s.ownerLastTs = ts
 		}
-		return true, false, false
+		return true, NoChange
 	}
 
-	if later(ts, s.ownerLastTs, t.timeout(s.interval())) {
-		*s = seriesState{owner: r, ownerLastTs: ts, intervalMs: s.interval(), cand: noReplica, candLastTs: noTs}
-		return true, true, false
+	if later(min(ts, h.now), s.ownerLastTs, t.timeout(s.interval())) {
+		*s = newOwnerState(r, ts, s.interval(), h)
+		return true, Failover
 	}
 
 	if stale {
@@ -386,14 +491,21 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, stale 
 		if s.cand == r {
 			s.cand, s.candLastTs = noReplica, noTs
 		}
-		return false, false, false
+		return false, NoChange
 	}
 	// Replacing cand by arrival order would let a lagging replica evict a live one, and the owner's stale marker
 	// would then be accepted instead of handing the series over.
-	if ts > s.candLastTs {
+	if ts := min(ts, h.max); ts > s.candLastTs {
 		s.cand, s.candLastTs = r, ts
 	}
-	return false, false, false
+	return false, NoChange
+}
+
+// newOwnerState returns the state of a series whose owner became r with its sample at ts. A new owner's timestamp is
+// recorded at most at the current time, so that a single sample from the future can't hold the series beyond the
+// failover timeout. A live owner whose clock is ahead moves it forward with its next sample.
+func newOwnerState(r uint16, ts int64, intervalMs uint32, h Horizon) seriesState {
+	return seriesState{owner: r, ownerLastTs: min(ts, h.now), intervalMs: intervalMs, cand: noReplica, candLastTs: noTs}
 }
 
 // later reports whether ts is more than d after last. Written without last+d, which overflows for timestamps near
@@ -406,7 +518,8 @@ func (t *Tracker) timeout(intervalMs uint32) int64 {
 	if intervalMs == 0 {
 		return t.defaultTimeoutMs
 	}
-	return min(max(int64(t.failoverIntervals*float64(intervalMs)), t.minTimeoutMs), t.maxTimeoutMs)
+	// Clamped before the conversion, which is undefined for values beyond the int64 range.
+	return int64(min(max(t.failoverIntervals*float64(intervalMs), float64(t.minTimeoutMs)), float64(t.maxTimeoutMs)))
 }
 
 // learnInterval tracks the smallest recent delta between consecutive owner samples: smaller deltas are adopted
@@ -426,22 +539,26 @@ func learnInterval(cur uint32, delta int64) uint32 {
 
 // GC removes the state of series whose newest sample is older than the state TTL, and frees replica values that
 // were not used for longer than the state TTL and are not referenced by any series. Unlike failover decisions, GC is
-// based on the current time, so that samples with timestamps in the future can't keep other state from being removed.
-// It returns the number of removed series.
+// based on the current time. It also removes state with timestamps further in the future than any decision can
+// store, which is left over from before a backward step of the clock. It returns the number of removed series.
 func (t *Tracker) GC() int {
+	start := time.Now()
+	defer func() { t.metrics.gcDuration.Set(time.Since(start).Seconds()) }()
+
 	now := t.now()
 	cutoff := now.Add(-t.stateTTL).UnixMilli()
+	futureCutoff := now.Add(t.stateTTL).UnixMilli() + t.maxTimeoutMs
 
 	t.replicasMtx.RLock()
 	referenced := make([]bool, len(t.replicas))
 	t.replicasMtx.RUnlock()
 
-	var removed int
+	var removed, withStandby int
 	for i := range t.stripes {
 		s := &t.stripes[i]
 		s.mtx.Lock()
 		for ref, st := range s.series {
-			if max(st.ownerLastTs, st.candLastTs) < cutoff {
+			if newest := max(st.ownerLastTs, st.candLastTs); newest < cutoff || newest > futureCutoff {
 				delete(s.series, ref)
 				removed++
 				continue
@@ -449,6 +566,7 @@ func (t *Tracker) GC() int {
 			markReferenced(referenced, st.owner)
 			if st.cand != noReplica {
 				markReferenced(referenced, st.cand)
+				withStandby++
 			}
 		}
 		s.mtx.Unlock()
@@ -456,6 +574,8 @@ func (t *Tracker) GC() int {
 
 	t.metrics.trackedSeries.Sub(float64(removed))
 	t.metrics.gcRemoved.Add(float64(removed))
+	t.metrics.seriesWithStandby.Set(float64(withStandby))
+	t.logPassthrough()
 
 	t.replicasMtx.Lock()
 	defer t.replicasMtx.Unlock()
@@ -477,6 +597,15 @@ func (t *Tracker) GC() int {
 	}
 	t.metrics.replicas.Set(float64(len(t.replicaIdx)))
 	return removed
+}
+
+func (t *Tracker) logPassthrough() {
+	if n := t.replicaTableFull.Swap(0); n > 0 {
+		level.Warn(t.logger).Log("msg", "HA replica table is full, series of further replicas are written without deduplication", "series", n, "maxReplicas", t.maxReplicas)
+	}
+	if n := t.replicaValueTooLong.Swap(0); n > 0 {
+		level.Warn(t.logger).Log("msg", "HA replica label values are too long, their series are written without deduplication", "series", n, "maxLength", MaxReplicaValueLength)
+	}
 }
 
 func markReferenced(referenced []bool, r uint16) {

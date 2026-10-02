@@ -12,6 +12,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/prometheus/storage"
@@ -30,7 +31,12 @@ func testConfig() Config {
 	}
 }
 
+// testNow is the current time of tests, in milliseconds. Test samples are older unless they test the horizon.
+const testNow = int64(1_700_000_000_000)
+
 type step struct {
+	// now advances the clock to the given time if set.
+	now          int64
 	replica      string
 	ts           int64
 	stale        bool
@@ -312,6 +318,105 @@ func TestTrackerAccept(t *testing.T) {
 			expectedFailovers: 1,
 		},
 		{
+			name: "sample from the future does not take the series over",
+			steps: []step{
+				{replica: a, ts: testNow - 15000, accept: true, ownerChanged: true},
+				{replica: a, ts: testNow, accept: true},
+				{replica: b, ts: testNow + time.Hour.Milliseconds(), accept: false},
+				// Within the horizon, but only the time up to now counts as silence of the owner.
+				{replica: b, ts: testNow + 4*time.Minute.Milliseconds(), accept: false},
+				{replica: a, ts: testNow + 15000, accept: true},
+			},
+			expectedOwner: a,
+		},
+		{
+			name: "sample from the future takes over once the owner is silent until now",
+			steps: []step{
+				{replica: a, ts: testNow - 15000, accept: true, ownerChanged: true},
+				{replica: a, ts: testNow, accept: true},
+				{now: testNow + 22500, replica: b, ts: testNow + 4*time.Minute.Milliseconds(), accept: false},
+				{now: testNow + 22501, replica: b, ts: testNow + 4*time.Minute.Milliseconds() + 15000, accept: true, ownerChanged: true},
+				{replica: a, ts: testNow + 30000, accept: false},
+			},
+			expectedOwner:     b,
+			expectedFailovers: 1,
+		},
+		{
+			name: "owner sample from the future does not block a later failover",
+			steps: []step{
+				{replica: a, ts: testNow - 15000, accept: true, ownerChanged: true},
+				{replica: a, ts: testNow, accept: true},
+				// Appended as the owner's own data, but recorded at the horizon, 5m from now.
+				{replica: a, ts: testNow + time.Hour.Milliseconds(), accept: true},
+				{now: testNow + 5*time.Minute.Milliseconds() + 22500, replica: b, ts: testNow + 5*time.Minute.Milliseconds() + 22500, accept: false},
+				// The learned interval is still 15s.
+				{now: testNow + 5*time.Minute.Milliseconds() + 22501, replica: b, ts: testNow + 5*time.Minute.Milliseconds() + 22501, accept: true, ownerChanged: true},
+			},
+			expectedOwner:     b,
+			expectedFailovers: 1,
+		},
+		{
+			name: "sample from beyond the horizon takes over once the owner is silent until now",
+			steps: []step{
+				{replica: a, ts: testNow - 15000, accept: true, ownerChanged: true},
+				{replica: a, ts: testNow, accept: true},
+				// The owner stopped and the other replica's clock is an hour ahead.
+				{now: testNow + 22500, replica: b, ts: testNow + time.Hour.Milliseconds(), accept: false},
+				{now: testNow + 22501, replica: b, ts: testNow + time.Hour.Milliseconds() + 15000, accept: true, ownerChanged: true},
+				// Recorded at the time of the failover, so the old owner takes over again once b stops too.
+				{now: testNow + 22501 + 22500, replica: a, ts: testNow + 22501 + 22500, accept: false},
+				{now: testNow + 22501 + 22501, replica: a, ts: testNow + 22501 + 22501, accept: true, ownerChanged: true},
+			},
+			expectedOwner:     a,
+			expectedFailovers: 2,
+		},
+		{
+			name: "sample from beyond the horizon becomes standby at the horizon",
+			steps: []step{
+				{replica: a, ts: testNow - 15000, accept: true, ownerChanged: true},
+				{replica: a, ts: testNow, accept: true},
+				{replica: b, ts: testNow + time.Hour.Milliseconds(), accept: false},
+				{replica: a, ts: testNow + 15000, stale: true, accept: false, ownerChanged: true},
+				// The handover floor is the horizon.
+				{replica: b, ts: testNow + 5*time.Minute.Milliseconds(), accept: false},
+				{replica: b, ts: testNow + 5*time.Minute.Milliseconds() + 1, accept: true},
+			},
+			expectedOwner: b,
+		},
+		{
+			name: "sample at the horizon becomes standby",
+			steps: []step{
+				{replica: a, ts: testNow - 15000, accept: true, ownerChanged: true},
+				{replica: a, ts: testNow, accept: true},
+				{replica: b, ts: testNow + 5*time.Minute.Milliseconds(), accept: false},
+				{replica: a, ts: testNow + 15000, stale: true, accept: false, ownerChanged: true},
+			},
+			expectedOwner: b,
+		},
+		{
+			name: "election by a sample from the future is recorded at the current time",
+			steps: []step{
+				{replica: a, ts: testNow + time.Hour.Milliseconds(), accept: true, ownerChanged: true},
+				// No interval is learned yet, so the default timeout of 1m applies.
+				{now: testNow + 60000, replica: b, ts: testNow + 60000, accept: false},
+				{now: testNow + 60001, replica: b, ts: testNow + 60001, accept: true, ownerChanged: true},
+			},
+			expectedOwner:     b,
+			expectedFailovers: 1,
+		},
+		{
+			name: "owner elected with a clock ahead keeps its series",
+			steps: []step{
+				{replica: a, ts: testNow + 2000, accept: true, ownerChanged: true},
+				{now: testNow + 15000, replica: a, ts: testNow + 17000, accept: true},
+				{now: testNow + 30000, replica: a, ts: testNow + 32000, accept: true},
+				{replica: b, ts: testNow + 30000, accept: false},
+				{now: testNow + 45000, replica: a, ts: testNow + 47000, accept: true},
+				{replica: b, ts: testNow + 45000, accept: false},
+			},
+			expectedOwner: a,
+		},
+		{
 			name: "three replicas",
 			steps: []step{
 				{replica: a, ts: 0, accept: true, ownerChanged: true},
@@ -341,16 +446,19 @@ func TestTrackerAccept(t *testing.T) {
 		t.Run(tcase.name, func(t *testing.T) {
 			t.Parallel()
 
-			tr := NewTracker(testConfig(), prometheus.NewRegistry())
+			now := time.UnixMilli(testNow)
+			tr := newTestTracker(testConfig(), &now)
 			var failovers int
 			for i, s := range tcase.steps {
+				if s.now != 0 {
+					now = time.UnixMilli(s.now)
+				}
 				r, ok := tr.Replica(s.replica)
 				require.True(t, ok)
-				accept, failover, ownerChanged := tr.Accept(1, r, s.ts, s.stale)
+				accept, change := tr.Accept(1, r, s.ts, tr.Horizon(), s.stale)
 				require.Equal(t, s.accept, accept, "step %d: %+v", i, s)
-				require.Equal(t, s.ownerChanged, ownerChanged, "step %d: %+v", i, s)
-				if failover {
-					require.True(t, ownerChanged, "step %d: %+v", i, s)
+				require.Equal(t, s.ownerChanged, change != NoChange, "step %d: %+v", i, s)
+				if change == Failover {
 					failovers++
 				}
 			}
@@ -384,31 +492,102 @@ func TestLater(t *testing.T) {
 }
 
 func acceptOnly(tr *Tracker, ref storage.SeriesRef, replica uint16, ts int64) bool {
-	accept, _, _ := tr.Accept(ref, replica, ts, false)
+	accept, _ := tr.Accept(ref, replica, ts, tr.Horizon(), false)
 	return accept
 }
 
 func TestTrackerInit(t *testing.T) {
 	t.Parallel()
 
-	tr := NewTracker(testConfig(), prometheus.NewRegistry())
+	tr := NewTracker(log.NewNopLogger(), testConfig(), prometheus.NewRegistry())
 	a, _ := tr.Replica("a")
 	b, _ := tr.Replica("b")
 
-	require.True(t, tr.Init(1, a, 0))
+	require.True(t, tr.Init(1, a, 0, tr.Horizon()))
 	// A concurrent writer of the other replica created the series too, the first owner is kept.
-	require.False(t, tr.Init(1, b, 1000))
+	require.False(t, tr.Init(1, b, 1000, tr.Horizon()))
 	require.True(t, tr.IsOwner(1, a))
 	require.False(t, tr.IsOwner(1, b))
 	require.False(t, acceptOnly(tr, 1, b, 2000))
 	require.True(t, acceptOnly(tr, 1, a, 15000))
 	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.trackedSeries))
+
+	// The first sample of a new owner is recorded at most at the current time.
+	h := tr.Horizon()
+	require.True(t, tr.Init(2, b, h.max+1, h))
+	require.Equal(t, h.now, trackedState(tr, 2).ownerLastTs)
+	require.True(t, tr.Init(3, b, h.now-1, h))
+	require.Equal(t, h.now-1, trackedState(tr, 3).ownerLastTs)
+	require.Equal(t, 3.0, promtest.ToFloat64(tr.metrics.trackedSeries))
+}
+
+func trackedState(tr *Tracker, ref storage.SeriesRef) seriesState {
+	s := &tr.stripes[uint64(ref)%numStripes]
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	return s.series[ref]
+}
+
+func TestTrackerHorizon(t *testing.T) {
+	t.Parallel()
+
+	now := time.UnixMilli(testNow)
+	tr := newTestTracker(testConfig(), &now)
+	a, _ := tr.Replica("a")
+	b, _ := tr.Replica("b")
+	h := tr.Horizon()
+	require.Equal(t, Horizon{now: testNow, max: testNow + (5 * time.Minute).Milliseconds()}, h)
+
+	require.True(t, acceptOnly(tr, 1, a, h.now))
+	require.True(t, acceptOnly(tr, 1, a, h.max-15000))
+	require.True(t, acceptOnly(tr, 1, a, h.max))
+	st := trackedState(tr, 1)
+	require.Equal(t, h.max, st.ownerLastTs)
+	require.Equal(t, uint32(15000), st.interval())
+
+	// The owner's samples beyond the horizon are accepted, but neither advance its last sample nor the interval.
+	require.True(t, acceptOnly(tr, 1, a, h.max+1))
+	require.True(t, acceptOnly(tr, 1, a, h.max+time.Hour.Milliseconds()))
+	require.Equal(t, st, trackedState(tr, 1))
+
+	now = now.Add(time.Minute)
+	require.True(t, acceptOnly(tr, 1, a, h.max+time.Hour.Milliseconds()))
+	st.ownerLastTs = tr.Horizon().max
+	require.Equal(t, st, trackedState(tr, 1))
+
+	// The handover floor is bounded by the horizon too.
+	require.True(t, acceptOnly(tr, 2, a, testNow))
+	require.False(t, acceptOnly(tr, 2, b, testNow+5000))
+	accept, change := tr.Accept(2, a, testNow+15000, tr.Horizon(), true)
+	require.False(t, accept)
+	require.Equal(t, Handover, change)
+	require.True(t, acceptOnly(tr, 2, b, tr.Horizon().max+1))
+	st = trackedState(tr, 2)
+	require.Equal(t, tr.Horizon().max, st.ownerLastTs)
+	require.Zero(t, st.intervalMs&handoverFlag)
+
+	// Standby samples are recorded up to the horizon.
+	require.False(t, acceptOnly(tr, 1, b, h.max+time.Hour.Milliseconds()))
+	st = trackedState(tr, 1)
+	require.Equal(t, b, st.cand)
+	require.Equal(t, tr.Horizon().max, st.candLastTs)
+}
+
+func TestTrackerTimeout(t *testing.T) {
+	t.Parallel()
+
+	cfg := testConfig()
+	cfg.FailoverIntervals = math.MaxFloat64
+	tr := NewTracker(log.NewNopLogger(), cfg, prometheus.NewRegistry())
+	require.Equal(t, cfg.MaxFailoverTimeout.Milliseconds(), tr.timeout(15000))
+	require.Equal(t, cfg.MaxFailoverTimeout.Milliseconds(), tr.timeout(maxIntervalMs))
+	require.Equal(t, cfg.DefaultFailoverTimeout.Milliseconds(), tr.timeout(0))
 }
 
 func TestTrackerForget(t *testing.T) {
 	t.Parallel()
 
-	tr := NewTracker(testConfig(), prometheus.NewRegistry())
+	tr := NewTracker(log.NewNopLogger(), testConfig(), prometheus.NewRegistry())
 	a, _ := tr.Replica("a")
 	b, _ := tr.Replica("b")
 	require.True(t, acceptOnly(tr, 1, a, 0))
@@ -416,20 +595,20 @@ func TestTrackerForget(t *testing.T) {
 	require.True(t, acceptOnly(tr, 2, a, 0))
 	require.False(t, acceptOnly(tr, 1, b, 20000))
 
-	tr.Forget(1)
+	require.True(t, tr.Forget(1))
 	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.trackedSeries))
 	require.True(t, tr.IsOwner(1, b), "forgotten series has no owner to protect")
 	require.True(t, tr.IsOwner(2, a))
 	require.False(t, tr.IsOwner(2, b))
 
-	tr.Forget(1)
-	tr.Forget(3)
+	require.False(t, tr.Forget(1))
+	require.False(t, tr.Forget(3))
 	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.trackedSeries))
 
 	// The next sample elects its replica, also one older than the forgotten owner's samples.
-	accepted, _, ownerChanged := tr.Accept(1, b, 10000, false)
+	accepted, change := tr.Accept(1, b, 10000, tr.Horizon(), false)
 	require.True(t, accepted)
-	require.True(t, ownerChanged)
+	require.Equal(t, Elected, change)
 	require.True(t, tr.IsOwner(1, b))
 	require.False(t, acceptOnly(tr, 1, a, 30000))
 	require.Equal(t, 2.0, promtest.ToFloat64(tr.metrics.trackedSeries))
@@ -444,7 +623,7 @@ func TestSeriesStateSize(t *testing.T) {
 func TestTrackerSeriesAreIndependent(t *testing.T) {
 	t.Parallel()
 
-	tr := NewTracker(testConfig(), prometheus.NewRegistry())
+	tr := NewTracker(log.NewNopLogger(), testConfig(), prometheus.NewRegistry())
 	a, _ := tr.Replica("a")
 	b, _ := tr.Replica("b")
 
@@ -462,7 +641,7 @@ func TestTrackerReplicaTableOverflow(t *testing.T) {
 
 	cfg := testConfig()
 	cfg.MaxReplicas = 2
-	tr := NewTracker(cfg, prometheus.NewRegistry())
+	tr := NewTracker(log.NewNopLogger(), cfg, prometheus.NewRegistry())
 
 	a, ok := tr.Replica("a")
 	require.True(t, ok)
@@ -472,15 +651,105 @@ func TestTrackerReplicaTableOverflow(t *testing.T) {
 
 	_, ok = tr.Replica("c")
 	require.False(t, ok)
+	_, ok, full := tr.LookupReplica("c")
+	require.False(t, ok)
+	require.True(t, full)
 
 	again, ok := tr.Replica("a")
 	require.True(t, ok)
 	require.Equal(t, a, again)
+	again, ok, full = tr.LookupReplica("b")
+	require.True(t, ok)
+	require.False(t, full)
+	require.Equal(t, b, again)
 	require.Equal(t, 2.0, promtest.ToFloat64(tr.metrics.replicas))
 }
 
+func TestTrackerLookupReplica(t *testing.T) {
+	t.Parallel()
+
+	tr := NewTracker(log.NewNopLogger(), testConfig(), prometheus.NewRegistry())
+	_, ok, full := tr.LookupReplica("a")
+	require.False(t, ok)
+	require.False(t, full)
+	require.Zero(t, promtest.ToFloat64(tr.metrics.replicas), "lookups must not intern")
+
+	a, ok := tr.Replica("a")
+	require.True(t, ok)
+	r, ok, _ := tr.LookupReplica("a")
+	require.True(t, ok)
+	require.Equal(t, a, r)
+}
+
+func TestTrackerFullReplicaTableLookupsShareTheLock(t *testing.T) {
+	t.Parallel()
+
+	cfg := testConfig()
+	cfg.MaxReplicas = 1
+	tr := NewTracker(log.NewNopLogger(), cfg, prometheus.NewRegistry())
+	_, ok := tr.Replica("a")
+	require.True(t, ok)
+
+	// Lookups of unknown values in a full table must not wait for the exclusive lock, so that a flood of junk values
+	// doesn't serialize the writers of a tenant.
+	tr.replicasMtx.RLock()
+	defer tr.replicasMtx.RUnlock()
+	done := make(chan bool)
+	go func() {
+		_, ok := tr.Replica("b")
+		done <- ok
+	}()
+	select {
+	case ok := <-done:
+		require.False(t, ok)
+	case <-time.After(10 * time.Second):
+		t.Fatal("lookup of an unknown value in a full replica table took the exclusive lock")
+	}
+}
+
+func TestTrackerLogs(t *testing.T) {
+	t.Parallel()
+
+	var buf syncBuffer
+	tr := NewTracker(log.NewLogfmtLogger(&buf), testConfig(), prometheus.NewRegistry())
+	_, ok := tr.Replica("prometheus-0")
+	require.True(t, ok)
+	_, ok = tr.Replica("prometheus-0")
+	require.True(t, ok)
+	require.Equal(t, "level=info msg=\"tracking new HA replica\" replica=prometheus-0 replicas=1\n", buf.reset())
+
+	tr.Record(Counts{ReplicaTableFull: 2})
+	tr.Record(Counts{ReplicaTableFull: 1, ReplicaValueTooLong: 4})
+	tr.GC()
+	require.Equal(t, "level=warn msg=\"HA replica table is full, series of further replicas are written without deduplication\" series=3 maxReplicas=1024\n"+
+		"level=warn msg=\"HA replica label values are too long, their series are written without deduplication\" series=4 maxLength=128\n", buf.reset())
+
+	// The warnings are logged at most once per GC.
+	tr.GC()
+	require.Empty(t, buf.reset())
+}
+
+type syncBuffer struct {
+	mtx sync.Mutex
+	buf strings.Builder
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mtx.Lock()
+	defer b.mtx.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) reset() string {
+	b.mtx.Lock()
+	defer b.mtx.Unlock()
+	s := b.buf.String()
+	b.buf.Reset()
+	return s
+}
+
 func newTestTracker(cfg Config, now *time.Time) *Tracker {
-	tr := NewTracker(cfg, prometheus.NewRegistry())
+	tr := NewTracker(log.NewNopLogger(), cfg, prometheus.NewRegistry())
 	tr.now = func() time.Time { return *now }
 	return tr
 }
@@ -508,6 +777,8 @@ func TestTrackerGC(t *testing.T) {
 	require.Equal(t, 1, tr.GC())
 	require.Equal(t, 2.0, promtest.ToFloat64(tr.metrics.trackedSeries))
 	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.gcRemoved))
+	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.seriesWithStandby))
+	require.Positive(t, promtest.ToFloat64(tr.metrics.gcDuration))
 
 	// Removed state is re-created by the next sample of any replica.
 	require.True(t, acceptOnly(tr, 1, b, ts))
@@ -517,24 +788,42 @@ func TestTrackerGC(t *testing.T) {
 	now = now.Add(time.Minute + time.Millisecond)
 	require.Equal(t, 1, tr.GC())
 	require.Equal(t, 2.0, promtest.ToFloat64(tr.metrics.trackedSeries))
+	require.Zero(t, promtest.ToFloat64(tr.metrics.seriesWithStandby))
 }
 
-func TestTrackerGCIgnoresFutureSamples(t *testing.T) {
+func TestTrackerGCRemovesFutureState(t *testing.T) {
 	t.Parallel()
 
-	now := time.UnixMilli(1_700_000_000_000)
+	now := time.UnixMilli(testNow)
 	tr := newTestTracker(testConfig(), &now)
 	a, _ := tr.Replica("a")
+	b, _ := tr.Replica("b")
+
+	require.True(t, acceptOnly(tr, 1, a, testNow))
+	// The clock is corrected by a day, the state of series 1 is now further ahead than any decision can store.
+	now = now.Add(-24 * time.Hour)
 	ts := now.UnixMilli()
+	require.True(t, acceptOnly(tr, 2, a, ts))
+	require.True(t, acceptOnly(tr, 3, a, ts))
+	// Series 3 has a standby replica at the horizon.
+	require.False(t, acceptOnly(tr, 3, b, ts+(5*time.Minute).Milliseconds()))
 
-	require.True(t, acceptOnly(tr, 1, a, ts))
-	require.True(t, acceptOnly(tr, 2, a, ts+(365*24*time.Hour).Milliseconds()))
-	require.Equal(t, 0, tr.GC())
+	require.Equal(t, 1, tr.GC())
+	require.True(t, tr.IsOwner(1, b))
+	require.False(t, tr.IsOwner(2, b))
+	require.False(t, tr.IsOwner(3, b))
+	require.Equal(t, 2.0, promtest.ToFloat64(tr.metrics.trackedSeries))
+	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.seriesWithStandby))
 
-	// The default TTL is max failover timeout + 10m.
+	// The default TTL is max failover timeout + 10m, it applies to the standby's sample at the horizon too.
 	now = now.Add(15*time.Minute + time.Millisecond)
 	require.Equal(t, 1, tr.GC())
 	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.trackedSeries))
+	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.seriesWithStandby))
+	now = now.Add(5 * time.Minute)
+	require.Equal(t, 1, tr.GC())
+	require.Zero(t, promtest.ToFloat64(tr.metrics.trackedSeries))
+	require.Zero(t, promtest.ToFloat64(tr.metrics.seriesWithStandby))
 }
 
 func TestTrackerReplicaGC(t *testing.T) {
@@ -633,7 +922,7 @@ func TestLearnInterval(t *testing.T) {
 func TestTrackerConcurrent(t *testing.T) {
 	t.Parallel()
 
-	tr := NewTracker(testConfig(), prometheus.NewRegistry())
+	tr := NewTracker(log.NewNopLogger(), testConfig(), prometheus.NewRegistry())
 
 	var wg sync.WaitGroup
 	for w := range 4 {
@@ -644,7 +933,7 @@ func TestTrackerConcurrent(t *testing.T) {
 			for i := range 1000 {
 				ts := int64(i * 15000)
 				ref := storage.SeriesRef(i % 100)
-				if accept, _, _ := tr.Accept(ref, r, ts, i%7 == 0); accept {
+				if accept, _ := tr.Accept(ref, r, ts, tr.Horizon(), i%7 == 0); accept {
 					c.Accepted++
 				} else {
 					c.Dropped++
@@ -661,7 +950,7 @@ func TestTrackerConcurrent(t *testing.T) {
 		r, ok := tr.Replica("replica-2")
 		require.True(t, ok)
 		for i := range 1000 {
-			tr.Init(storage.SeriesRef(i%100), r, int64(i*15000))
+			tr.Init(storage.SeriesRef(i%100), r, int64(i*15000), tr.Horizon())
 		}
 		tr.Record(Counts{Accepted: 1000})
 	})
@@ -689,24 +978,35 @@ func TestTrackerRecord(t *testing.T) {
 	t.Parallel()
 
 	reg := prometheus.NewRegistry()
-	tr := NewTracker(testConfig(), reg)
+	tr := NewTracker(log.NewNopLogger(), testConfig(), reg)
 	tr.Record(Counts{})
-	tr.Record(Counts{Accepted: 3, Dropped: 2, Failovers: 1, NoLabel: 4})
-	tr.Record(Counts{Accepted: 1, ReplicaTableFull: 5})
+	tr.Record(Counts{Accepted: 3, Dropped: 2, Failovers: 1, NoLabel: 4, Elections: 2})
+	tr.Record(Counts{Accepted: 1, ReplicaTableFull: 5, ReplicaValueTooLong: 6, Handovers: 7, Forgotten: 8})
 
 	require.NoError(t, promtest.GatherAndCompare(reg, strings.NewReader(`
+# HELP thanos_receive_ha_dedup_elections_total Total number of series whose owning HA replica was elected by their first tracked sample.
+# TYPE thanos_receive_ha_dedup_elections_total counter
+thanos_receive_ha_dedup_elections_total 2
 # HELP thanos_receive_ha_dedup_failovers_total Total number of series taken over by another HA replica after the owning replica stopped writing them.
 # TYPE thanos_receive_ha_dedup_failovers_total counter
 thanos_receive_ha_dedup_failovers_total 1
+# HELP thanos_receive_ha_dedup_forgotten_total Total number of series states removed because the samples they were based on were not stored.
+# TYPE thanos_receive_ha_dedup_forgotten_total counter
+thanos_receive_ha_dedup_forgotten_total 8
+# HELP thanos_receive_ha_dedup_handovers_total Total number of series handed over to another HA replica after the owning replica wrote a stale marker.
+# TYPE thanos_receive_ha_dedup_handovers_total counter
+thanos_receive_ha_dedup_handovers_total 7
 # HELP thanos_receive_ha_dedup_passthrough_total Total number of series written without HA deduplication, by reason.
 # TYPE thanos_receive_ha_dedup_passthrough_total counter
 thanos_receive_ha_dedup_passthrough_total{reason="no_label"} 4
 thanos_receive_ha_dedup_passthrough_total{reason="replica_table_full"} 5
+thanos_receive_ha_dedup_passthrough_total{reason="replica_value_too_long"} 6
 # HELP thanos_receive_ha_dedup_samples_total Total number of samples from HA replicas processed by deduplication, by outcome.
 # TYPE thanos_receive_ha_dedup_samples_total counter
 thanos_receive_ha_dedup_samples_total{outcome="accepted"} 4
 thanos_receive_ha_dedup_samples_total{outcome="dropped"} 2
-`), "thanos_receive_ha_dedup_failovers_total", "thanos_receive_ha_dedup_passthrough_total", "thanos_receive_ha_dedup_samples_total"))
+`), "thanos_receive_ha_dedup_elections_total", "thanos_receive_ha_dedup_failovers_total", "thanos_receive_ha_dedup_forgotten_total",
+		"thanos_receive_ha_dedup_handovers_total", "thanos_receive_ha_dedup_passthrough_total", "thanos_receive_ha_dedup_samples_total"))
 }
 
 func TestConfigValidate(t *testing.T) {
@@ -722,6 +1022,10 @@ func TestConfigValidate(t *testing.T) {
 		{name: "reserved metric name label", cfg: func(c *Config) { c.ReplicaLabel = "__name__" }},
 		{name: "reserved label prefix", cfg: func(c *Config) { c.ReplicaLabel = "__replica__" }},
 		{name: "failover intervals equal to 1", cfg: func(c *Config) { c.FailoverIntervals = 1 }},
+		{name: "NaN failover intervals", cfg: func(c *Config) { c.FailoverIntervals = math.NaN() }},
+		{name: "infinite failover intervals", cfg: func(c *Config) { c.FailoverIntervals = math.Inf(1) }},
+		{name: "negative infinite failover intervals", cfg: func(c *Config) { c.FailoverIntervals = math.Inf(-1) }},
+		{name: "large failover intervals", cfg: func(c *Config) { c.FailoverIntervals = math.MaxFloat64 }, valid: true},
 		{name: "min greater than max", cfg: func(c *Config) { c.MinFailoverTimeout = 10 * time.Minute }},
 		{name: "zero default timeout", cfg: func(c *Config) { c.DefaultFailoverTimeout = 0 }},
 		{name: "default timeout below min", cfg: func(c *Config) { c.DefaultFailoverTimeout = 5 * time.Second }},
@@ -748,29 +1052,31 @@ func TestConfigValidate(t *testing.T) {
 }
 
 func BenchmarkTrackerAccept(b *testing.B) {
-	tr := NewTracker(testConfig(), prometheus.NewRegistry())
+	tr := NewTracker(log.NewNopLogger(), testConfig(), prometheus.NewRegistry())
 	a, _ := tr.Replica("a")
 	rb, _ := tr.Replica("b")
 
 	const numSeries = 10000
+	h := tr.Horizon()
 	b.ReportAllocs()
 	b.ResetTimer()
 	var i int64
 	for b.Loop() {
 		ref := storage.SeriesRef(i % numSeries)
 		ts := (i / numSeries) * 15000
-		tr.Accept(ref, a, ts, false)
-		tr.Accept(ref, rb, ts+5000, false)
+		tr.Accept(ref, a, ts, h, false)
+		tr.Accept(ref, rb, ts+5000, h, false)
 		i++
 	}
 }
 
 func BenchmarkTrackerAcceptParallel(b *testing.B) {
-	tr := NewTracker(testConfig(), prometheus.NewRegistry())
+	tr := NewTracker(log.NewNopLogger(), testConfig(), prometheus.NewRegistry())
 	a, _ := tr.Replica("a")
 	rb, _ := tr.Replica("b")
 
 	const numSeries = 100000
+	h := tr.Horizon()
 	var worker atomic.Int64
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -781,8 +1087,8 @@ func BenchmarkTrackerAcceptParallel(b *testing.B) {
 		for pb.Next() {
 			ref := storage.SeriesRef(base + i%numSeries)
 			ts := (i / numSeries) * 15000
-			tr.Accept(ref, a, ts, false)
-			tr.Accept(ref, rb, ts+5000, false)
+			tr.Accept(ref, a, ts, h, false)
+			tr.Accept(ref, rb, ts+5000, h, false)
 			i++
 		}
 	})

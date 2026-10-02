@@ -256,8 +256,12 @@ func runReceive(
 	if conf.haDedupReplicaLabel != "" {
 		multiTSDBOptions = append(multiTSDBOptions, receive.WithHADedup(conf.haDedupConfig()))
 		level.Info(logger).Log("msg", "HA replica deduplication enabled", "replicaLabel", conf.haDedupReplicaLabel)
+		promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
+			Name: "thanos_receive_ha_dedup_config_info",
+			Help: "Information about the HA deduplication configuration.",
+		}, []string{"replica_label"}).WithLabelValues(conf.haDedupReplicaLabel).Set(1)
 		if enableIngestion && *conf.tsdbTooFarInFutureTimeWindow == 0 {
-			level.Warn(logger).Log("msg", "HA replica deduplication is enabled without --tsdb.too-far-in-future.time-window: a sample with a timestamp in the future lets its replica take the series over until that time; set the window, e.g. to 5m, to reject such samples")
+			level.Warn(logger).Log("msg", "HA replica deduplication is enabled without --tsdb.too-far-in-future.time-window: samples with timestamps in the future are stored and can make later samples of their series be rejected as out of order; set the window, e.g. to 5m, to reject such samples")
 		}
 	}
 
@@ -1209,7 +1213,7 @@ func (rc *receiveConfig) registerFlag(cmd extkingpin.FlagClause) {
 	rc.haDedupDefaultFailoverTimeout = extkingpin.ModelDuration(cmd.Flag("receive.ha-dedup.default-failover-timeout", "[EXPERIMENTAL] HA failover timeout used until the sample interval of a series has been learned.").Default("60s"))
 	cmd.Flag("receive.ha-dedup.max-replicas-per-tenant", "[EXPERIMENTAL] Maximum number of distinct replica label values tracked per tenant. Series of further replicas are written without deduplication.").
 		Default("1024").IntVar(&rc.haDedupMaxReplicasPerTenant)
-	rc.haDedupStateTTL = extkingpin.ModelDuration(cmd.Flag("receive.ha-dedup.state-ttl", "[EXPERIMENTAL] How long HA dedup state of a series is kept once its newest sample is older than the current time, and how long unused replica label values are kept. Must not be less than max-failover-timeout. 0s means max-failover-timeout + 10m.").Default("0s"))
+	rc.haDedupStateTTL = extkingpin.ModelDuration(cmd.Flag("receive.ha-dedup.state-ttl", "[EXPERIMENTAL] How long HA dedup state of a series is kept after its newest sample, and how long unused replica label values are kept. Must not be less than max-failover-timeout. 0s means max-failover-timeout + 10m.").Default("0s"))
 }
 
 // determineMode returns the ReceiverMode that this receiver is configured to run in.
