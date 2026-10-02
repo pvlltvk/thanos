@@ -371,15 +371,15 @@ func TestTrackerAccept(t *testing.T) {
 			expectedFailovers: 2,
 		},
 		{
-			name: "sample from beyond the horizon becomes standby at the horizon",
+			name: "sample from the future becomes standby at the current time",
 			steps: []step{
 				{replica: a, ts: testNow - 15000, accept: true, ownerChanged: true},
 				{replica: a, ts: testNow, accept: true},
 				{replica: b, ts: testNow + time.Hour.Milliseconds(), accept: false},
 				{replica: a, ts: testNow + 15000, stale: true, accept: false, ownerChanged: true},
-				// The handover floor is the horizon.
-				{replica: b, ts: testNow + 5*time.Minute.Milliseconds(), accept: false},
-				{replica: b, ts: testNow + 5*time.Minute.Milliseconds() + 1, accept: true},
+				// The handover floor is the current time, not the standby's timestamp.
+				{replica: b, ts: testNow, accept: false},
+				{replica: b, ts: testNow + 1, accept: true},
 			},
 			expectedOwner: b,
 		},
@@ -566,11 +566,11 @@ func TestTrackerHorizon(t *testing.T) {
 	require.Equal(t, tr.Horizon().max, st.ownerLastTs)
 	require.Zero(t, st.intervalMs&handoverFlag)
 
-	// Standby samples are recorded up to the horizon.
+	// Standby samples are recorded at most at the current time.
 	require.False(t, acceptOnly(tr, 1, b, h.max+time.Hour.Milliseconds()))
 	st = trackedState(tr, 1)
 	require.Equal(t, b, st.cand)
-	require.Equal(t, tr.Horizon().max, st.candLastTs)
+	require.Equal(t, tr.Horizon().now, st.candLastTs)
 }
 
 func TestTrackerTimeout(t *testing.T) {
@@ -791,6 +791,33 @@ func TestTrackerGC(t *testing.T) {
 	require.Zero(t, promtest.ToFloat64(tr.metrics.seriesWithStandby))
 }
 
+func TestTrackerStaleHandoverToFutureStandby(t *testing.T) {
+	t.Parallel()
+
+	now := time.UnixMilli(testNow)
+	tr := newTestTracker(testConfig(), &now)
+	a, _ := tr.Replica("a")
+	m, _ := tr.Replica("made-up")
+
+	for i := range 3 {
+		now = now.Add(15 * time.Second)
+		require.True(t, acceptOnly(tr, 1, a, testNow+int64(i+1)*15000))
+	}
+	require.False(t, acceptOnly(tr, 1, m, now.UnixMilli()+time.Hour.Milliseconds()))
+	accept, change := tr.Accept(1, a, now.UnixMilli(), tr.Horizon(), true)
+	require.False(t, accept)
+	require.Equal(t, Handover, change)
+
+	// The made-up replica doesn't write the series, so the real one takes it back after the failover timeout of the
+	// 15s interval, instead of after the timestamp of the made-up replica's sample.
+	now = now.Add(20 * time.Second)
+	require.False(t, acceptOnly(tr, 1, a, now.UnixMilli()))
+	now = now.Add(5 * time.Second)
+	accept, change = tr.Accept(1, a, now.UnixMilli(), tr.Horizon(), false)
+	require.True(t, accept)
+	require.Equal(t, Failover, change)
+}
+
 func TestTrackerGCRemovesFutureState(t *testing.T) {
 	t.Parallel()
 
@@ -805,7 +832,7 @@ func TestTrackerGCRemovesFutureState(t *testing.T) {
 	ts := now.UnixMilli()
 	require.True(t, acceptOnly(tr, 2, a, ts))
 	require.True(t, acceptOnly(tr, 3, a, ts))
-	// Series 3 has a standby replica at the horizon.
+	// Series 3 has a standby replica, whose sample from the future is recorded at the current time.
 	require.False(t, acceptOnly(tr, 3, b, ts+(5*time.Minute).Milliseconds()))
 
 	require.Equal(t, 1, tr.GC())
@@ -815,13 +842,9 @@ func TestTrackerGCRemovesFutureState(t *testing.T) {
 	require.Equal(t, 2.0, promtest.ToFloat64(tr.metrics.trackedSeries))
 	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.seriesWithStandby))
 
-	// The default TTL is max failover timeout + 10m, it applies to the standby's sample at the horizon too.
+	// The default TTL is max failover timeout + 10m, so both remaining series expire together.
 	now = now.Add(15*time.Minute + time.Millisecond)
-	require.Equal(t, 1, tr.GC())
-	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.trackedSeries))
-	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.seriesWithStandby))
-	now = now.Add(5 * time.Minute)
-	require.Equal(t, 1, tr.GC())
+	require.Equal(t, 2, tr.GC())
 	require.Zero(t, promtest.ToFloat64(tr.metrics.trackedSeries))
 	require.Zero(t, promtest.ToFloat64(tr.metrics.seriesWithStandby))
 }

@@ -494,8 +494,9 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, h Hori
 		return false, NoChange
 	}
 	// Replacing cand by arrival order would let a lagging replica evict a live one, and the owner's stale marker
-	// would then be accepted instead of handing the series over.
-	if ts := min(ts, h.max); ts > s.candLastTs {
+	// would then be accepted instead of handing the series over. A timestamp from the future counts as the current
+	// time: the handover floor is derived from it, so it would otherwise keep the other replicas out until then.
+	if ts := min(ts, h.now); ts > s.candLastTs {
 		s.cand, s.candLastTs = r, ts
 	}
 	return false, NoChange
