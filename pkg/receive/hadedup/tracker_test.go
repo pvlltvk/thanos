@@ -57,6 +57,7 @@ func TestTrackerAccept(t *testing.T) {
 		steps             []step
 		expectedOwner     string
 		expectedFailovers int
+		expectedTakeovers int
 	}{
 		{
 			name:          "first sample elects its replica",
@@ -106,13 +107,13 @@ func TestTrackerAccept(t *testing.T) {
 		{
 			name: "failover just after the timeout",
 			steps: []step{
-				{replica: a, ts: 0, accept: true, ownerChanged: true},
-				{replica: a, ts: 15000, accept: true},
-				{replica: b, ts: 15000 + 22500 + 1, accept: true, ownerChanged: true},
-				{replica: a, ts: 45000, accept: false},
-				{replica: b, ts: 52500, accept: true},
+				{replica: b, ts: 0, accept: true, ownerChanged: true},
+				{replica: b, ts: 15000, accept: true},
+				{replica: a, ts: 15000 + 22500 + 1, accept: true, ownerChanged: true},
+				{replica: b, ts: 45000, accept: false},
+				{replica: a, ts: 52500, accept: true},
 			},
-			expectedOwner:     b,
+			expectedOwner:     a,
 			expectedFailovers: 1,
 		},
 		{
@@ -185,7 +186,7 @@ func TestTrackerAccept(t *testing.T) {
 				{replica: b, ts: 20000, accept: false},
 				{replica: a, ts: 30000, stale: true, accept: false, ownerChanged: true},
 				{replica: b, ts: 35000, accept: true},
-				{replica: a, ts: 45000, accept: false},
+				{replica: a, ts: 34000, accept: false},
 				{replica: b, ts: 50000, accept: true},
 			},
 			expectedOwner: b,
@@ -208,17 +209,17 @@ func TestTrackerAccept(t *testing.T) {
 		{
 			name: "handover floor is kept when the old owner becomes candidate again",
 			steps: []step{
-				{replica: a, ts: 0, accept: true, ownerChanged: true},
-				{replica: a, ts: 1000, accept: true},
-				{replica: a, ts: 2000, accept: true},
-				{replica: b, ts: 500, accept: false},
-				{replica: a, ts: 3000, stale: true, accept: false, ownerChanged: true},
-				{replica: a, ts: 4000, accept: false},
-				{replica: b, ts: 1500, accept: false},
-				{replica: b, ts: 2500, accept: true},
-				{replica: b, ts: 1800, accept: true},
+				{replica: b, ts: 0, accept: true, ownerChanged: true},
+				{replica: b, ts: 1000, accept: true},
+				{replica: b, ts: 2000, accept: true},
+				{replica: a, ts: 500, accept: false},
+				{replica: b, ts: 3000, stale: true, accept: false, ownerChanged: true},
+				{replica: b, ts: 4000, accept: false},
+				{replica: a, ts: 1500, accept: false},
+				{replica: a, ts: 2500, accept: true},
+				{replica: a, ts: 1800, accept: true},
 			},
-			expectedOwner: b,
+			expectedOwner: a,
 		},
 		{
 			name: "handover floor is kept when a third replica becomes candidate",
@@ -254,7 +255,7 @@ func TestTrackerAccept(t *testing.T) {
 				{replica: a, ts: 45000, stale: true, accept: false, ownerChanged: true},
 				{replica: b, ts: 31000, accept: true},
 				{replica: b, ts: 46000, accept: true},
-				{replica: a, ts: 57000, accept: false},
+				{replica: c, ts: 57000, accept: false},
 			},
 			expectedOwner: b,
 		},
@@ -363,12 +364,13 @@ func TestTrackerAccept(t *testing.T) {
 				// The owner stopped and the other replica's clock is an hour ahead.
 				{now: testNow + 22500, replica: b, ts: testNow + time.Hour.Milliseconds(), accept: false},
 				{now: testNow + 22501, replica: b, ts: testNow + time.Hour.Milliseconds() + 15000, accept: true, ownerChanged: true},
-				// Recorded at the time of the failover, so the old owner takes over again once b stops too.
-				{now: testNow + 22501 + 22500, replica: a, ts: testNow + 22501 + 22500, accept: false},
-				{now: testNow + 22501 + 22501, replica: a, ts: testNow + 22501 + 22501, accept: true, ownerChanged: true},
+				// Recorded at the time of the failover, so the preferred old owner takes over with its next newer sample.
+				{replica: a, ts: testNow + 22501, accept: false},
+				{now: testNow + 22502, replica: a, ts: testNow + 22502, accept: true, ownerChanged: true},
 			},
 			expectedOwner:     a,
-			expectedFailovers: 2,
+			expectedFailovers: 1,
+			expectedTakeovers: 1,
 		},
 		{
 			name: "sample from the future becomes standby at the current time",
@@ -420,15 +422,15 @@ func TestTrackerAccept(t *testing.T) {
 			name: "three replicas",
 			steps: []step{
 				{replica: a, ts: 0, accept: true, ownerChanged: true},
-				{replica: b, ts: 5000, accept: false},
-				{replica: c, ts: 10000, accept: false},
+				{replica: c, ts: 5000, accept: false},
+				{replica: b, ts: 10000, accept: false},
 				{replica: a, ts: 15000, accept: true},
-				{replica: c, ts: 25000, accept: false},
+				{replica: b, ts: 25000, accept: false},
 				{replica: a, ts: 30000, stale: true, accept: false, ownerChanged: true},
-				{replica: c, ts: 40000, accept: true},
-				{replica: b, ts: 50000, accept: false},
+				{replica: b, ts: 40000, accept: true},
+				{replica: c, ts: 50000, accept: false},
 			},
-			expectedOwner: c,
+			expectedOwner: b,
 		},
 		{
 			name: "lagging third replica does not replace a live candidate",
@@ -442,13 +444,88 @@ func TestTrackerAccept(t *testing.T) {
 			},
 			expectedOwner: b,
 		},
+		{
+			name: "preferred replica takes over from a live owner once it is current",
+			steps: []step{
+				{replica: b, ts: 0, accept: true, ownerChanged: true},
+				{replica: a, ts: -5000, accept: false},
+				{replica: b, ts: 15000, accept: true},
+				{replica: a, ts: 10000, accept: false},
+				{replica: a, ts: 15000, accept: false},
+				{replica: a, ts: 25000, accept: true, ownerChanged: true},
+				{replica: b, ts: 30000, accept: false},
+				{replica: a, ts: 40000, accept: true},
+			},
+			expectedOwner:     a,
+			expectedTakeovers: 1,
+		},
+		{
+			name: "lagging preferred replica stays standby",
+			steps: []step{
+				{replica: b, ts: 0, accept: true, ownerChanged: true},
+				{replica: b, ts: 15000, accept: true},
+				{replica: a, ts: 10000, accept: false},
+				{replica: b, ts: 30000, accept: true},
+				{replica: a, ts: 25000, accept: false},
+				{replica: b, ts: 45000, accept: true},
+			},
+			expectedOwner: b,
+		},
+		{
+			name: "stale marker of the preferred replica does not take over",
+			steps: []step{
+				{replica: b, ts: 0, accept: true, ownerChanged: true},
+				{replica: a, ts: 5000, stale: true, accept: false},
+				{replica: b, ts: 15000, accept: true},
+			},
+			expectedOwner: b,
+		},
+		{
+			name: "takeover keeps the learned interval",
+			steps: []step{
+				{replica: b, ts: 0, accept: true, ownerChanged: true},
+				{replica: b, ts: 15000, accept: true},
+				{replica: a, ts: 20000, accept: true, ownerChanged: true},
+				// The delta to the old owner's sample is not an interval, the timeout stays 22.5s.
+				{replica: b, ts: 20000 + 22500, accept: false},
+				{replica: b, ts: 20000 + 22500 + 1, accept: true, ownerChanged: true},
+			},
+			expectedOwner:     b,
+			expectedFailovers: 1,
+			expectedTakeovers: 1,
+		},
+		{
+			name: "preferred replica takes over from the owner of a handed over series",
+			steps: []step{
+				{replica: b, ts: 0, accept: true, ownerChanged: true},
+				{replica: c, ts: 5000, accept: false},
+				{replica: b, ts: 15000, stale: true, accept: false, ownerChanged: true},
+				// Not newer than the handover floor of 5s.
+				{replica: a, ts: 4000, accept: false},
+				{replica: a, ts: 20000, accept: true, ownerChanged: true},
+				{replica: c, ts: 25000, accept: false},
+			},
+			expectedOwner:     a,
+			expectedTakeovers: 1,
+		},
+		{
+			name: "sample from the future of the preferred replica does not take over",
+			steps: []step{
+				{replica: b, ts: testNow - 15000, accept: true, ownerChanged: true},
+				{replica: b, ts: testNow, accept: true},
+				{now: testNow + 15000, replica: a, ts: testNow + 15001, accept: false},
+				{replica: a, ts: testNow + 15000, accept: true, ownerChanged: true},
+			},
+			expectedOwner:     a,
+			expectedTakeovers: 1,
+		},
 	} {
 		t.Run(tcase.name, func(t *testing.T) {
 			t.Parallel()
 
 			now := time.UnixMilli(testNow)
 			tr := newTestTracker(testConfig(), &now)
-			var failovers int
+			var failovers, takeovers int
 			for i, s := range tcase.steps {
 				if s.now != 0 {
 					now = time.UnixMilli(s.now)
@@ -458,8 +535,11 @@ func TestTrackerAccept(t *testing.T) {
 				accept, change := tr.Accept(1, r, s.ts, tr.Horizon(), s.stale)
 				require.Equal(t, s.accept, accept, "step %d: %+v", i, s)
 				require.Equal(t, s.ownerChanged, change != NoChange, "step %d: %+v", i, s)
-				if change == Failover {
+				switch change {
+				case Failover:
 					failovers++
+				case Takeover:
+					takeovers++
 				}
 			}
 
@@ -467,8 +547,42 @@ func TestTrackerAccept(t *testing.T) {
 			require.True(t, ok)
 			require.True(t, tr.IsOwner(1, owner))
 			require.Equal(t, tcase.expectedFailovers, failovers)
+			require.Equal(t, tcase.expectedTakeovers, takeovers)
 			require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.trackedSeries))
 		})
+	}
+}
+
+func TestTrackerCopiesConverge(t *testing.T) {
+	t.Parallel()
+
+	// Two ingestors hold copies of a series. The second one was restarted and elected the replica whose sample arrived
+	// first, while the other copy is owned by the preferred replica.
+	now := time.UnixMilli(testNow)
+	trackers := []*Tracker{newTestTracker(testConfig(), &now), newTestTracker(testConfig(), &now)}
+	write := func(tr *Tracker, replica string, ts int64) bool {
+		r, ok := tr.Replica(replica)
+		require.True(t, ok)
+		accept, _ := tr.Accept(1, r, ts, tr.Horizon(), false)
+		return accept
+	}
+	require.True(t, write(trackers[0], "prometheus-0", 0))
+	require.True(t, write(trackers[1], "prometheus-1", 7000))
+
+	// The replicas scrape 7s apart, and every copy receives the samples of both.
+	for i := range 4 {
+		var accepted [2][]int64
+		for j, tr := range trackers {
+			for _, sample := range []struct {
+				replica string
+				ts      int64
+			}{{"prometheus-0", int64(i+1) * 15000}, {"prometheus-1", int64(i+1)*15000 + 7000}} {
+				if write(tr, sample.replica, sample.ts) {
+					accepted[j] = append(accepted[j], sample.ts)
+				}
+			}
+		}
+		require.Equal(t, accepted[0], accepted[1], "copies diverge after %d scrapes", i+1)
 	}
 }
 
@@ -590,6 +704,7 @@ func TestTrackerForget(t *testing.T) {
 	tr := NewTracker(log.NewNopLogger(), testConfig(), prometheus.NewRegistry())
 	a, _ := tr.Replica("a")
 	b, _ := tr.Replica("b")
+	c, _ := tr.Replica("c")
 	require.True(t, acceptOnly(tr, 1, a, 0))
 	require.True(t, acceptOnly(tr, 1, a, 15000))
 	require.True(t, acceptOnly(tr, 2, a, 0))
@@ -610,7 +725,7 @@ func TestTrackerForget(t *testing.T) {
 	require.True(t, accepted)
 	require.Equal(t, Elected, change)
 	require.True(t, tr.IsOwner(1, b))
-	require.False(t, acceptOnly(tr, 1, a, 30000))
+	require.False(t, acceptOnly(tr, 1, c, 30000))
 	require.Equal(t, 2.0, promtest.ToFloat64(tr.metrics.trackedSeries))
 }
 
@@ -630,7 +745,7 @@ func TestTrackerSeriesAreIndependent(t *testing.T) {
 	require.True(t, acceptOnly(tr, 1, a, 0))
 	require.True(t, acceptOnly(tr, 2, b, 0))
 	require.False(t, acceptOnly(tr, 1, b, 1000))
-	require.False(t, acceptOnly(tr, 2, a, 1000))
+	require.False(t, acceptOnly(tr, 2, a, 0))
 	require.True(t, tr.IsOwner(1, a))
 	require.True(t, tr.IsOwner(2, b))
 	require.True(t, tr.IsOwner(3, a), "untracked series has no owner to protect")
@@ -796,24 +911,25 @@ func TestTrackerStaleHandoverToFutureStandby(t *testing.T) {
 
 	now := time.UnixMilli(testNow)
 	tr := newTestTracker(testConfig(), &now)
-	a, _ := tr.Replica("a")
+	r, _ := tr.Replica("real")
 	m, _ := tr.Replica("made-up")
 
 	for i := range 3 {
 		now = now.Add(15 * time.Second)
-		require.True(t, acceptOnly(tr, 1, a, testNow+int64(i+1)*15000))
+		require.True(t, acceptOnly(tr, 1, r, testNow+int64(i+1)*15000))
 	}
 	require.False(t, acceptOnly(tr, 1, m, now.UnixMilli()+time.Hour.Milliseconds()))
-	accept, change := tr.Accept(1, a, now.UnixMilli(), tr.Horizon(), true)
+	accept, change := tr.Accept(1, r, now.UnixMilli(), tr.Horizon(), true)
 	require.False(t, accept)
 	require.Equal(t, Handover, change)
 
 	// The made-up replica doesn't write the series, so the real one takes it back after the failover timeout of the
-	// 15s interval, instead of after the timestamp of the made-up replica's sample.
+	// 15s interval, instead of after the timestamp of the made-up replica's sample. The made-up replica is preferred,
+	// so the real one can't take the series back earlier.
 	now = now.Add(20 * time.Second)
-	require.False(t, acceptOnly(tr, 1, a, now.UnixMilli()))
+	require.False(t, acceptOnly(tr, 1, r, now.UnixMilli()))
 	now = now.Add(5 * time.Second)
-	accept, change = tr.Accept(1, a, now.UnixMilli(), tr.Horizon(), false)
+	accept, change = tr.Accept(1, r, now.UnixMilli(), tr.Horizon(), false)
 	require.True(t, accept)
 	require.Equal(t, Failover, change)
 }
@@ -1004,7 +1120,7 @@ func TestTrackerRecord(t *testing.T) {
 	tr := NewTracker(log.NewNopLogger(), testConfig(), reg)
 	tr.Record(Counts{})
 	tr.Record(Counts{Accepted: 3, Dropped: 2, Failovers: 1, NoLabel: 4, Elections: 2})
-	tr.Record(Counts{Accepted: 1, ReplicaTableFull: 5, ReplicaValueTooLong: 6, Handovers: 7, Forgotten: 8})
+	tr.Record(Counts{Accepted: 1, ReplicaTableFull: 5, ReplicaValueTooLong: 6, Handovers: 7, Forgotten: 8, Takeovers: 9})
 
 	require.NoError(t, promtest.GatherAndCompare(reg, strings.NewReader(`
 # HELP thanos_receive_ha_dedup_elections_total Total number of series whose owning HA replica was elected by their first tracked sample.
@@ -1028,8 +1144,12 @@ thanos_receive_ha_dedup_passthrough_total{reason="replica_value_too_long"} 6
 # TYPE thanos_receive_ha_dedup_samples_total counter
 thanos_receive_ha_dedup_samples_total{outcome="accepted"} 4
 thanos_receive_ha_dedup_samples_total{outcome="dropped"} 2
+# HELP thanos_receive_ha_dedup_takeovers_total Total number of series taken over from a live owning HA replica by the preferred replica, the one with the lowest replica label value.
+# TYPE thanos_receive_ha_dedup_takeovers_total counter
+thanos_receive_ha_dedup_takeovers_total 9
 `), "thanos_receive_ha_dedup_elections_total", "thanos_receive_ha_dedup_failovers_total", "thanos_receive_ha_dedup_forgotten_total",
-		"thanos_receive_ha_dedup_handovers_total", "thanos_receive_ha_dedup_passthrough_total", "thanos_receive_ha_dedup_samples_total"))
+		"thanos_receive_ha_dedup_handovers_total", "thanos_receive_ha_dedup_passthrough_total", "thanos_receive_ha_dedup_samples_total",
+		"thanos_receive_ha_dedup_takeovers_total"))
 }
 
 func TestConfigValidate(t *testing.T) {

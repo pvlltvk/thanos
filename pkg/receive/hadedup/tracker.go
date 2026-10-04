@@ -4,6 +4,7 @@
 // Package hadedup deduplicates samples of the same series written by multiple HA Prometheus replicas.
 // For every series it tracks which replica currently owns it, accepts samples only from the owner and
 // fails over to another replica once the owner has been silent for a few of the series' scrape intervals.
+// The replica with the lowest label value takes series back as soon as its samples are current again.
 package hadedup
 
 import (
@@ -127,6 +128,7 @@ type metrics struct {
 	failovers          prometheus.Counter
 	elections          prometheus.Counter
 	handovers          prometheus.Counter
+	takeovers          prometheus.Counter
 	forgotten          prometheus.Counter
 	passthroughNoLabel prometheus.Counter
 	passthroughFull    prometheus.Counter
@@ -164,6 +166,10 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		handovers: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "thanos_receive_ha_dedup_handovers_total",
 			Help: "Total number of series handed over to another HA replica after the owning replica wrote a stale marker.",
+		}),
+		takeovers: promauto.With(reg).NewCounter(prometheus.CounterOpts{
+			Name: "thanos_receive_ha_dedup_takeovers_total",
+			Help: "Total number of series taken over from a live owning HA replica by the preferred replica, the one with the lowest replica label value.",
 		}),
 		forgotten: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "thanos_receive_ha_dedup_forgotten_total",
@@ -208,6 +214,9 @@ type Tracker struct {
 	// replicas is indexed by interned replica index; freed slots are nil and listed in freeReplicas.
 	replicas     []*replicaEntry
 	freeReplicas []uint16
+	// values holds the replica values by interned index, freed slots empty. It is replaced on every change of the
+	// replica table, so that decisions can compare replicas without taking replicasMtx.
+	values atomic.Pointer[[]string]
 
 	stripes [numStripes]stripe
 
@@ -226,7 +235,7 @@ func NewTracker(logger log.Logger, cfg Config, reg prometheus.Registerer) *Track
 	if stateTTL == 0 {
 		stateTTL = cfg.MaxFailoverTimeout + 10*time.Minute
 	}
-	return &Tracker{
+	t := &Tracker{
 		replicaLabel:      cfg.ReplicaLabel,
 		failoverIntervals: cfg.FailoverIntervals,
 		minTimeoutMs:      cfg.MinFailoverTimeout.Milliseconds(),
@@ -239,6 +248,8 @@ func NewTracker(logger log.Logger, cfg Config, reg prometheus.Registerer) *Track
 		now:               time.Now,
 		metrics:           newMetrics(reg),
 	}
+	t.values.Store(&[]string{})
+	return t
 }
 
 // ReplicaLabel returns the name of the replica label.
@@ -294,6 +305,7 @@ func (t *Tracker) Replica(value string) (uint16, bool) {
 		t.replicas = append(t.replicas, rep)
 	}
 	t.replicaIdx[rep.value] = r
+	t.storeValues()
 	n := len(t.replicaIdx)
 	t.metrics.replicas.Set(float64(n))
 	t.replicasMtx.Unlock()
@@ -307,10 +319,11 @@ type Counts struct {
 	// Accepted and Dropped count the samples of deduplicated series.
 	Accepted int
 	Dropped  int
-	// Elections, Failovers and Handovers count the series whose owner was elected or changed, see Change.
+	// Elections, Failovers, Handovers and Takeovers count the series whose owner was elected or changed, see Change.
 	Elections int
 	Failovers int
 	Handovers int
+	Takeovers int
 	// Forgotten counts the series removed by Forget.
 	Forgotten int
 	// NoLabel, ReplicaTableFull and ReplicaValueTooLong count the series written without deduplication, by reason.
@@ -327,6 +340,7 @@ func (t *Tracker) Record(c Counts) {
 	addCount(t.metrics.failovers, c.Failovers)
 	addCount(t.metrics.elections, c.Elections)
 	addCount(t.metrics.handovers, c.Handovers)
+	addCount(t.metrics.takeovers, c.Takeovers)
 	addCount(t.metrics.forgotten, c.Forgotten)
 	addCount(t.metrics.passthroughNoLabel, c.NoLabel)
 	addCount(t.metrics.passthroughFull, c.ReplicaTableFull)
@@ -357,6 +371,8 @@ const (
 	Failover
 	// Handover means that the owner's stale marker handed the series over to the standby replica.
 	Handover
+	// Takeover means that the preferred replica took the series over from a live owner.
+	Takeover
 )
 
 // Horizon bounds the sample timestamps that ownership decisions take into account. Writers take it once per request,
@@ -493,6 +509,13 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, h Hori
 		}
 		return false, NoChange
 	}
+	// The preferred replica takes over once it is current, i.e. not behind any sample already appended. A lagging
+	// preferred replica stays standby instead, as taking over would drop the owner's newer samples. A sample from the
+	// future doesn't take over either: appending it would make the owner's later samples out of order.
+	if ts > s.ownerLastTs && ts <= h.now && t.prefers(r, s.owner) {
+		*s = newOwnerState(r, ts, s.interval(), h)
+		return true, Takeover
+	}
 	// Replacing cand by arrival order would let a lagging replica evict a live one, and the owner's stale marker
 	// would then be accepted instead of handing the series over. A timestamp from the future counts as the current
 	// time: the handover floor is derived from it, so it would otherwise keep the other replicas out until then.
@@ -500,6 +523,25 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, h Hori
 		s.cand, s.candLastTs = r, ts
 	}
 	return false, NoChange
+}
+
+// prefers reports whether replica r has a lower label value than replica o. The ingestors holding copies of a series
+// elect its owner independently, e.g. one of them after a restart, and the copies stay with different owners while
+// both replicas write the series. Taking series over by a fixed preference makes them converge within one sample.
+func (t *Tracker) prefers(r, o uint16) bool {
+	values := *t.values.Load()
+	return int(max(r, o)) < len(values) && values[r] < values[o]
+}
+
+// storeValues publishes the current replica values for prefers. replicasMtx must be held for writing.
+func (t *Tracker) storeValues() {
+	values := make([]string, len(t.replicas))
+	for i, rep := range t.replicas {
+		if rep != nil {
+			values[i] = rep.value
+		}
+	}
+	t.values.Store(&values)
 }
 
 // newOwnerState returns the state of a series whose owner became r with its sample at ts. A new owner's timestamp is
@@ -580,6 +622,7 @@ func (t *Tracker) GC() int {
 
 	t.replicasMtx.Lock()
 	defer t.replicasMtx.Unlock()
+	var freed bool
 	for i, rep := range t.replicas {
 		if rep == nil {
 			continue
@@ -595,6 +638,10 @@ func (t *Tracker) GC() int {
 		delete(t.replicaIdx, rep.value)
 		t.replicas[i] = nil
 		t.freeReplicas = append(t.freeReplicas, uint16(i))
+		freed = true
+	}
+	if freed {
+		t.storeValues()
 	}
 	t.metrics.replicas.Set(float64(len(t.replicaIdx)))
 	return removed

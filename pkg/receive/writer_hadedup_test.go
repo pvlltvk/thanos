@@ -457,9 +457,9 @@ func TestWriterHADedupRejectedSamples(t *testing.T) {
 			name:   "rejected first sample of a series",
 			failTs: base,
 			writes: []haDedupWrite{
-				{replica: "prometheus-0", ts: base},
-				{replica: "prometheus-1", ts: base + 5000},
-				{replica: "prometheus-0", ts: base + 15000},
+				{replica: "prometheus-1", ts: base},
+				{replica: "prometheus-0", ts: base + 5000},
+				{replica: "prometheus-1", ts: base + 15000},
 			},
 			expected: []int64{base + 5000},
 		},
@@ -671,9 +671,9 @@ func TestWriterHADedupFailedWrites(t *testing.T) {
 		{
 			name: "rejected histogram of a new series",
 			writes: []failedWrite{
-				{series: malformedHistogram("prometheus-0", base)},
-				{series: floats("prometheus-1", prompb.Sample{Value: 1, Timestamp: base + 5000})},
-				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 15000})},
+				{series: malformedHistogram("prometheus-1", base)},
+				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 5000})},
+				{series: floats("prometheus-1", prompb.Sample{Value: 1, Timestamp: base + 15000})},
 			},
 			expected: []int64{base + 5000},
 		},
@@ -702,23 +702,23 @@ func TestWriterHADedupFailedWrites(t *testing.T) {
 		{
 			name: "commit failure after a failover and a handover of the same series is retried",
 			writes: []failedWrite{
-				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base})},
-				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 15000})},
+				{series: floats("prometheus-1", prompb.Sample{Value: 1, Timestamp: base})},
+				{series: floats("prometheus-1", prompb.Sample{Value: 1, Timestamp: base + 15000})},
 				{
 					series: slices.Concat(
-						floats("prometheus-1", prompb.Sample{Value: 1, Timestamp: base + 40000}),
-						floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 45000}),
-						floats("prometheus-1", prompb.Sample{Value: stale, Timestamp: base + 50000}),
+						floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 40000}),
+						floats("prometheus-1", prompb.Sample{Value: 1, Timestamp: base + 45000}),
+						floats("prometheus-0", prompb.Sample{Value: stale, Timestamp: base + 50000}),
 					),
 					failCommit: true,
 					err:        true,
 				},
 				{series: slices.Concat(
-					floats("prometheus-1", prompb.Sample{Value: 1, Timestamp: base + 40000}),
-					floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 45000}),
-					floats("prometheus-1", prompb.Sample{Value: stale, Timestamp: base + 50000}),
+					floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 40000}),
+					floats("prometheus-1", prompb.Sample{Value: 1, Timestamp: base + 45000}),
+					floats("prometheus-0", prompb.Sample{Value: stale, Timestamp: base + 50000}),
 				)},
-				{series: floats("prometheus-0", prompb.Sample{Value: 1, Timestamp: base + 60000})},
+				{series: floats("prometheus-1", prompb.Sample{Value: 1, Timestamp: base + 60000})},
 			},
 			expected: []int64{base, base + 15000, base + 40000, base + 60000},
 		},
@@ -1055,7 +1055,7 @@ func TestHADedupSeries(t *testing.T) {
 	require.True(t, w.accept(&s3, 9, 90000, false))
 	w.appended(&s3, 9)
 	s4 := haDedupSeries{dedup: true, replica: r0, interned: true}
-	require.False(t, w.accept(&s4, 9, 95000, false))
+	require.False(t, w.accept(&s4, 9, 85000, false))
 	require.False(t, w.accept(&s3, 9, 100000, true))
 	require.True(t, tracker.IsOwner(9, r0))
 	require.Equal(t, []storage.SeriesRef{9, 9}, w.ownerChanged)
@@ -1315,7 +1315,7 @@ func TestWriterHADedupReplicaTable(t *testing.T) {
 			}))
 			require.NoError(t, writeHADedupRequest(t, s, capnp, 5*time.Minute, []prompb.TimeSeries{
 				series("a", maxValue, base+5000),
-				series("b", "prometheus-0", base+5000),
+				series("b", "prometheus-0", base),
 			}))
 
 			require.Equal(t, map[string]storedSeries{

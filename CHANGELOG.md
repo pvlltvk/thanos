@@ -15,7 +15,7 @@ We use *breaking :warning:* to mark changes that are not backward compatible (re
 - [#8356](https://github.com/thanos-io/thanos/pull/8356): receive: Add retry-after backoff with jitter via header field to active-series-limiting (429) and quorum-unavailable (503) responses
 - [#8882](https://github.com/thanos-io/thanos/pull/8882) Receive: implement multi-tenant writes; greatly improves throughput when using the split tenant label functionality.
 - [#8876](https://github.com/thanos-io/thanos/pull/8876): Query-Frontend: Reuse compatible lower-step query range cache entries by subsampling cached responses.
-- [#XXXX](https://github.com/thanos-io/thanos/pull/XXXX): Receive: Add experimental deduplication of samples written by HA Prometheus replicas (`--receive.ha-dedup.*`): ingestors keep samples of one replica per series and fail over when it stops writing.
+- [#XXXX](https://github.com/thanos-io/thanos/pull/XXXX): Receive: Add experimental deduplication of samples written by HA Prometheus replicas (`--receive.ha-dedup.*`): ingestors keep samples of one replica per series, preferring the replica with the lowest label value, and fail over when it stops writing.
 
 ### Fixed
 

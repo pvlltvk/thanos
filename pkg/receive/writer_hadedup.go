@@ -213,6 +213,8 @@ func (w *haDedupWriter) accept(s *haDedupSeries, ref storage.SeriesRef, ts int64
 		w.counts.Failovers++
 	case hadedup.Handover:
 		w.counts.Handovers++
+	case hadedup.Takeover:
+		w.counts.Takeovers++
 	}
 	ownerChanged := change != hadedup.NoChange
 	if ownerChanged && !accept {
