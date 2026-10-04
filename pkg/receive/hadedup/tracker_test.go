@@ -509,6 +509,33 @@ func TestTrackerAccept(t *testing.T) {
 			expectedTakeovers: 1,
 		},
 		{
+			name: "stale marker of the preferred replica hands the series back to the live old owner",
+			steps: []step{
+				{replica: b, ts: 0, accept: true, ownerChanged: true},
+				{replica: b, ts: 10000, accept: true},
+				{replica: b, ts: 20000, accept: true},
+				{replica: a, ts: 25000, accept: true, ownerChanged: true},
+				{replica: a, ts: 30000, stale: true, accept: false, ownerChanged: true},
+				{replica: b, ts: 30000, accept: true},
+			},
+			expectedOwner:     b,
+			expectedTakeovers: 1,
+		},
+		{
+			name: "takeover of a handed over series has no standby",
+			steps: []step{
+				{replica: b, ts: 0, accept: true, ownerChanged: true},
+				{replica: b, ts: 15000, accept: true},
+				{replica: c, ts: 10000, accept: false},
+				{replica: b, ts: 20000, stale: true, accept: false, ownerChanged: true},
+				// The handover floor of 15s is the newest sample of prometheus-1, not of prometheus-2, which went silent.
+				{replica: a, ts: 16000, accept: true, ownerChanged: true},
+				{replica: a, ts: 36000, stale: true, accept: true},
+			},
+			expectedOwner:     a,
+			expectedTakeovers: 1,
+		},
+		{
 			name: "sample from the future of the preferred replica does not take over",
 			steps: []step{
 				{replica: b, ts: testNow - 15000, accept: true, ownerChanged: true},
@@ -712,6 +739,8 @@ func TestTrackerForget(t *testing.T) {
 
 	require.True(t, tr.Forget(1))
 	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.trackedSeries))
+	require.False(t, tr.Tracked(1))
+	require.True(t, tr.Tracked(2))
 	require.True(t, tr.IsOwner(1, b), "forgotten series has no owner to protect")
 	require.True(t, tr.IsOwner(2, a))
 	require.False(t, tr.IsOwner(2, b))
@@ -904,6 +933,36 @@ func TestTrackerGC(t *testing.T) {
 	require.Equal(t, 1, tr.GC())
 	require.Equal(t, 2.0, promtest.ToFloat64(tr.metrics.trackedSeries))
 	require.Zero(t, promtest.ToFloat64(tr.metrics.seriesWithStandby))
+}
+
+func TestTrackerGCRemovesDeadStandby(t *testing.T) {
+	t.Parallel()
+
+	cfg := testConfig()
+	cfg.MaxReplicas = 2
+	cfg.StateTTL = 5 * time.Minute
+	now := time.UnixMilli(testNow)
+	tr := newTestTracker(cfg, &now)
+	ts := func() int64 { return now.UnixMilli() }
+
+	a, _ := tr.Replica("a")
+	b, _ := tr.Replica("b")
+	require.True(t, acceptOnly(tr, 1, a, ts()))
+	require.False(t, acceptOnly(tr, 1, b, ts()+1000))
+	tr.GC()
+	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.seriesWithStandby))
+
+	// Only a keeps writing the series, b stopped and must not keep its slot of the replica table.
+	for range 6 {
+		now = now.Add(time.Minute)
+		require.True(t, acceptOnly(tr, 1, a, ts()))
+		tr.GC()
+	}
+	require.Equal(t, uint16(noReplica), trackedState(tr, 1).cand)
+	require.Zero(t, promtest.ToFloat64(tr.metrics.seriesWithStandby))
+	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.replicas))
+	_, ok := tr.Replica("c")
+	require.True(t, ok)
 }
 
 func TestTrackerStaleHandoverToFutureStandby(t *testing.T) {

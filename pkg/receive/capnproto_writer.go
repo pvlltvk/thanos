@@ -143,6 +143,10 @@ func (r *CapNProtoWriter) Write(ctx context.Context, wreq *writecapnp.Request) e
 			errorTracker.addHistogramError(err, tLogger, lset, hp.Timestamp)
 		}
 
+		if dedup.tableFilled {
+			return dedup.abort(app)
+		}
+
 		// Current implementation of app.AppendExemplar doesn't create a new series, so it must be already present.
 		// We drop the exemplars in case the series doesn't exist.
 		if ref != 0 && len(series.Exemplars) > 0 && dedup.acceptExemplars(&dedupSeries, ref) {

@@ -454,6 +454,15 @@ func (t *Tracker) IsOwner(ref storage.SeriesRef, replica uint16) bool {
 	return !exists || st.owner == replica
 }
 
+// Tracked returns true if the series is tracked.
+func (t *Tracker) Tracked(ref storage.SeriesRef) bool {
+	s := &t.stripes[uint64(ref)%numStripes]
+	s.mtx.Lock()
+	_, exists := s.series[ref]
+	s.mtx.Unlock()
+	return exists
+}
+
 // decide implements the per-sample state machine. Decisions compare sample timestamps rather than arrival times, so
 // lag that all replicas share doesn't cause failovers, while an owner lagging behind another replica by more than the
 // failover timeout loses its series. Timestamps are only trusted up to the horizon: no stored timestamp is beyond
@@ -513,7 +522,13 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, h Hori
 	// preferred replica stays standby instead, as taking over would drop the owner's newer samples. A sample from the
 	// future doesn't take over either: appending it would make the owner's later samples out of order.
 	if ts > s.ownerLastTs && ts <= h.now && t.prefers(r, s.owner) {
-		*s = newOwnerState(r, ts, s.interval(), h)
+		old := *s
+		*s = newOwnerState(r, ts, old.interval(), h)
+		// The old owner is live, so a stale marker of the new owner must hand the series back to it instead of ending
+		// it. After a handover, ownerLastTs is the floor rather than a sample of the owner, which may not be live.
+		if old.intervalMs&handoverFlag == 0 {
+			s.cand, s.candLastTs = old.owner, old.ownerLastTs
+		}
 		return true, Takeover
 	}
 	// Replacing cand by arrival order would let a lagging replica evict a live one, and the owner's stale marker
@@ -580,10 +595,11 @@ func learnInterval(cur uint32, delta int64) uint32 {
 	return cur + uint32(max((target-int64(cur))/8, 1))
 }
 
-// GC removes the state of series whose newest sample is older than the state TTL, and frees replica values that
-// were not used for longer than the state TTL and are not referenced by any series. Unlike failover decisions, GC is
-// based on the current time. It also removes state with timestamps further in the future than any decision can
-// store, which is left over from before a backward step of the clock. It returns the number of removed series.
+// GC removes the state of series whose newest sample is older than the state TTL, as well as standby replicas whose
+// newest sample is, and frees replica values that were not used for longer than the state TTL and are not referenced
+// by any series. Unlike failover decisions, GC is based on the current time. It also removes state with timestamps
+// further in the future than any decision can store, which is left over from before a backward step of the clock. It
+// returns the number of removed series.
 func (t *Tracker) GC() int {
 	start := time.Now()
 	defer func() { t.metrics.gcDuration.Set(time.Since(start).Seconds()) }()
@@ -605,6 +621,10 @@ func (t *Tracker) GC() int {
 				delete(s.series, ref)
 				removed++
 				continue
+			}
+			if st.cand != noReplica && st.candLastTs < cutoff {
+				st.cand, st.candLastTs = noReplica, noTs
+				s.series[ref] = st
 			}
 			markReferenced(referenced, st.owner)
 			if st.cand != noReplica {

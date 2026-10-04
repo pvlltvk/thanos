@@ -7,6 +7,8 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/colega/zeropool"
+	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/storage"
@@ -21,15 +23,20 @@ type haDedupTenantStorage interface {
 	TenantHADedupTracker(tenantID string) (*hadedup.Tracker, error)
 }
 
+// haDedupChangedPool reuses haDedupWriter.changed, which has an entry per series of a request with accepted samples.
+var haDedupChangedPool zeropool.Pool[[]storage.SeriesRef]
+
 // haDedupWriter applies HA replica deduplication to the series of a single write request.
 // It is shared by Writer and CapNProtoWriter so that both paths take the same decisions.
 type haDedupWriter struct {
 	tracker *hadedup.Tracker
 	horizon hadedup.Horizon
 	scratch []labelpb.ZLabel
-	// ownerChanged lists the series whose owner was changed by the request, see forget.
-	ownerChanged []storage.SeriesRef
-	counts       hadedup.Counts
+	// changed lists the series whose state is based on samples of the request, see forget.
+	changed []storage.SeriesRef
+	counts  hadedup.Counts
+	// tableFilled is set if the replica table filled up while the request was written, see intern.
+	tableFilled bool
 
 	// The series of a request normally come from a single Prometheus, so the lookup of the last replica value is
 	// reused while it repeats. The value references request memory without being copied: the request's label
@@ -58,7 +65,7 @@ func newHADedupWriter(s TenantStorage, tenantID string) (haDedupWriter, error) {
 	if err != nil || tracker == nil {
 		return haDedupWriter{}, err
 	}
-	return haDedupWriter{tracker: tracker, horizon: tracker.Horizon()}, nil
+	return haDedupWriter{tracker: tracker, horizon: tracker.Horizon(), changed: haDedupChangedPool.Get()}, nil
 }
 
 // prepare looks up the replica label of the given sorted labels. For deduplicated series it returns the labels
@@ -114,16 +121,15 @@ func (w *haDedupWriter) lookupReplica(value string) (uint16, replicaStatus) {
 }
 
 // intern interns the replica value of a series once one of its samples takes part in a decision, so that series
-// without valid samples can't fill the replica table. If the table filled up since prepare, the series is written
-// without deduplication from then on, as its labels were already used without the replica label.
+// without valid samples can't fill the replica table. If the table filled up since prepare, the request must be
+// aborted, see abort: the series must then be written with the replica label, which its labels no longer have.
 func (w *haDedupWriter) intern(s *haDedupSeries) bool {
 	if s.interned {
 		return true
 	}
 	r, ok := w.tracker.Replica(s.replicaValue)
 	if !ok {
-		s.dedup = false
-		w.counts.ReplicaTableFull++
+		w.tableFilled = true
 	}
 	s.replica, s.interned = r, ok
 	if w.lastReplicaStatus == replicaUnknown && w.lastReplicaValue == s.replicaValue {
@@ -143,15 +149,29 @@ func (w *haDedupWriter) flush() {
 	}
 	w.tracker.Record(w.counts)
 	w.counts = hadedup.Counts{}
+	if cap(w.changed) > 0 {
+		haDedupChangedPool.Put(w.changed[:0])
+	}
+	w.changed = nil
 }
 
-// forget removes the state of the series whose owner was changed by the request. It must be called if the request's
-// samples are not stored, as a retry would otherwise be dropped by the ownership they established.
+// forget removes the state of the series that is based on samples of the request. It must be called if the request's
+// samples are not stored, as the state would otherwise make other replicas' samples and a retry be dropped.
 func (w *haDedupWriter) forget() {
-	for _, ref := range w.ownerChanged {
+	for _, ref := range w.changed {
 		w.forgetSeries(ref)
 	}
-	w.ownerChanged = nil
+	w.changed = w.changed[:0]
+}
+
+// abort rolls back a request that can't be written as prepared, see intern. The returned error makes clients retry
+// the request, which then finds the replica table full and writes the series with the replica label.
+func (w *haDedupWriter) abort(app storage.Appender) error {
+	w.forget()
+	if err := app.Rollback(); err != nil {
+		return errors.Wrap(err, "rollback samples")
+	}
+	return errors.Wrap(errNotReady, "HA replica table filled up while writing the request")
 }
 
 func (w *haDedupWriter) forgetSeries(ref storage.SeriesRef) {
@@ -176,10 +196,13 @@ type haDedupSeries struct {
 
 	// ref is the last known head reference of the series. Appends return a zero reference on error, which must not
 	// make later samples of the series bypass the tracker.
-	ref          storage.SeriesRef
-	pending      bool
-	pendingTs    int64
-	ownerChanged bool
+	ref       storage.SeriesRef
+	pending   bool
+	pendingTs int64
+	// decided is set while a sample accepted by the tracker is appended, see appended.
+	decided bool
+	// listed is set once the series is in haDedupWriter.changed.
+	listed bool
 }
 
 // accept reports whether a sample at ts must be appended to the series with the given head reference.
@@ -198,7 +221,7 @@ func (w *haDedupWriter) accept(s *haDedupSeries, ref storage.SeriesRef, ts int64
 		return true
 	}
 	if !w.intern(s) {
-		return true
+		return false
 	}
 	accept, change := w.tracker.Accept(s.ref, s.replica, ts, w.horizon, stale)
 	if accept {
@@ -216,25 +239,25 @@ func (w *haDedupWriter) accept(s *haDedupSeries, ref storage.SeriesRef, ts int64
 	case hadedup.Takeover:
 		w.counts.Takeovers++
 	}
-	ownerChanged := change != hadedup.NoChange
-	if ownerChanged && !accept {
-		w.ownerChanged = append(w.ownerChanged, s.ref)
+	if change != hadedup.NoChange && !accept {
+		w.list(s)
 	}
-	s.ownerChanged = ownerChanged && accept
+	s.decided = accept
 	return accept
 }
 
 // appended must be called with the reference returned by appending an accepted sample, which is zero if the append
-// failed. A rejected sample that changed the owner makes the series be forgotten, so that it can't make later valid
-// samples be dropped.
+// failed. A rejected sample that the tracker decided on makes the series be forgotten, so that the state it advanced
+// can't make later valid samples be dropped.
 func (w *haDedupWriter) appended(s *haDedupSeries, ref storage.SeriesRef) {
 	if !s.dedup {
 		return
 	}
+	decided := s.decided
+	s.decided = false
 	if ref == 0 {
-		if s.ownerChanged {
+		if decided {
 			w.forgetSeries(s.ref)
-			s.ownerChanged = false
 		}
 		return
 	}
@@ -244,21 +267,32 @@ func (w *haDedupWriter) appended(s *haDedupSeries, ref storage.SeriesRef) {
 		if !w.intern(s) {
 			return
 		}
-		s.ownerChanged = w.tracker.Init(ref, s.replica, s.pendingTs, w.horizon)
-		if s.ownerChanged {
-			w.counts.Elections++
-		}
 		w.counts.Accepted++
+		if !w.tracker.Init(ref, s.replica, s.pendingTs, w.horizon) {
+			return
+		}
+		w.counts.Elections++
 	}
-	if s.ownerChanged {
-		w.ownerChanged = append(w.ownerChanged, ref)
-		s.ownerChanged = false
+	w.list(s)
+}
+
+func (w *haDedupWriter) list(s *haDedupSeries) {
+	if !s.listed {
+		s.listed = true
+		w.changed = append(w.changed, s.ref)
 	}
 }
 
 // acceptExemplars reports whether exemplars of the series with the given head reference must be appended.
 func (w *haDedupWriter) acceptExemplars(s *haDedupSeries, ref storage.SeriesRef) bool {
-	return !s.dedup || w.tracker.IsOwner(ref, s.replica)
+	if !s.dedup {
+		return true
+	}
+	if !s.interned {
+		// A replica that is not interned owns no series, and its index is not valid.
+		return !w.tracker.Tracked(ref)
+	}
+	return w.tracker.IsOwner(ref, s.replica)
 }
 
 func isStaleHistogram(h *histogram.Histogram, fh *histogram.FloatHistogram) bool {
