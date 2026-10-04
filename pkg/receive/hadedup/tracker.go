@@ -30,9 +30,11 @@ const (
 	noTs       = math.MinInt64
 
 	// handoverFlag is set in seriesState.intervalMs while ownerLastTs holds the stale handover floor. Learned
-	// intervals are capped below it.
-	handoverFlag  = 1 << 31
-	maxIntervalMs = handoverFlag - 1
+	// intervals are capped below the two flags (about 12.4 days).
+	handoverFlag = 1 << 31
+	// staleFlag marks an owner whose newest accepted sample is stale, so takeover cannot retain it as standby.
+	staleFlag     = 1 << 30
+	maxIntervalMs = staleFlag - 1
 
 	// MaxReplicasLimit is the maximum allowed value of Config.MaxReplicas.
 	MaxReplicasLimit = noReplica
@@ -99,7 +101,7 @@ type seriesState struct {
 	ownerLastTs int64
 	// candLastTs is the timestamp of the newest sample seen from cand, noTs if cand is noReplica.
 	candLastTs int64
-	// intervalMs is the learned sample interval of the owner, 0 if unknown, possibly with handoverFlag set.
+	// intervalMs is the learned sample interval of the owner, 0 if unknown, possibly with handoverFlag or staleFlag set.
 	intervalMs uint32
 	owner      uint16
 	// cand is the non-owner replica with the newest samples that is still sending them, noReplica if none.
@@ -107,7 +109,7 @@ type seriesState struct {
 }
 
 func (s *seriesState) interval() uint32 {
-	return s.intervalMs &^ handoverFlag
+	return s.intervalMs &^ (handoverFlag | staleFlag)
 }
 
 type stripe struct {
@@ -427,7 +429,7 @@ func (t *Tracker) Forget(ref storage.SeriesRef) bool {
 // Init records replica as the owner of a series created by appending its sample at ts, unless another
 // writer created state for the series in the meantime. In that case both replicas' first samples may have
 // been appended. It returns true if it created the state.
-func (t *Tracker) Init(ref storage.SeriesRef, replica uint16, ts int64, h Horizon) bool {
+func (t *Tracker) Init(ref storage.SeriesRef, replica uint16, ts int64, h Horizon, stale bool) bool {
 	s := &t.stripes[uint64(ref)%numStripes]
 	s.mtx.Lock()
 	_, exists := s.series[ref]
@@ -435,7 +437,7 @@ func (t *Tracker) Init(ref storage.SeriesRef, replica uint16, ts int64, h Horizo
 		if s.series == nil {
 			s.series = map[storage.SeriesRef]seriesState{}
 		}
-		s.series[ref] = newOwnerState(replica, ts, 0, h)
+		s.series[ref] = newOwnerState(replica, ts, 0, h, stale)
 	}
 	s.mtx.Unlock()
 
@@ -470,7 +472,7 @@ func (t *Tracker) Tracked(ref storage.SeriesRef) bool {
 // that samples from the future can't take series over from a live owner.
 func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, h Horizon, stale bool) (accept bool, change Change) {
 	if !exists {
-		*s = newOwnerState(r, ts, 0, h)
+		*s = newOwnerState(r, ts, 0, h, stale)
 		return true, Elected
 	}
 
@@ -483,7 +485,7 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, h Hori
 			s.intervalMs &^= handoverFlag
 			s.ownerLastTs = min(ts, h.max)
 		}
-		if stale && s.cand != noReplica && !later(ts, s.candLastTs, t.timeout(s.interval())) {
+		if stale && ts >= s.ownerLastTs && s.cand != noReplica && !later(ts, s.candLastTs, t.timeout(s.interval())) {
 			// The series vanished only on the owner while another replica still produces it: hand the series
 			// over and drop the stale marker. The new owner may lag behind the old one, so its samples up to the
 			// newest one already appended are dropped instead of being appended out of order. Resetting cand makes
@@ -491,23 +493,29 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, h Hori
 			// back and forth.
 			s.owner, s.ownerLastTs = s.cand, max(s.ownerLastTs, s.candLastTs)
 			s.cand, s.candLastTs = noReplica, noTs
-			s.intervalMs |= handoverFlag
+			s.intervalMs = s.interval() | handoverFlag
 			return false, Handover
 		}
+		previousTs := s.ownerLastTs
 		switch {
 		case ts > h.max:
 			// The owner's own data is appended as without deduplication, but recording its timestamp would keep
 			// other replicas from taking over until then. The delta to it isn't an interval either.
 			s.ownerLastTs = max(s.ownerLastTs, h.max)
 		case ts > s.ownerLastTs:
-			s.intervalMs = learnInterval(s.intervalMs, ts-s.ownerLastTs)
+			s.intervalMs = learnInterval(s.interval(), ts-s.ownerLastTs)
 			s.ownerLastTs = ts
+		}
+		if stale && ts >= previousTs {
+			s.intervalMs |= staleFlag
+		} else if ts > previousTs {
+			s.intervalMs &^= staleFlag
 		}
 		return true, NoChange
 	}
 
 	if later(min(ts, h.now), s.ownerLastTs, t.timeout(s.interval())) {
-		*s = newOwnerState(r, ts, s.interval(), h)
+		*s = newOwnerState(r, ts, s.interval(), h, stale)
 		return true, Failover
 	}
 
@@ -523,11 +531,13 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, h Hori
 	// future doesn't take over either: appending it would make the owner's later samples out of order.
 	if ts > s.ownerLastTs && ts <= h.now && t.prefers(r, s.owner) {
 		old := *s
-		*s = newOwnerState(r, ts, old.interval(), h)
-		// The old owner is live, so a stale marker of the new owner must hand the series back to it instead of ending
-		// it. After a handover, ownerLastTs is the floor rather than a sample of the owner, which may not be live.
-		if old.intervalMs&handoverFlag == 0 {
-			s.cand, s.candLastTs = old.owner, old.ownerLastTs
+		*s = newOwnerState(r, ts, old.interval(), h, false)
+		if old.cand != r {
+			s.cand, s.candLastTs = old.cand, old.candLastTs
+		}
+		// Keep the freshest live standby. A stale owner or a handover floor is not evidence of a live old owner.
+		if last := min(old.ownerLastTs, h.now); old.intervalMs&(handoverFlag|staleFlag) == 0 && last > s.candLastTs {
+			s.cand, s.candLastTs = old.owner, last
 		}
 		return true, Takeover
 	}
@@ -562,7 +572,10 @@ func (t *Tracker) storeValues() {
 // newOwnerState returns the state of a series whose owner became r with its sample at ts. A new owner's timestamp is
 // recorded at most at the current time, so that a single sample from the future can't hold the series beyond the
 // failover timeout. A live owner whose clock is ahead moves it forward with its next sample.
-func newOwnerState(r uint16, ts int64, intervalMs uint32, h Horizon) seriesState {
+func newOwnerState(r uint16, ts int64, intervalMs uint32, h Horizon, stale bool) seriesState {
+	if stale {
+		intervalMs |= staleFlag
+	}
 	return seriesState{owner: r, ownerLastTs: min(ts, h.now), intervalMs: intervalMs, cand: noReplica, candLastTs: noTs}
 }
 

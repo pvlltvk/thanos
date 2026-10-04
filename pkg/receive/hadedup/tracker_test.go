@@ -522,6 +522,107 @@ func TestTrackerAccept(t *testing.T) {
 			expectedTakeovers: 1,
 		},
 		{
+			name: "takeover keeps the freshest third replica as standby",
+			steps: []step{
+				{replica: b, ts: 0, accept: true, ownerChanged: true},
+				{replica: b, ts: 10000, accept: true},
+				{replica: b, ts: 20000, accept: true},
+				{replica: c, ts: 25000, accept: false},
+				{replica: a, ts: 26000, accept: true, ownerChanged: true},
+				{replica: a, ts: 36000, stale: true, accept: false, ownerChanged: true},
+				{replica: c, ts: 35000, accept: true},
+				{replica: c, ts: 45000, accept: true},
+			},
+			expectedOwner:     c,
+			expectedTakeovers: 1,
+		},
+		{
+			name: "takeover excludes an owner that accepted stale",
+			steps: []step{
+				{replica: b, ts: 0, accept: true, ownerChanged: true},
+				{replica: b, ts: 10000, accept: true},
+				{replica: b, ts: 20000, stale: true, accept: true},
+				{replica: a, ts: 25000, accept: true, ownerChanged: true},
+				{replica: a, ts: 35000, stale: true, accept: true},
+			},
+			expectedOwner:     a,
+			expectedTakeovers: 1,
+		},
+		{
+			name: "takeover excludes an owner elected with stale",
+			steps: []step{
+				{replica: b, ts: 0, stale: true, accept: true, ownerChanged: true},
+				{replica: a, ts: 5000, accept: true, ownerChanged: true},
+				{replica: a, ts: 10000, stale: true, accept: true},
+			},
+			expectedOwner:     a,
+			expectedTakeovers: 1,
+		},
+		{
+			name: "takeover excludes an owner failed over with stale",
+			steps: []step{
+				{replica: c, ts: 0, accept: true, ownerChanged: true},
+				{replica: c, ts: 10000, accept: true},
+				{replica: b, ts: 30000, stale: true, accept: true, ownerChanged: true},
+				{replica: a, ts: 35000, accept: true, ownerChanged: true},
+				{replica: a, ts: 40000, stale: true, accept: true},
+			},
+			expectedOwner:     a,
+			expectedFailovers: 1,
+			expectedTakeovers: 1,
+		},
+		{
+			name: "new owner samples resume liveness after stale",
+			steps: []step{
+				{replica: b, ts: 0, accept: true, ownerChanged: true},
+				{replica: b, ts: 10000, accept: true},
+				{replica: b, ts: 20000, stale: true, accept: true},
+				{replica: b, ts: 30000, accept: true},
+				{replica: a, ts: 35000, accept: true, ownerChanged: true},
+				{replica: a, ts: 40000, stale: true, accept: false, ownerChanged: true},
+				{replica: b, ts: 45000, accept: true},
+			},
+			expectedOwner:     b,
+			expectedTakeovers: 1,
+		},
+		{
+			name: "older owner samples do not resume liveness after stale",
+			steps: []step{
+				{replica: b, ts: 0, accept: true, ownerChanged: true},
+				{replica: b, ts: 10000, accept: true},
+				{replica: b, ts: 20000, stale: true, accept: true},
+				{replica: b, ts: 15000, accept: true},
+				{replica: a, ts: 25000, accept: true, ownerChanged: true},
+				{replica: a, ts: 35000, stale: true, accept: true},
+			},
+			expectedOwner:     a,
+			expectedTakeovers: 1,
+		},
+		{
+			name: "older stale owner samples do not end liveness",
+			steps: []step{
+				{replica: b, ts: 0, accept: true, ownerChanged: true},
+				{replica: b, ts: 10000, accept: true},
+				{replica: b, ts: 20000, accept: true},
+				{replica: b, ts: 15000, stale: true, accept: true},
+				{replica: a, ts: 25000, accept: true, ownerChanged: true},
+				{replica: a, ts: 30000, stale: true, accept: false, ownerChanged: true},
+			},
+			expectedOwner:     b,
+			expectedTakeovers: 1,
+		},
+		{
+			name: "older stale marker does not hand over to standby",
+			steps: []step{
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
+				{replica: a, ts: 10000, accept: true},
+				{replica: b, ts: 15000, accept: false},
+				{replica: a, ts: 20000, accept: true},
+				{replica: a, ts: 15000, stale: true, accept: true},
+			},
+			expectedOwner: a,
+		},
+		{
 			name: "takeover of a handed over series has no standby",
 			steps: []step{
 				{replica: b, ts: 0, accept: true, ownerChanged: true},
@@ -644,9 +745,9 @@ func TestTrackerInit(t *testing.T) {
 	a, _ := tr.Replica("a")
 	b, _ := tr.Replica("b")
 
-	require.True(t, tr.Init(1, a, 0, tr.Horizon()))
+	require.True(t, tr.Init(1, a, 0, tr.Horizon(), false))
 	// A concurrent writer of the other replica created the series too, the first owner is kept.
-	require.False(t, tr.Init(1, b, 1000, tr.Horizon()))
+	require.False(t, tr.Init(1, b, 1000, tr.Horizon(), false))
 	require.True(t, tr.IsOwner(1, a))
 	require.False(t, tr.IsOwner(1, b))
 	require.False(t, acceptOnly(tr, 1, b, 2000))
@@ -655,11 +756,18 @@ func TestTrackerInit(t *testing.T) {
 
 	// The first sample of a new owner is recorded at most at the current time.
 	h := tr.Horizon()
-	require.True(t, tr.Init(2, b, h.max+1, h))
+	require.True(t, tr.Init(2, b, h.max+1, h, false))
 	require.Equal(t, h.now, trackedState(tr, 2).ownerLastTs)
-	require.True(t, tr.Init(3, b, h.now-1, h))
+	require.True(t, tr.Init(3, b, h.now-1, h, false))
 	require.Equal(t, h.now-1, trackedState(tr, 3).ownerLastTs)
 	require.Equal(t, 3.0, promtest.ToFloat64(tr.metrics.trackedSeries))
+
+	require.True(t, tr.Init(4, b, 0, h, true))
+	require.NotZero(t, trackedState(tr, 4).intervalMs&staleFlag)
+	require.True(t, acceptOnly(tr, 4, a, 5000))
+	accept, change := tr.Accept(4, a, 10000, h, true)
+	require.True(t, accept)
+	require.Equal(t, NoChange, change)
 }
 
 func trackedState(tr *Tracker, ref storage.SeriesRef) seriesState {
@@ -1111,10 +1219,10 @@ func TestLearnInterval(t *testing.T) {
 	require.Equal(t, uint32(10000), learnInterval(10000, 0))
 	require.Equal(t, uint32(10000), learnInterval(10000, -5))
 
-	// The top bit is reserved for handoverFlag.
+	// The top two bits are reserved for handoverFlag and staleFlag.
 	require.Equal(t, uint32(10000), learnInterval(10000, maxIntervalMs+1))
 	require.Equal(t, uint32(maxIntervalMs), learnInterval(maxIntervalMs-1, maxIntervalMs))
-	require.Zero(t, learnInterval(maxIntervalMs/2+1, maxIntervalMs)&handoverFlag)
+	require.Zero(t, learnInterval(maxIntervalMs/2+1, maxIntervalMs)&(handoverFlag|staleFlag))
 }
 
 func TestTrackerConcurrent(t *testing.T) {
@@ -1148,7 +1256,7 @@ func TestTrackerConcurrent(t *testing.T) {
 		r, ok := tr.Replica("replica-2")
 		require.True(t, ok)
 		for i := range 1000 {
-			tr.Init(storage.SeriesRef(i%100), r, int64(i*15000), tr.Horizon())
+			tr.Init(storage.SeriesRef(i%100), r, int64(i*15000), tr.Horizon(), false)
 		}
 		tr.Record(Counts{Accepted: 1000})
 	})

@@ -343,30 +343,85 @@ func TestWriterHADedupStaleHandoverAfterTakeover(t *testing.T) {
 	sample := func(replica string, ts int64, v float64) haDedupWrite {
 		return haDedupWrite{series: []prompb.TimeSeries{{
 			Labels:  withReplicaLabel(lbls, replica),
-			Samples: []prompb.Sample{{Value: v, Timestamp: ts}},
+			Samples: []prompb.Sample{{Value: v, Timestamp: base + ts}},
 		}}}
 	}
 	stale := math.Float64frombits(value.StaleNaN)
 
-	for _, capnp := range []bool{false, true} {
-		t.Run(fmt.Sprintf("capnp=%v", capnp), func(t *testing.T) {
+	for _, tcase := range []struct {
+		name     string
+		writes   []haDedupWrite
+		expected []int64
+	}{
+		{
+			name: "live old owner",
+			writes: []haDedupWrite{
+				sample("prometheus-1", 0, 1), sample("prometheus-1", 10000, 1), sample("prometheus-1", 20000, 1),
+				sample("prometheus-0", 25000, 1), sample("prometheus-0", 30000, stale),
+				sample("prometheus-1", 30000, 1), sample("prometheus-1", 40000, 1),
+			},
+			expected: []int64{0, 10000, 20000, 25000, 30000, 40000},
+		},
+		{
+			name: "fresher third replica",
+			writes: []haDedupWrite{
+				sample("prometheus-1", 0, 1), sample("prometheus-1", 10000, 1), sample("prometheus-1", 20000, 1),
+				sample("prometheus-2", 25000, 1), sample("prometheus-0", 26000, 1), sample("prometheus-0", 36000, stale),
+				sample("prometheus-2", 35000, 1), sample("prometheus-2", 45000, 1),
+			},
+			expected: []int64{0, 10000, 20000, 26000, 35000, 45000},
+		},
+		{
+			name: "stale old owner",
+			writes: []haDedupWrite{
+				sample("prometheus-1", 0, 1), sample("prometheus-1", 10000, 1), sample("prometheus-1", 20000, stale),
+				sample("prometheus-0", 25000, 1), sample("prometheus-0", 35000, stale),
+			},
+			expected: []int64{0, 10000, 20000, 25000, 35000},
+		},
+		{
+			name: "failover sample stale",
+			writes: []haDedupWrite{
+				sample("prometheus-2", 0, 1), sample("prometheus-2", 10000, 1), sample("prometheus-1", 30000, stale),
+				sample("prometheus-0", 35000, 1), sample("prometheus-0", 40000, stale),
+			},
+			expected: []int64{0, 10000, 30000, 35000, 40000},
+		},
+		{
+			name: "old owner resumes after stale",
+			writes: []haDedupWrite{
+				sample("prometheus-1", 0, 1), sample("prometheus-1", 10000, 1), sample("prometheus-1", 20000, stale),
+				sample("prometheus-1", 30000, 1), sample("prometheus-0", 35000, 1), sample("prometheus-0", 40000, stale),
+				sample("prometheus-1", 45000, 1),
+			},
+			expected: []int64{0, 10000, 20000, 30000, 35000, 45000},
+		},
+		{
+			name: "first sample stale",
+			writes: []haDedupWrite{
+				sample("prometheus-1", 0, stale), sample("prometheus-0", 5000, 1), sample("prometheus-0", 10000, stale),
+			},
+			expected: []int64{0, 5000, 10000},
+		},
+	} {
+		t.Run(tcase.name, func(t *testing.T) {
 			t.Parallel()
-
-			m := newHADedupMultiTSDB(t, prometheus.NewRegistry(), labels.FromStrings("replica", "01"), WithHADedup(testHADedupConfig()))
-			writeHADedupRequests(t, m, capnp, []haDedupWrite{
-				sample("prometheus-1", base, 1),
-				sample("prometheus-1", base+10000, 1),
-				sample("prometheus-1", base+20000, 1),
-				// The preferred replica takes over, then the target vanishes on it only.
-				sample("prometheus-0", base+25000, 1),
-				sample("prometheus-0", base+30000, stale),
-				sample("prometheus-1", base+30000, 1),
-				sample("prometheus-1", base+40000, 1),
-			})
-
-			require.Equal(t, map[string]storedSeries{
-				`{__name__="up"}`: {floats: []int64{base, base + 10000, base + 20000, base + 25000, base + 30000, base + 40000}},
-			}, readTenantSeries(t, m))
+			for _, capnp := range []bool{false, true} {
+				t.Run(fmt.Sprintf("capnp=%v", capnp), func(t *testing.T) {
+					t.Parallel()
+					cfg := testHADedupConfig()
+					cfg.MaxReplicas = 3
+					m := newHADedupMultiTSDB(t, prometheus.NewRegistry(), labels.FromStrings("replica", "01"), WithHADedup(cfg))
+					writeHADedupRequests(t, m, capnp, tcase.writes)
+					expected := make([]int64, len(tcase.expected))
+					for i, ts := range tcase.expected {
+						expected[i] = base + ts
+					}
+					require.Equal(t, map[string]storedSeries{
+						`{__name__="up"}`: {floats: expected},
+					}, readTenantSeries(t, m))
+				})
+			}
 		})
 	}
 }
@@ -1149,7 +1204,7 @@ func TestHADedupSeries(t *testing.T) {
 	require.Equal(t, []storage.SeriesRef{7}, w.changed)
 
 	// So does a failed append of an accepted sample of the owner, whose state it advanced.
-	require.True(t, tracker.Init(10, r0, 0, w.horizon))
+	require.True(t, tracker.Init(10, r0, 0, w.horizon, false))
 	s5 := haDedupSeries{dedup: true, replica: r0, interned: true}
 	require.True(t, w.accept(&s5, 10, 15000, false))
 	w.appended(&s5, 0)
@@ -1157,7 +1212,7 @@ func TestHADedupSeries(t *testing.T) {
 	require.Equal(t, []storage.SeriesRef{7}, w.changed)
 
 	// The reference is known from the first sample even if its append fails.
-	require.True(t, tracker.Init(8, r0, 15000, w.horizon))
+	require.True(t, tracker.Init(8, r0, 15000, w.horizon, false))
 	s2 := haDedupSeries{dedup: true, replica: r0, interned: true}
 	require.True(t, w.accept(&s2, 8, 20000, false))
 	w.appended(&s2, 0)
@@ -1178,7 +1233,7 @@ func TestHADedupSeries(t *testing.T) {
 	require.False(t, tracker.Tracked(8))
 
 	// A failover and a handover of the same series in one request list it once.
-	require.True(t, tracker.Init(9, r0, 0, w.horizon))
+	require.True(t, tracker.Init(9, r0, 0, w.horizon, false))
 	s3 := haDedupSeries{dedup: true, replica: r1, interned: true}
 	require.True(t, w.accept(&s3, 9, 90000, false))
 	w.appended(&s3, 9)

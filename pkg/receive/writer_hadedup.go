@@ -196,9 +196,10 @@ type haDedupSeries struct {
 
 	// ref is the last known head reference of the series. Appends return a zero reference on error, which must not
 	// make later samples of the series bypass the tracker.
-	ref       storage.SeriesRef
-	pending   bool
-	pendingTs int64
+	ref          storage.SeriesRef
+	pending      bool
+	pendingTs    int64
+	pendingStale bool
 	// decided is set while a sample accepted by the tracker is appended, see appended.
 	decided bool
 	// listed is set once the series is in haDedupWriter.changed.
@@ -217,7 +218,7 @@ func (w *haDedupWriter) accept(s *haDedupSeries, ref storage.SeriesRef, ts int64
 	if s.ref == 0 {
 		// The series doesn't exist in the head yet, so there's no state to decide on: the appended sample elects
 		// its replica once the series has a reference.
-		s.pending, s.pendingTs = true, ts
+		s.pending, s.pendingTs, s.pendingStale = true, ts, stale
 		return true
 	}
 	if !w.intern(s) {
@@ -268,7 +269,7 @@ func (w *haDedupWriter) appended(s *haDedupSeries, ref storage.SeriesRef) {
 			return
 		}
 		w.counts.Accepted++
-		if !w.tracker.Init(ref, s.replica, s.pendingTs, w.horizon) {
+		if !w.tracker.Init(ref, s.replica, s.pendingTs, w.horizon, s.pendingStale) {
 			return
 		}
 		w.counts.Elections++
