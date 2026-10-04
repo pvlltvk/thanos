@@ -1344,64 +1344,70 @@ thanos_receive_ha_dedup_samples_total{outcome="dropped",tenant=%[1]q} 2
 func TestWriterHADedupFutureSamples(t *testing.T) {
 	t.Parallel()
 
-	now := time.Now().UnixMilli()
 	hour := time.Hour.Milliseconds()
-	sample := func(replica string, ts int64) haDedupWrite {
-		return haDedupWrite{ts: ts, series: []prompb.TimeSeries{{
-			Labels:  withReplicaLabel([]labelpb.ZLabel{{Name: "__name__", Value: "up"}}, replica),
-			Samples: []prompb.Sample{{Value: 1, Timestamp: ts}},
-		}}}
+	type write struct {
+		replica string
+		// ts is relative to the time the subtest starts, as the tracker compares timestamps with the current time.
+		ts int64
 	}
 
 	for _, tcase := range []struct {
 		name           string
 		tooFarInFuture time.Duration
-		writes         []haDedupWrite
+		writes         []write
 		expected       []int64
 	}{
 		{
 			// A sample from the future of another replica must not suppress a live owner.
 			name: "without window",
-			writes: []haDedupWrite{
-				sample("prometheus-0", now-15000),
-				sample("prometheus-0", now),
-				sample("made-up", now+hour),
-				sample("prometheus-0", now+15000),
+			writes: []write{
+				{"prometheus-0", -15000},
+				{"prometheus-0", 0},
+				{"made-up", hour},
+				{"prometheus-0", 15000},
 			},
-			expected: []int64{now - 15000, now, now + 15000},
+			expected: []int64{-15000, 0, 15000},
 		},
 		{
 			name:           "within window",
 			tooFarInFuture: 5 * time.Minute,
-			writes: []haDedupWrite{
-				sample("prometheus-0", now-15000),
-				sample("prometheus-0", now),
-				sample("made-up", now+(4*time.Minute).Milliseconds()),
-				sample("prometheus-0", now+15000),
+			writes: []write{
+				{"prometheus-0", -15000},
+				{"prometheus-0", 0},
+				{"made-up", (4 * time.Minute).Milliseconds()},
+				{"prometheus-0", 15000},
 			},
-			expected: []int64{now - 15000, now, now + 15000},
+			expected: []int64{-15000, 0, 15000},
 		},
 		{
 			// The owner stopped 45s ago and the clock of the other replica is an hour ahead.
 			name: "dead owner and replica with a clock ahead",
-			writes: []haDedupWrite{
-				sample("prometheus-0", now-60000),
-				sample("prometheus-0", now-45000),
-				sample("prometheus-1", now+hour),
-				sample("prometheus-1", now+hour+15000),
+			writes: []write{
+				{"prometheus-0", -60000},
+				{"prometheus-0", -45000},
+				{"prometheus-1", hour},
+				{"prometheus-1", hour + 15000},
 			},
-			expected: []int64{now - 60000, now - 45000, now + hour, now + hour + 15000},
+			expected: []int64{-60000, -45000, hour, hour + 15000},
 		},
 	} {
 		for _, capnp := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/capnp=%v", tcase.name, capnp), func(t *testing.T) {
 				t.Parallel()
 
+				now := time.Now().UnixMilli()
 				m := newHADedupMultiTSDB(t, prometheus.NewRegistry(), labels.FromStrings("replica", "01"), WithHADedup(testHADedupConfig()))
 				for _, wr := range tcase.writes {
-					require.NoError(t, writeHADedupRequest(t, m, capnp, tcase.tooFarInFuture, wr.series))
+					require.NoError(t, writeHADedupRequest(t, m, capnp, tcase.tooFarInFuture, []prompb.TimeSeries{{
+						Labels:  withReplicaLabel([]labelpb.ZLabel{{Name: "__name__", Value: "up"}}, wr.replica),
+						Samples: []prompb.Sample{{Value: 1, Timestamp: now + wr.ts}},
+					}}))
 				}
-				require.Equal(t, map[string]storedSeries{`{__name__="up"}`: {floats: tcase.expected}}, readTenantSeries(t, m))
+				expected := make([]int64, 0, len(tcase.expected))
+				for _, ts := range tcase.expected {
+					expected = append(expected, now+ts)
+				}
+				require.Equal(t, map[string]storedSeries{`{__name__="up"}`: {floats: expected}}, readTenantSeries(t, m))
 			})
 		}
 	}
