@@ -653,7 +653,7 @@ func TestTrackerAccept(t *testing.T) {
 
 			now := time.UnixMilli(testNow)
 			tr := newTestTracker(testConfig(), &now)
-			var failovers, takeovers int
+			var elections, failovers, takeovers int
 			for i, s := range tcase.steps {
 				if s.now != 0 {
 					now = time.UnixMilli(s.now)
@@ -664,6 +664,8 @@ func TestTrackerAccept(t *testing.T) {
 				require.Equal(t, s.accept, accept, "step %d: %+v", i, s)
 				require.Equal(t, s.ownerChanged, change != NoChange, "step %d: %+v", i, s)
 				switch change {
+				case Elected:
+					elections++
 				case Failover:
 					failovers++
 				case Takeover:
@@ -674,6 +676,7 @@ func TestTrackerAccept(t *testing.T) {
 			owner, ok := tr.Replica(tcase.expectedOwner)
 			require.True(t, ok)
 			require.True(t, tr.IsOwner(1, owner))
+			require.Equal(t, 1, elections)
 			require.Equal(t, tcase.expectedFailovers, failovers)
 			require.Equal(t, tcase.expectedTakeovers, takeovers)
 			require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.trackedSeries))
@@ -1099,6 +1102,8 @@ func TestTrackerStaleHandoverToFutureStandby(t *testing.T) {
 	accept, change = tr.Accept(1, r, now.UnixMilli(), tr.Horizon(), false)
 	require.True(t, accept)
 	require.Equal(t, Failover, change)
+	require.Zero(t, trackedState(tr, 1).intervalMs&handoverFlag)
+	require.True(t, acceptOnly(tr, 1, r, now.UnixMilli()-1000), "older samples of the new owner are accepted")
 }
 
 func TestTrackerGCRemovesFutureState(t *testing.T) {
@@ -1186,6 +1191,33 @@ func TestTrackerReplicaGC(t *testing.T) {
 		require.True(t, acceptOnly(tr, storage.SeriesRef(100+i), r0, ts()))
 		require.False(t, acceptOnly(tr, storage.SeriesRef(100+i), r1, ts()+1000))
 	}
+}
+
+func TestTrackerReplicaGCKeepsLookedUpReplica(t *testing.T) {
+	t.Parallel()
+
+	cfg := testConfig()
+	cfg.StateTTL = 5 * time.Minute
+	now := time.UnixMilli(1_700_000_000_000)
+	tr := newTestTracker(cfg, &now)
+
+	// No series references the replica, only lookups keep it.
+	a, ok := tr.Replica("a")
+	require.True(t, ok)
+	for range 10 {
+		now = now.Add(time.Minute)
+		r, ok, _ := tr.LookupReplica("a")
+		require.True(t, ok)
+		require.Equal(t, a, r)
+		tr.GC()
+	}
+	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.replicas))
+
+	now = now.Add(cfg.StateTTL + time.Second)
+	tr.GC()
+	_, ok, _ = tr.LookupReplica("a")
+	require.False(t, ok)
+	require.Zero(t, promtest.ToFloat64(tr.metrics.replicas))
 }
 
 func TestLearnInterval(t *testing.T) {

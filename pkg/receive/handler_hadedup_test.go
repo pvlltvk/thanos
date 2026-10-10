@@ -6,6 +6,7 @@ package receive
 import (
 	"fmt"
 	"net/http"
+	"slices"
 	"testing"
 	"time"
 
@@ -110,12 +111,14 @@ func TestHandlerHADedup(t *testing.T) {
 			}
 
 			copies := map[string]int{}
+			phases := map[string][]int64{}
 			for _, m := range dbs {
 				for lset, s := range readTenantSeries(t, m) {
 					copies[lset]++
 
 					// No stored series may interleave samples of both replicas.
 					require.Len(t, s.floats, numScrapes, lset)
+					phases[lset] = append(phases[lset], s.floats[0]%interval)
 					for _, ts := range s.floats {
 						require.Equal(t, s.floats[0]%interval, ts%interval, lset)
 					}
@@ -128,6 +131,8 @@ func TestHandlerHADedup(t *testing.T) {
 				for lset, n := range copies {
 					require.Equal(t, replicationFactor, n, lset)
 					require.NotContains(t, lset, testHADedupReplicaLabel)
+					// All copies are owned by the same replica.
+					require.Len(t, slices.Compact(phases[lset]), 1, lset)
 				}
 			case tc.ingestorDedup:
 				// Twins may land on different ingestors: duplicates as today, but never mixed into one series.

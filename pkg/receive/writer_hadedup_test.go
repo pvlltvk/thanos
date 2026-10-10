@@ -9,6 +9,7 @@ import (
 	"math"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1254,6 +1255,27 @@ thanos_receive_ha_dedup_tracked_series 0
 `), "thanos_receive_ha_dedup_tracked_series"))
 }
 
+func TestHADedupSeriesElectedByAnotherWriter(t *testing.T) {
+	t.Parallel()
+
+	tracker := hadedup.NewTracker(log.NewNopLogger(), testHADedupConfig(), prometheus.NewRegistry())
+	r0, _ := tracker.Replica("prometheus-0")
+	r1, _ := tracker.Replica("prometheus-1")
+	w := haDedupWriter{tracker: tracker, horizon: tracker.Horizon()}
+
+	// Another writer elects its replica between the append that created the series and the election of this one.
+	s := haDedupSeries{dedup: true, replica: r1, interned: true}
+	require.True(t, w.accept(&s, 0, 5000, false))
+	require.True(t, tracker.Init(7, r0, 0, w.horizon, false))
+	w.appended(&s, 7)
+	require.True(t, tracker.IsOwner(7, r0))
+	require.Empty(t, w.changed, "the state is not based on samples of this request")
+	require.Equal(t, hadedup.Counts{Accepted: 1}, w.counts)
+
+	w.forget()
+	require.True(t, tracker.IsOwner(7, r0))
+}
+
 func TestHADedupWriterReplicaCache(t *testing.T) {
 	t.Parallel()
 
@@ -1603,6 +1625,66 @@ thanos_receive_ha_dedup_tracked_series{tenant=%[1]q} 2
 `, tenancy.DefaultTenant)), "thanos_receive_ha_dedup_forgotten_total", "thanos_receive_ha_dedup_passthrough_total", "thanos_receive_ha_dedup_tracked_series"))
 			})
 		}
+	}
+}
+
+func TestWriterHADedupConcurrentReplicas(t *testing.T) {
+	t.Parallel()
+
+	const (
+		numScrapes = 20
+		interval   = int64(15000)
+		offset     = int64(5000)
+	)
+	for _, capnp := range []bool{false, true} {
+		t.Run(fmt.Sprintf("capnp=%v", capnp), func(t *testing.T) {
+			t.Parallel()
+
+			reg := prometheus.NewRegistry()
+			m := newHADedupMultiTSDB(t, reg, labels.FromStrings("replica", "01"), WithHADedup(testHADedupConfig()))
+			replicas := haReplicaRequests("host")
+			numSeries := len(replicas[0])
+			write := func(r int, ts int64) error {
+				for i := range replicas[r] {
+					replicas[r][i].Samples[0].Timestamp = ts + int64(r)*offset
+				}
+				return writeHADedupRequest(t, m, capnp, 0, replicas[r])
+			}
+
+			// Both replicas create the series and keep writing them concurrently. Their samples may be decided on in
+			// one order and committed in the other, which the head rejects as out of order, a conflict for clients.
+			base := time.Now().Add(-time.Hour).UnixMilli()
+			var wg sync.WaitGroup
+			for r := range replicas {
+				wg.Go(func() {
+					for i := range int64(numScrapes) {
+						if err := write(r, base+i*interval); err != nil && errors.Cause(err) != errConflict {
+							t.Errorf("replica %d, scrape %d: %v", r, i, err)
+						}
+					}
+				})
+			}
+			wg.Wait()
+
+			// Every series ends up owned by the preferred replica.
+			processed := sumCounter(t, reg, "thanos_receive_ha_dedup_samples_total")
+			last := base + numScrapes*interval
+			require.NoError(t, write(0, last))
+			require.NoError(t, write(1, last))
+			require.Equal(t, processed+float64(2*numSeries), sumCounter(t, reg, "thanos_receive_ha_dedup_samples_total"))
+
+			stored := readTenantSeries(t, m)
+			require.Len(t, stored, numSeries)
+			for lset, s := range stored {
+				require.NotContains(t, lset, testHADedupReplicaLabel)
+				require.Equal(t, last, s.floats[len(s.floats)-1], lset)
+			}
+			require.NoError(t, promtest.GatherAndCompare(reg, strings.NewReader(fmt.Sprintf(`
+# HELP thanos_receive_ha_dedup_tracked_series Number of series tracked by HA deduplication.
+# TYPE thanos_receive_ha_dedup_tracked_series gauge
+thanos_receive_ha_dedup_tracked_series{tenant=%q} %d
+`, tenancy.DefaultTenant, numSeries)), "thanos_receive_ha_dedup_tracked_series"))
+		})
 	}
 }
 
