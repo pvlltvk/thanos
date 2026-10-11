@@ -638,7 +638,9 @@ func (t *tenant) close(cd closeDelete) {
 		}
 
 		t.readyS.set(nil)
+		t.mtx.Lock()
 		t.setComponents(nil, nil, nil, nil, nil, nil)
+		t.mtx.Unlock()
 	})
 }
 

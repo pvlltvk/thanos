@@ -1073,6 +1073,35 @@ func TestMultiTSDBHADedupTrackerCreatedWithTenant(t *testing.T) {
 	require.Same(t, tenant.haDedupTracker(), tracker)
 }
 
+func TestMultiTSDBHADedupTrackerLookupDuringClose(t *testing.T) {
+	t.Parallel()
+
+	m := newHADedupMultiTSDB(t, prometheus.NewRegistry(), labels.FromStrings("replica", "01"), WithHADedup(testHADedupConfig()))
+	_, err := m.TenantAppendable("foo")
+	require.NoError(t, err)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					_, _ = m.TenantHADedupTracker("foo")
+				}
+			}
+		})
+	}
+	m.Close()
+	close(stop)
+	wg.Wait()
+
+	_, err = m.TenantHADedupTracker("foo")
+	require.ErrorIs(t, err, tsdb.ErrNotReady)
+}
+
 type notReadyHADedupStorage struct {
 	TenantStorage
 }
