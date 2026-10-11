@@ -306,6 +306,74 @@ func TestTrackerAccept(t *testing.T) {
 			expectedOwner: a,
 		},
 		{
+			name: "late stale marker of the standby does not end its newer samples",
+			steps: []step{
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
+				{replica: a, ts: 15000, accept: true},
+				{replica: b, ts: 20000, accept: false},
+				{replica: b, ts: 5000, stale: true, accept: false},
+				{replica: a, ts: 30000, stale: true, accept: false, ownerChanged: true},
+				{replica: b, ts: 35000, accept: true},
+			},
+			expectedOwner: b,
+		},
+		{
+			name: "stale owner fails over after its learned timeout",
+			steps: []step{
+				{replica: b, ts: 0, accept: true, ownerChanged: true},
+				{replica: b, ts: 10000, accept: true},
+				{replica: b, ts: 20000, stale: true, accept: true},
+				// The timeout is 1.5 * 10s, not the default or the max.
+				{replica: c, ts: 40000, accept: true, ownerChanged: true},
+			},
+			expectedOwner:     c,
+			expectedFailovers: 1,
+		},
+		{
+			name: "handover clears the stale owner flag",
+			steps: []step{
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
+				{replica: a, ts: 10000, accept: true},
+				{replica: a, ts: 20000, stale: true, accept: true},
+				{replica: b, ts: 25000, accept: false},
+				{replica: a, ts: 30000, stale: true, accept: false, ownerChanged: true},
+				{replica: b, ts: 35000, accept: true},
+				// b is live, so the takeover keeps it as standby for a's stale marker.
+				{replica: a, ts: 36000, accept: true, ownerChanged: true},
+				{replica: a, ts: 46000, stale: true, accept: false, ownerChanged: true},
+			},
+			expectedOwner:     b,
+			expectedTakeovers: 1,
+		},
+		{
+			name: "chained takeovers keep the middle replica as standby",
+			steps: []step{
+				{replica: c, ts: 0, accept: true, ownerChanged: true},
+				{replica: c, ts: 10000, accept: true},
+				{replica: c, ts: 20000, accept: true},
+				{replica: b, ts: 25000, accept: true, ownerChanged: true},
+				{replica: a, ts: 26000, accept: true, ownerChanged: true},
+				{replica: a, ts: 36000, stale: true, accept: false, ownerChanged: true},
+				{replica: b, ts: 40000, accept: true},
+			},
+			expectedOwner:     b,
+			expectedTakeovers: 2,
+		},
+		{
+			name: "takeover by the standby keeps the old owner as standby",
+			steps: []step{
+				{replica: b, ts: testNow - 20000, accept: true, ownerChanged: true},
+				{replica: b, ts: testNow - 10000, accept: true},
+				// Becomes standby at the current time, but can't take over from the future.
+				{replica: a, ts: testNow + 100000, accept: false},
+				{replica: a, ts: testNow - 5000, accept: true, ownerChanged: true},
+				{replica: a, ts: testNow - 1000, stale: true, accept: false, ownerChanged: true},
+				{replica: b, ts: testNow - 500, accept: true},
+			},
+			expectedOwner:     b,
+			expectedTakeovers: 1,
+		},
+		{
 			name: "lagging owner loses the series to the current replica",
 			steps: []step{
 				{replica: a, ts: 0, accept: true, ownerChanged: true},
@@ -823,6 +891,23 @@ func TestTrackerHorizon(t *testing.T) {
 	st = trackedState(tr, 1)
 	require.Equal(t, b, st.cand)
 	require.Equal(t, tr.Horizon().now, st.candLastTs)
+}
+
+func TestTrackerStaleFlag(t *testing.T) {
+	t.Parallel()
+
+	now := time.UnixMilli(testNow)
+	tr := newTestTracker(testConfig(), &now)
+	a, _ := tr.Replica("a")
+
+	require.True(t, acceptOnly(tr, 1, a, testNow-30000))
+	accept, _ := tr.Accept(1, a, testNow-30000, tr.Horizon(), true)
+	require.True(t, accept)
+	require.NotZero(t, trackedState(tr, 1).intervalMs&staleFlag, "stale marker at the newest timestamp")
+
+	// An owner sample beyond the horizon learns no interval, but still ends the staleness.
+	require.True(t, acceptOnly(tr, 1, a, testNow+time.Hour.Milliseconds()))
+	require.Zero(t, trackedState(tr, 1).intervalMs&staleFlag)
 }
 
 func TestTrackerTimeout(t *testing.T) {

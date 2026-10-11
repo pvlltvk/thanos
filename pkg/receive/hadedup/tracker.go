@@ -520,8 +520,9 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, h Hori
 	}
 
 	if stale {
-		// A replica that sent a stale marker no longer produces the series, so it can't take it over.
-		if s.cand == r {
+		// A replica that sent a stale marker no longer produces the series, so it can't take it over. A stale marker
+		// older than the replica's newest sample was delivered late and doesn't end it.
+		if s.cand == r && min(ts, h.now) >= s.candLastTs {
 			s.cand, s.candLastTs = noReplica, noTs
 		}
 		return false, NoChange
