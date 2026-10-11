@@ -521,8 +521,10 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, h Hori
 
 	if stale {
 		// A replica that sent a stale marker no longer produces the series, so it can't take it over. A stale marker
-		// older than the replica's newest sample was delivered late and doesn't end it.
-		if s.cand == r && min(ts, h.now) >= s.candLastTs {
+		// older than the replica's newest sample was delivered late and doesn't end it. candLastTs is already bounded
+		// by the horizon that recorded it: bounding ts by this request's horizon, which may have been taken earlier,
+		// would keep a replica that ended as standby.
+		if s.cand == r && ts >= s.candLastTs {
 			s.cand, s.candLastTs = noReplica, noTs
 		}
 		return false, NoChange

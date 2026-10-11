@@ -891,6 +891,18 @@ func TestTrackerHorizon(t *testing.T) {
 	st = trackedState(tr, 1)
 	require.Equal(t, b, st.cand)
 	require.Equal(t, tr.Horizon().now, st.candLastTs)
+
+	// A standby's stale marker ends it even if its request took the horizon before the standby's newest sample.
+	early := tr.Horizon()
+	now = now.Add(time.Minute)
+	require.True(t, acceptOnly(tr, 3, a, early.now))
+	require.False(t, acceptOnly(tr, 3, b, early.now+20000))
+	accept, change = tr.Accept(3, b, early.now+25000, early, true)
+	require.False(t, accept)
+	require.Equal(t, NoChange, change)
+	accept, change = tr.Accept(3, a, early.now+30000, tr.Horizon(), true)
+	require.True(t, accept)
+	require.Equal(t, NoChange, change)
 }
 
 func TestTrackerStaleFlag(t *testing.T) {
