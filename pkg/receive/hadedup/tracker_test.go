@@ -903,6 +903,24 @@ func TestTrackerHorizon(t *testing.T) {
 	accept, change = tr.Accept(3, a, early.now+30000, tr.Horizon(), true)
 	require.True(t, accept)
 	require.Equal(t, NoChange, change)
+	// A sample of the new owner whose request took the horizon before the handover doesn't move the floor back, even
+	// if that horizon ends before the floor.
+	early = tr.Horizon()
+	now = now.Add(10 * time.Minute)
+	ts := now.UnixMilli()
+	require.True(t, acceptOnly(tr, 4, b, ts))
+	require.False(t, acceptOnly(tr, 4, a, ts))
+	accept, change = tr.Accept(4, b, ts+1000, tr.Horizon(), true)
+	require.False(t, accept)
+	require.Equal(t, Handover, change)
+	accept, change = tr.Accept(4, a, ts+1500, early, false)
+	require.True(t, accept)
+	require.Equal(t, NoChange, change)
+	st = trackedState(tr, 4)
+	require.Equal(t, ts, st.ownerLastTs)
+	require.Zero(t, st.intervalMs&handoverFlag)
+	require.Zero(t, st.interval())
+	require.False(t, acceptOnly(tr, 4, b, ts+1600))
 }
 
 func TestTrackerStaleFlag(t *testing.T) {

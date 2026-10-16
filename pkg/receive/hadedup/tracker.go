@@ -482,8 +482,9 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, h Hori
 				return false, NoChange
 			}
 			// The distance to the floor is the phase offset between the replicas, not an interval of the new owner.
+			// A request that took its horizon before the handover must not move the floor back.
 			s.intervalMs &^= handoverFlag
-			s.ownerLastTs = min(ts, h.max)
+			s.ownerLastTs = max(s.ownerLastTs, min(ts, h.max))
 		}
 		if stale && ts >= s.ownerLastTs && s.cand != noReplica && !later(ts, s.candLastTs, t.timeout(s.interval())) {
 			// The series vanished only on the owner while another replica still produces it: hand the series
