@@ -499,7 +499,7 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, h Hori
 			// as ended cand makes the new owner's own stale marker be accepted if the series vanishes there too,
 			// instead of handing it back and forth, also if a sample of the old owner is delivered late.
 			s.owner, s.ownerLastTs = s.cand, max(s.ownerLastTs, s.candLastTs)
-			s.cand, s.candLastTs = r, min(ts, h.now)
+			s.cand, s.candLastTs = r, min(ts, h.max)
 			s.intervalMs = s.interval() | handoverFlag | candStaleFlag
 			return false, Handover
 		}
@@ -521,6 +521,12 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, h Hori
 		return true, NoChange
 	}
 
+	if !stale && s.cand == r && s.intervalMs&candStaleFlag != 0 && ts <= s.candLastTs {
+		// A sample of a replica that ended the series, delivered late, neither takes it over nor makes the replica
+		// standby again, which would make the owner's stale marker be handed over to it.
+		return false, NoChange
+	}
+
 	if later(min(ts, h.now), s.ownerLastTs, t.timeout(s.interval())) {
 		*s = newOwnerState(r, ts, s.interval(), h, stale)
 		return true, Failover
@@ -530,17 +536,12 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, h Hori
 		// A replica that sent a stale marker no longer produces the series, so it can't take it over. A stale marker
 		// older than the replica's newest sample was delivered late and doesn't end it. candLastTs is already bounded
 		// by the horizon that recorded it: bounding ts by this request's horizon, which may have been taken earlier,
-		// would keep a replica that ended as standby. The end is recorded like a standby sample, but not before the
-		// newest one.
+		// would keep a replica that ended as standby. The end is recorded up to the max horizon rather than the
+		// current time, as the late samples are ordered against it, but not before the newest sample.
 		if s.cand == r && ts >= s.candLastTs {
-			s.candLastTs = max(s.candLastTs, min(ts, h.now))
+			s.candLastTs = max(s.candLastTs, min(ts, h.max))
 			s.intervalMs |= candStaleFlag
 		}
-		return false, NoChange
-	}
-	if s.cand == r && s.intervalMs&candStaleFlag != 0 && ts <= s.candLastTs {
-		// A sample of a replica that ended the series, delivered late, neither takes it over nor makes the replica
-		// standby again, which would make the owner's stale marker be handed over to it.
 		return false, NoChange
 	}
 	// The preferred replica takes over once it is current, i.e. not behind any sample already appended. A lagging
@@ -554,18 +555,24 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, h Hori
 			s.intervalMs |= old.intervalMs & candStaleFlag
 		}
 		// Keep the freshest live standby. A stale owner or a handover floor is not evidence of a live old owner, while
-		// a live old owner is preferred over a cand that ended.
-		if last := min(old.ownerLastTs, h.now); old.intervalMs&(handoverFlag|staleFlag) == 0 && (last > s.candLastTs || s.intervalMs&candStaleFlag != 0) {
+		// a live old owner is preferred over a cand that ended. A stale owner ended the series, so it is kept as ended
+		// cand if there is no other, like the old owner of a handover.
+		switch last := min(old.ownerLastTs, h.now); {
+		case old.intervalMs&(handoverFlag|staleFlag) == 0 && (last > s.candLastTs || s.intervalMs&candStaleFlag != 0):
 			s.cand, s.candLastTs = old.owner, last
 			s.intervalMs &^= candStaleFlag
+		case old.intervalMs&staleFlag != 0 && s.cand == noReplica:
+			s.cand, s.candLastTs = old.owner, old.ownerLastTs
+			s.intervalMs |= candStaleFlag
 		}
 		return true, Takeover
 	}
 	// Replacing cand by arrival order would let a lagging replica evict a live one, and the owner's stale marker
 	// would then be accepted instead of handing the series over. A live replica replaces one that ended regardless of
-	// the timestamps. A timestamp from the future counts as the current time: the handover floor is derived from it,
-	// so it would otherwise keep the other replicas out until then.
-	if ts := min(ts, h.now); ts > s.candLastTs || (s.cand != r && s.intervalMs&candStaleFlag != 0) {
+	// the timestamps, also the one that ended, whose samples reaching here are newer than its end. A timestamp from
+	// the future counts as the current time: the handover floor is derived from it, so it would otherwise keep the
+	// other replicas out until then.
+	if ts := min(ts, h.now); ts > s.candLastTs || s.intervalMs&candStaleFlag != 0 {
 		s.cand, s.candLastTs = r, ts
 		s.intervalMs &^= candStaleFlag
 	}

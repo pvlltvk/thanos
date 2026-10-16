@@ -355,6 +355,84 @@ func TestTrackerAccept(t *testing.T) {
 			expectedOwner: b,
 		},
 		{
+			name: "late sample of a standby that ended in the future does not make it standby again",
+			steps: []step{
+				{replica: a, ts: testNow - 15000, accept: true, ownerChanged: true},
+				{replica: a, ts: testNow, accept: true},
+				{replica: b, ts: testNow + 5000, accept: false},
+				{replica: b, ts: testNow + 10000, stale: true, accept: false},
+				{now: testNow + 7000, replica: b, ts: testNow + 6000, accept: false},
+				{replica: a, ts: testNow + 7000, stale: true, accept: true},
+			},
+			expectedOwner: a,
+		},
+		{
+			name: "newer sample of a standby that ended in the future makes it standby again",
+			steps: []step{
+				{replica: a, ts: testNow - 15000, accept: true, ownerChanged: true},
+				{replica: a, ts: testNow, accept: true},
+				{replica: b, ts: testNow + 5000, accept: false},
+				{replica: b, ts: testNow + 10000, stale: true, accept: false},
+				{now: testNow + 5000, replica: b, ts: testNow + 20000, accept: false},
+				{replica: a, ts: testNow + 5000, stale: true, accept: false, ownerChanged: true},
+			},
+			expectedOwner: b,
+		},
+		{
+			name: "late sample of a standby that ended in the future does not fail over",
+			steps: []step{
+				{replica: a, ts: testNow - 30000, accept: true, ownerChanged: true},
+				{replica: a, ts: testNow - 15000, accept: true},
+				{replica: b, ts: testNow - 10000, accept: false},
+				{replica: b, ts: testNow + 20000, stale: true, accept: false},
+				{now: testNow + 30000, replica: b, ts: testNow + 15000, accept: false},
+			},
+			expectedOwner: a,
+		},
+		{
+			name: "late sample of a stale owner does not make it standby after a takeover",
+			steps: []step{
+				{replica: b, ts: 0, accept: true, ownerChanged: true},
+				{replica: b, ts: 15000, accept: true},
+				{replica: b, ts: 30000, stale: true, accept: true},
+				{replica: a, ts: 40000, accept: true, ownerChanged: true},
+				{replica: b, ts: 29000, accept: false},
+				{replica: a, ts: 45000, stale: true, accept: true},
+			},
+			expectedOwner:     a,
+			expectedTakeovers: 1,
+		},
+		{
+			name: "late sample of a stale owner does not make it standby after a takeover by the standby",
+			steps: []step{
+				{replica: b, ts: 0, accept: true, ownerChanged: true},
+				{replica: b, ts: 15000, accept: true},
+				{replica: a, ts: 10000, accept: false},
+				{replica: a, ts: 25000, stale: true, accept: false},
+				{replica: b, ts: 30000, stale: true, accept: true},
+				{replica: a, ts: 31000, accept: true, ownerChanged: true},
+				{replica: b, ts: 29000, accept: false},
+				{replica: a, ts: 40000, stale: true, accept: true},
+			},
+			expectedOwner:     a,
+			expectedTakeovers: 1,
+		},
+		{
+			name: "newer sample of a stale owner makes it standby after a takeover",
+			steps: []step{
+				{replica: b, ts: 0, accept: true, ownerChanged: true},
+				{replica: b, ts: 15000, accept: true},
+				{replica: b, ts: 30000, stale: true, accept: true},
+				{replica: a, ts: 40000, accept: true, ownerChanged: true},
+				{replica: b, ts: 29000, accept: false},
+				{replica: b, ts: 45000, accept: false},
+				{replica: a, ts: 50000, stale: true, accept: false, ownerChanged: true},
+				{replica: b, ts: 55000, accept: true},
+			},
+			expectedOwner:     b,
+			expectedTakeovers: 1,
+		},
+		{
 			name: "newer sample of a standby that ended makes it standby again",
 			steps: []step{
 				{replica: a, ts: 0, accept: true, ownerChanged: true},
@@ -974,6 +1052,22 @@ func TestTrackerHorizon(t *testing.T) {
 	require.Zero(t, st.intervalMs&handoverFlag)
 	require.Zero(t, st.interval())
 	require.False(t, acceptOnly(tr, 4, b, ts+1600))
+
+	// A standby's stale marker beyond its request's current time ends it at the stale marker's timestamp, so that its
+	// earlier samples delivered late with a later horizon don't make it standby again.
+	require.True(t, acceptOnly(tr, 5, a, ts-20000))
+	require.True(t, acceptOnly(tr, 5, a, ts-5000))
+	early = tr.Horizon()
+	require.False(t, acceptOnly(tr, 5, b, ts))
+	accept, change = tr.Accept(5, b, ts+10000, early, true)
+	require.False(t, accept)
+	require.Equal(t, NoChange, change)
+	require.Equal(t, ts+10000, trackedState(tr, 5).candLastTs)
+	now = now.Add(20 * time.Second)
+	require.False(t, acceptOnly(tr, 5, b, ts+5000))
+	accept, change = tr.Accept(5, a, ts+10000, tr.Horizon(), true)
+	require.True(t, accept)
+	require.Equal(t, NoChange, change)
 }
 
 func TestTrackerStaleFlag(t *testing.T) {

@@ -1519,6 +1519,45 @@ func TestWriterHADedupFutureSamples(t *testing.T) {
 	}
 }
 
+func TestWriterHADedupLateSampleAfterFutureStaleMarker(t *testing.T) {
+	t.Parallel()
+
+	lbls := []labelpb.ZLabel{{Name: labels.MetricName, Value: "up"}}
+	stale := math.Float64frombits(value.StaleNaN)
+
+	for _, capnp := range []bool{false, true} {
+		t.Run(fmt.Sprintf("capnp=%v", capnp), func(t *testing.T) {
+			t.Parallel()
+
+			now := time.Now().UnixMilli()
+			sample := func(replica string, ts int64, v float64) []prompb.TimeSeries {
+				return []prompb.TimeSeries{{
+					Labels:  withReplicaLabel(lbls, replica),
+					Samples: []prompb.Sample{{Value: v, Timestamp: now + ts}},
+				}}
+			}
+			m := newHADedupMultiTSDB(t, prometheus.NewRegistry(), labels.FromStrings("replica", "01"), WithHADedup(testHADedupConfig()))
+			for _, series := range [][]prompb.TimeSeries{
+				sample("prometheus-0", -30000, 1),
+				sample("prometheus-0", -15000, 1),
+				sample("prometheus-1", -10000, 1),
+				// The clock of prometheus-1 is ahead, it ended the series after the ingestor's current time.
+				sample("prometheus-1", 10000, stale),
+			} {
+				require.NoError(t, writeHADedupRequest(t, m, capnp, time.Minute, series))
+			}
+			// The request of the late sample takes a horizon after the one of the stale marker.
+			time.Sleep(time.Millisecond)
+			require.NoError(t, writeHADedupRequest(t, m, capnp, time.Minute, sample("prometheus-1", 5000, 1)))
+			require.NoError(t, writeHADedupRequest(t, m, capnp, time.Minute, sample("prometheus-0", 0, stale)))
+
+			require.Equal(t, map[string]storedSeries{
+				`{__name__="up"}`: {floats: []int64{now - 30000, now - 15000, now}},
+			}, readTenantSeries(t, m))
+		})
+	}
+}
+
 func TestWriterHADedupReplicaTable(t *testing.T) {
 	t.Parallel()
 
