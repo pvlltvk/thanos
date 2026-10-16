@@ -318,6 +318,58 @@ func TestTrackerAccept(t *testing.T) {
 			expectedOwner: b,
 		},
 		{
+			name: "late sample of a standby that ended does not make it standby again",
+			steps: []step{
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
+				{replica: a, ts: 15000, accept: true},
+				{replica: b, ts: 20000, accept: false},
+				{replica: b, ts: 30000, stale: true, accept: false},
+				{replica: b, ts: 20000, accept: false},
+				{replica: a, ts: 30000, stale: true, accept: true},
+			},
+			expectedOwner: a,
+		},
+		{
+			name: "late sample of an owner that handed over does not make it standby again",
+			steps: []step{
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
+				{replica: a, ts: 15000, accept: true},
+				{replica: b, ts: 20000, accept: false},
+				{replica: a, ts: 30000, stale: true, accept: false, ownerChanged: true},
+				{replica: b, ts: 35000, accept: true},
+				{replica: a, ts: 15000, accept: false},
+				{replica: b, ts: 36000, stale: true, accept: true},
+			},
+			expectedOwner: b,
+		},
+		{
+			name: "late sample of a preferred standby that ended does not take over",
+			steps: []step{
+				{replica: b, ts: 0, accept: true, ownerChanged: true},
+				{replica: b, ts: 15000, accept: true},
+				{replica: a, ts: 10000, accept: false},
+				{replica: a, ts: 25000, stale: true, accept: false},
+				{replica: a, ts: 20000, accept: false},
+				{replica: b, ts: 30000, accept: true},
+			},
+			expectedOwner: b,
+		},
+		{
+			name: "newer sample of a standby that ended makes it standby again",
+			steps: []step{
+				{replica: a, ts: 0, accept: true, ownerChanged: true},
+				{replica: a, ts: 15000, accept: true},
+				{replica: b, ts: 20000, accept: false},
+				{replica: a, ts: 30000, accept: true},
+				{replica: b, ts: 35000, stale: true, accept: false},
+				{replica: b, ts: 20000, accept: false},
+				{replica: b, ts: 50000, accept: false},
+				{replica: a, ts: 45000, stale: true, accept: false, ownerChanged: true},
+				{replica: b, ts: 55000, accept: true},
+			},
+			expectedOwner: b,
+		},
+		{
 			name: "stale owner fails over after its learned timeout",
 			steps: []step{
 				{replica: b, ts: 0, accept: true, ownerChanged: true},
@@ -903,6 +955,7 @@ func TestTrackerHorizon(t *testing.T) {
 	accept, change = tr.Accept(3, a, early.now+30000, tr.Horizon(), true)
 	require.True(t, accept)
 	require.Equal(t, NoChange, change)
+
 	// A sample of the new owner whose request took the horizon before the handover doesn't move the floor back, even
 	// if that horizon ends before the floor.
 	early = tr.Horizon()
@@ -1175,6 +1228,11 @@ func TestTrackerGCRemovesDeadStandby(t *testing.T) {
 	b, _ := tr.Replica("b")
 	require.True(t, acceptOnly(tr, 1, a, ts()))
 	require.False(t, acceptOnly(tr, 1, b, ts()+1000))
+	// b ended series 2, so it is no standby of it.
+	require.True(t, acceptOnly(tr, 2, a, ts()))
+	require.False(t, acceptOnly(tr, 2, b, ts()))
+	accept, _ := tr.Accept(2, b, ts()+1000, tr.Horizon(), true)
+	require.False(t, accept)
 	tr.GC()
 	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.seriesWithStandby))
 
@@ -1182,9 +1240,13 @@ func TestTrackerGCRemovesDeadStandby(t *testing.T) {
 	for range 6 {
 		now = now.Add(time.Minute)
 		require.True(t, acceptOnly(tr, 1, a, ts()))
+		require.True(t, acceptOnly(tr, 2, a, ts()))
 		tr.GC()
 	}
 	require.Equal(t, uint16(noReplica), trackedState(tr, 1).cand)
+	st := trackedState(tr, 2)
+	require.Equal(t, uint16(noReplica), st.cand)
+	require.Zero(t, st.intervalMs&candStaleFlag)
 	require.Zero(t, promtest.ToFloat64(tr.metrics.seriesWithStandby))
 	require.Equal(t, 1.0, promtest.ToFloat64(tr.metrics.replicas))
 	_, ok := tr.Replica("c")
@@ -1366,10 +1428,10 @@ func TestLearnInterval(t *testing.T) {
 	require.Equal(t, uint32(10000), learnInterval(10000, 0))
 	require.Equal(t, uint32(10000), learnInterval(10000, -5))
 
-	// The top two bits are reserved for handoverFlag and staleFlag.
+	// The top three bits are reserved for handoverFlag, staleFlag and candStaleFlag.
 	require.Equal(t, uint32(10000), learnInterval(10000, maxIntervalMs+1))
 	require.Equal(t, uint32(maxIntervalMs), learnInterval(maxIntervalMs-1, maxIntervalMs))
-	require.Zero(t, learnInterval(maxIntervalMs/2+1, maxIntervalMs)&(handoverFlag|staleFlag))
+	require.Zero(t, learnInterval(maxIntervalMs/2+1, maxIntervalMs)&(handoverFlag|staleFlag|candStaleFlag))
 }
 
 func TestTrackerConcurrent(t *testing.T) {

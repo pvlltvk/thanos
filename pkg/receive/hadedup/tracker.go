@@ -30,11 +30,14 @@ const (
 	noTs       = math.MinInt64
 
 	// handoverFlag is set in seriesState.intervalMs while ownerLastTs holds the stale handover floor. Learned
-	// intervals are capped below the two flags (about 12.4 days).
+	// intervals are capped below the three flags (about 6.2 days).
 	handoverFlag = 1 << 31
 	// staleFlag marks an owner whose newest accepted sample is stale, so takeover cannot retain it as standby.
-	staleFlag     = 1 << 30
-	maxIntervalMs = staleFlag - 1
+	staleFlag = 1 << 30
+	// candStaleFlag marks a cand that ended the series with a stale marker, so that it is no standby until it sends a
+	// newer sample.
+	candStaleFlag = 1 << 29
+	maxIntervalMs = candStaleFlag - 1
 
 	// MaxReplicasLimit is the maximum allowed value of Config.MaxReplicas.
 	MaxReplicasLimit = noReplica
@@ -99,17 +102,20 @@ type seriesState struct {
 	// ownerLastTs is the timestamp of the newest sample accepted from the owner. After a stale handover, while
 	// handoverFlag is set, it is the timestamp up to which samples of the new owner are dropped.
 	ownerLastTs int64
-	// candLastTs is the timestamp of the newest sample seen from cand, noTs if cand is noReplica.
+	// candLastTs is the timestamp of the newest sample seen from cand, noTs if cand is noReplica. While candStaleFlag
+	// is set, it is the timestamp at which cand ended the series.
 	candLastTs int64
-	// intervalMs is the learned sample interval of the owner, 0 if unknown, possibly with handoverFlag or staleFlag set.
+	// intervalMs is the learned sample interval of the owner, 0 if unknown, possibly with handoverFlag, staleFlag or
+	// candStaleFlag set.
 	intervalMs uint32
 	owner      uint16
-	// cand is the non-owner replica with the newest samples that is still sending them, noReplica if none.
+	// cand is the non-owner replica with the newest samples, noReplica if none. While candStaleFlag is set, cand
+	// ended the series and is only kept so that its older samples, delivered late, don't make it standby again.
 	cand uint16
 }
 
 func (s *seriesState) interval() uint32 {
-	return s.intervalMs &^ (handoverFlag | staleFlag)
+	return s.intervalMs &^ (handoverFlag | staleFlag | candStaleFlag)
 }
 
 type stripe struct {
@@ -486,15 +492,15 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, h Hori
 			s.intervalMs &^= handoverFlag
 			s.ownerLastTs = max(s.ownerLastTs, min(ts, h.max))
 		}
-		if stale && ts >= s.ownerLastTs && s.cand != noReplica && !later(ts, s.candLastTs, t.timeout(s.interval())) {
+		if stale && ts >= s.ownerLastTs && s.cand != noReplica && s.intervalMs&candStaleFlag == 0 && !later(ts, s.candLastTs, t.timeout(s.interval())) {
 			// The series vanished only on the owner while another replica still produces it: hand the series
 			// over and drop the stale marker. The new owner may lag behind the old one, so its samples up to the
-			// newest one already appended are dropped instead of being appended out of order. Resetting cand makes
-			// the new owner's own stale marker be accepted if the series vanishes there too, instead of handing it
-			// back and forth.
+			// newest one already appended are dropped instead of being appended out of order. Keeping the old owner
+			// as ended cand makes the new owner's own stale marker be accepted if the series vanishes there too,
+			// instead of handing it back and forth, also if a sample of the old owner is delivered late.
 			s.owner, s.ownerLastTs = s.cand, max(s.ownerLastTs, s.candLastTs)
-			s.cand, s.candLastTs = noReplica, noTs
-			s.intervalMs = s.interval() | handoverFlag
+			s.cand, s.candLastTs = r, min(ts, h.now)
+			s.intervalMs = s.interval() | handoverFlag | candStaleFlag
 			return false, Handover
 		}
 		previousTs := s.ownerLastTs
@@ -504,7 +510,7 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, h Hori
 			// other replicas from taking over until then. The delta to it isn't an interval either.
 			s.ownerLastTs = max(s.ownerLastTs, h.max)
 		case ts > s.ownerLastTs:
-			s.intervalMs = learnInterval(s.interval(), ts-s.ownerLastTs)
+			s.intervalMs = learnInterval(s.interval(), ts-s.ownerLastTs) | s.intervalMs&candStaleFlag
 			s.ownerLastTs = ts
 		}
 		if stale && ts >= previousTs {
@@ -524,10 +530,17 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, h Hori
 		// A replica that sent a stale marker no longer produces the series, so it can't take it over. A stale marker
 		// older than the replica's newest sample was delivered late and doesn't end it. candLastTs is already bounded
 		// by the horizon that recorded it: bounding ts by this request's horizon, which may have been taken earlier,
-		// would keep a replica that ended as standby.
+		// would keep a replica that ended as standby. The end is recorded like a standby sample, but not before the
+		// newest one.
 		if s.cand == r && ts >= s.candLastTs {
-			s.cand, s.candLastTs = noReplica, noTs
+			s.candLastTs = max(s.candLastTs, min(ts, h.now))
+			s.intervalMs |= candStaleFlag
 		}
+		return false, NoChange
+	}
+	if s.cand == r && s.intervalMs&candStaleFlag != 0 && ts <= s.candLastTs {
+		// A sample of a replica that ended the series, delivered late, neither takes it over nor makes the replica
+		// standby again, which would make the owner's stale marker be handed over to it.
 		return false, NoChange
 	}
 	// The preferred replica takes over once it is current, i.e. not behind any sample already appended. A lagging
@@ -538,18 +551,23 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, h Hori
 		*s = newOwnerState(r, ts, old.interval(), h, false)
 		if old.cand != r {
 			s.cand, s.candLastTs = old.cand, old.candLastTs
+			s.intervalMs |= old.intervalMs & candStaleFlag
 		}
-		// Keep the freshest live standby. A stale owner or a handover floor is not evidence of a live old owner.
-		if last := min(old.ownerLastTs, h.now); old.intervalMs&(handoverFlag|staleFlag) == 0 && last > s.candLastTs {
+		// Keep the freshest live standby. A stale owner or a handover floor is not evidence of a live old owner, while
+		// a live old owner is preferred over a cand that ended.
+		if last := min(old.ownerLastTs, h.now); old.intervalMs&(handoverFlag|staleFlag) == 0 && (last > s.candLastTs || s.intervalMs&candStaleFlag != 0) {
 			s.cand, s.candLastTs = old.owner, last
+			s.intervalMs &^= candStaleFlag
 		}
 		return true, Takeover
 	}
 	// Replacing cand by arrival order would let a lagging replica evict a live one, and the owner's stale marker
-	// would then be accepted instead of handing the series over. A timestamp from the future counts as the current
-	// time: the handover floor is derived from it, so it would otherwise keep the other replicas out until then.
-	if ts := min(ts, h.now); ts > s.candLastTs {
+	// would then be accepted instead of handing the series over. A live replica replaces one that ended regardless of
+	// the timestamps. A timestamp from the future counts as the current time: the handover floor is derived from it,
+	// so it would otherwise keep the other replicas out until then.
+	if ts := min(ts, h.now); ts > s.candLastTs || (s.cand != r && s.intervalMs&candStaleFlag != 0) {
 		s.cand, s.candLastTs = r, ts
+		s.intervalMs &^= candStaleFlag
 	}
 	return false, NoChange
 }
@@ -641,12 +659,16 @@ func (t *Tracker) GC() int {
 			}
 			if st.cand != noReplica && st.candLastTs < cutoff {
 				st.cand, st.candLastTs = noReplica, noTs
+				st.intervalMs &^= candStaleFlag
 				s.series[ref] = st
 			}
 			markReferenced(referenced, st.owner)
 			if st.cand != noReplica {
+				// A cand that ended is no standby, but its index must stay valid while it is kept.
 				markReferenced(referenced, st.cand)
-				withStandby++
+				if st.intervalMs&candStaleFlag == 0 {
+					withStandby++
+				}
 			}
 		}
 		s.mtx.Unlock()
