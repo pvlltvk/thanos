@@ -94,7 +94,7 @@ func TestHandlerHADedup(t *testing.T) {
 					wreq := &prompb.WriteRequest{Timeseries: make([]prompb.TimeSeries, 0, numSeries)}
 					for s := range numSeries {
 						wreq.Timeseries = append(wreq.Timeseries, prompb.TimeSeries{
-							Labels:  withReplicaLabel([]labelpb.ZLabel{{Name: "__name__", Value: "up"}, {Name: "instance", Value: fmt.Sprintf("host-%d", s)}}, fmt.Sprintf("prometheus-%d", r)),
+							Labels:  withReplicaLabel([]labelpb.ZLabel{{Name: labels.MetricName, Value: "up"}, {Name: "instance", Value: fmt.Sprintf("host-%d", s)}}, fmt.Sprintf("prometheus-%d", r)),
 							Samples: []prompb.Sample{{Value: 1, Timestamp: ts}},
 						})
 					}
