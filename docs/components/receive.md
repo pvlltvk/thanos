@@ -392,7 +392,7 @@ Timestamps in the future:
 - An owner whose clock runs ahead delays the takeover of its series after it stops by its clock offset, at most by `--receive.ha-dedup.max-failover-timeout`. Its own samples from the future are stored as they are without deduplication.
 - The preferred replica takes series over from a live owner only with samples that are not ahead of the ingestor's clock. If its clock runs ahead by more than its remote write delay, it takes series over only after their owner stops.
 - Deduplication can't tell a writer that sets a made-up replica value from a real replica: while it writes current samples, it takes part in the ownership decisions like one, and takes over the series of live owners if its value sorts before theirs.
-- Still set `--tsdb.too-far-in-future.time-window` on ingestors, e.g. to `5m`: without it, samples from the future are stored and can make later samples of their series be rejected as out of order. Receive logs a warning on startup if the window is not set.
+- Still set `--tsdb.too-far-in-future.time-window` on ingestors, e.g. to `5m`: without it, samples from the future are stored and can make later samples of their series be rejected as out of order. Receive logs a warning on startup if the window is not set. Keep the window at most `--receive.ha-dedup.max-failover-timeout`: the end of a series on a replica is recorded at most that far ahead of the ingestor's clock, so if a replica whose clock runs further ahead ends a series and its own writes arrive out of order, its earlier sample can make it standby again, and the owner's stale marker is then dropped and the series stays visible until the query lookback ends. Receive logs a warning on startup if the window is larger.
 
 Behaviour to be aware of:
 

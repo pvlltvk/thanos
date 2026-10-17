@@ -262,6 +262,8 @@ func runReceive(
 		}, []string{"replica_label"}).WithLabelValues(conf.haDedupReplicaLabel).Set(1)
 		if enableIngestion && *conf.tsdbTooFarInFutureTimeWindow == 0 {
 			level.Warn(logger).Log("msg", "HA replica deduplication is enabled without --tsdb.too-far-in-future.time-window: samples with timestamps in the future are stored and can make later samples of their series be rejected as out of order; set the window, e.g. to 5m, to reject such samples")
+		} else if enableIngestion && *conf.tsdbTooFarInFutureTimeWindow > *conf.haDedupMaxFailoverTimeout {
+			level.Warn(logger).Log("msg", "--tsdb.too-far-in-future.time-window is larger than --receive.ha-dedup.max-failover-timeout: when a replica whose clock runs ahead by more than the maximum ends a series and its own writes arrive out of order, the owner's stale marker of the series can be dropped; set the window to at most the maximum")
 		}
 	}
 
