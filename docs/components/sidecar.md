@@ -25,6 +25,14 @@ If you choose to use the sidecar to also upload data to object storage:
 * The `--storage.tsdb.min-block-duration` and `--storage.tsdb.max-block-duration` must be set to equal values to disable local compaction in order to use Thanos sidecar upload, otherwise leave local compaction on if sidecar just exposes StoreAPI and your retention is normal. The default of `2h` is recommended. Mentioned parameters set to equal values disable the internal Prometheus compaction, which is needed to avoid the corruption of uploaded data when Thanos compactor does its job, this is critical for data consistency and should not be ignored if you plan to use Thanos compactor. Even though you set mentioned parameters equal, you might observe Prometheus internal metric `prometheus_tsdb_compactions_total` being incremented, don't be confused by that: Prometheus writes initial head block to filesystem via its internal compaction mechanism, but if you have followed recommendations - data won't be modified by Prometheus before the sidecar uploads it. Thanos sidecar will also check sanity of the flags set to Prometheus on the startup and log errors or warning if they have been configured improperly (#838).
 * The retention of Prometheus is recommended to not be lower than three times of the min block duration, so 6 hours. This achieves resilience in the face of connectivity issues to the object storage since all local data will remain available within the Thanos cluster. If connectivity gets restored the backlog of blocks gets uploaded to the object storage.
 
+## StoreAPI request limits
+
+Use `--store.limits.request-series` and `--store.limits.request-samples` to limit individual StoreAPI Series requests. Both default to `0`, which disables the limit. The sample limit uses an estimate of 120 samples per chunk, including histogram chunks. Series split across multiple remote-read responses are counted once per response.
+
+Sidecar checks these limits before retaining responses for sorting. If a limit is exceeded, the request fails without sending the buffered series. For streamed remote reads, Sidecar stops reading and closes the upstream response body. Rejected requests increment `thanos_store_selects_dropped_total` with reason `series` or `chunks`.
+
+These limits reduce retained results for rejected requests, but do not impose a hard memory limit. Successful and unlimited requests still buffer their results for sorting. A decoded frame or a large chunk can consume memory before the check, and metadata and sampled fallback responses are fully decoded before their series are checked. Concurrent requests have separate budgets.
+
 ## Reloader Configuration
 
 Thanos can watch changes in Prometheus configuration and refresh Prometheus configuration if `--web.enable-lifecycle` enabled.
