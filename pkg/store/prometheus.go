@@ -59,6 +59,32 @@ type PrometheusStore struct {
 	remoteReadAcceptableResponses []prompb.ReadRequest_ResponseType
 
 	framesRead prometheus.Histogram
+
+	newSeriesLimiter      SeriesLimiterFactory
+	newSamplesLimiter     ChunksLimiterFactory
+	failedRequestsCounter *prometheus.CounterVec
+}
+
+type PrometheusStoreOption func(s *PrometheusStore)
+
+// WithPrometheusStoreLimits enforces limits before results are buffered for sorting.
+// Without this option, the store applies no request limits.
+func WithPrometheusStoreLimits(selectLimits SeriesSelectLimits) PrometheusStoreOption {
+	return func(s *PrometheusStore) {
+		s.newSeriesLimiter = NewSeriesLimiterFactory(selectLimits.SeriesPerRequest)
+		s.newSamplesLimiter = NewChunksLimiterFactory(selectLimits.SamplesPerRequest)
+	}
+}
+
+type limitedPrometheusServer struct {
+	*limitedServer
+}
+
+func (s *limitedPrometheusServer) Flush() error {
+	if f, ok := s.Store_SeriesServer.(flushableServer); ok {
+		return f.Flush()
+	}
+	return nil
 }
 
 // Label{Values,Names} call with matchers is supported for Prometheus versions >= 2.24.0.
@@ -79,6 +105,7 @@ func NewPrometheusStore(
 	externalLabelsFn func() labels.Labels,
 	timestamps func() (mint int64, maxt int64),
 	promVersion func() string,
+	options ...PrometheusStoreOption,
 ) (*PrometheusStore, error) {
 	if logger == nil {
 		logger = log.NewNopLogger()
@@ -104,6 +131,12 @@ func NewPrometheusStore(
 			},
 		),
 	}
+	for _, option := range options {
+		option(p)
+	}
+	if p.newSeriesLimiter != nil {
+		p.failedRequestsCounter = newSelectsDroppedCounter(reg)
+	}
 	return p, nil
 }
 
@@ -126,6 +159,11 @@ func (p *PrometheusStore) Series(r *storepb.SeriesRequest, seriesSrv storepb.Sto
 	s := newFlushableServer(
 		newBatchableServer(seriesSrv, int(r.ResponseBatchSize)),
 		sortingStrategyStore)
+	if p.newSeriesLimiter != nil {
+		s = &limitedPrometheusServer{newLimitedServer(s,
+			p.newSeriesLimiter(p.failedRequestsCounter.WithLabelValues("series")),
+			p.newSamplesLimiter(p.failedRequestsCounter.WithLabelValues("chunks")))}
+	}
 
 	extLset := p.externalLabelsFn()
 

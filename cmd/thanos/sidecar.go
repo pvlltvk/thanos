@@ -315,7 +315,7 @@ func runSidecar(
 	{
 		c := promclient.NewWithTracingClient(logger, httpClient, clientconfig.ThanosUserAgent)
 
-		promStore, err := store.NewPrometheusStore(logger, reg, c, conf.prometheus.url, component.Sidecar, m.Labels, m.Timestamps, m.Version)
+		promStore, err := store.NewPrometheusStore(logger, reg, c, conf.prometheus.url, component.Sidecar, m.Labels, m.Timestamps, m.Version, store.WithPrometheusStoreLimits(conf.storeRateLimits))
 		if err != nil {
 			return errors.Wrap(err, "create Prometheus store")
 		}
@@ -389,7 +389,7 @@ func runSidecar(
 			),
 		)
 
-		storeServer := store.NewLimitedStoreServer(store.NewInstrumentedStoreServer(reg, promStore), reg, conf.storeRateLimits)
+		storeServer := store.NewInstrumentedStoreServer(reg, promStore)
 		s := grpcserver.New(logger, reg, tracer, grpcLogOpts, logFilterMethods, comp, grpcProbe,
 			grpcserver.WithServer(store.RegisterStoreServer(storeServer, logger)),
 			grpcserver.WithServer(rules.RegisterRulesServer(rules.NewPrometheus(conf.prometheus.url, c, m.Labels))),

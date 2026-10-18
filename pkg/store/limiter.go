@@ -128,14 +128,18 @@ type limitedStoreServer struct {
 // NewLimitedStoreServer creates a new limitedStoreServer.
 func NewLimitedStoreServer(store storepb.StoreServer, reg prometheus.Registerer, selectLimits SeriesSelectLimits) storepb.StoreServer {
 	return &limitedStoreServer{
-		StoreServer:       store,
-		newSeriesLimiter:  NewSeriesLimiterFactory(selectLimits.SeriesPerRequest),
-		newSamplesLimiter: NewChunksLimiterFactory(selectLimits.SamplesPerRequest),
-		failedRequestsCounter: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
-			Name: "thanos_store_selects_dropped_total",
-			Help: "Number of select queries that were dropped due to configured limits.",
-		}, []string{"reason"}),
+		StoreServer:           store,
+		newSeriesLimiter:      NewSeriesLimiterFactory(selectLimits.SeriesPerRequest),
+		newSamplesLimiter:     NewChunksLimiterFactory(selectLimits.SamplesPerRequest),
+		failedRequestsCounter: newSelectsDroppedCounter(reg),
 	}
+}
+
+func newSelectsDroppedCounter(reg prometheus.Registerer) *prometheus.CounterVec {
+	return promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+		Name: "thanos_store_selects_dropped_total",
+		Help: "Number of select queries that were dropped due to configured limits.",
+	}, []string{"reason"})
 }
 
 func (s *limitedStoreServer) Series(req *storepb.SeriesRequest, srv storepb.Store_SeriesServer) error {
