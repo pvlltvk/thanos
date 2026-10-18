@@ -487,24 +487,31 @@ func TestHashWithPrefix(t *testing.T) {
 
 func TestHashWithPrefixIgnoring(t *testing.T) {
 	bigValue := strings.Repeat("abcdefghij", 200)
+	// The hashes of HashWithPrefix before it delegated to HashWithPrefixIgnoring: changing them would move series to
+	// other endpoints of the hashring.
 	for _, tcase := range []struct {
 		name string
 		lbls []ZLabel
+		hash uint64
 	}{
 		{
 			name: "empty",
+			hash: 0x3ff5008a504a5280,
 		},
 		{
 			name: "small",
 			lbls: []ZLabel{{Name: "__name__", Value: "up"}, {Name: "job", Value: "node"}},
+			hash: 0x1b67e244c4fe08f5,
 		},
 		{
 			name: "over 1KB",
 			lbls: []ZLabel{{Name: "__name__", Value: "up"}, {Name: "a", Value: bigValue}, {Name: "job", Value: "node"}},
+			hash: 0x5c1eb610c2b039e2,
 		},
 	} {
 		t.Run(tcase.name, func(t *testing.T) {
-			testutil.Equals(t, HashWithPrefix("a", tcase.lbls), HashWithPrefixIgnoring("a", tcase.lbls, "replica"))
+			testutil.Equals(t, tcase.hash, HashWithPrefix("a", tcase.lbls))
+			testutil.Equals(t, tcase.hash, HashWithPrefixIgnoring("a", tcase.lbls, "replica"))
 			testutil.Equals(t, HashWithPrefix("a", tcase.lbls), HashWithPrefixIgnoring("a", tcase.lbls, ""))
 
 			for _, pos := range []int{0, len(tcase.lbls) / 2, len(tcase.lbls)} {
