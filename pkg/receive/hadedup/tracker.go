@@ -512,17 +512,7 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, h Hori
 			// other replicas from taking over until then. The delta to it isn't an interval either.
 			s.ownerLastTs = max(s.ownerLastTs, h.max)
 		case ts > s.ownerLastTs:
-			cur := s.interval()
-			interval := learnInterval(cur, ts-s.ownerLastTs)
-			if cur != 0 && interval > cur && s.candLastTs > ts-int64(interval/2) {
-				// The interval doesn't grow to a value that a standby undercuts by writing within its last half,
-				// which bounds it to twice the standby's spacing. A preferred replica that took the series over
-				// could otherwise stretch the failover timeout with sparse samples, until one sample per maximum
-				// timeout keeps the series. After a real interval change the standby writes once per gap, so the
-				// new interval is learned unless the standby scrapes less than half of it before the owner.
-				interval = cur
-			}
-			s.intervalMs = interval | s.intervalMs&candStaleFlag
+			s.intervalMs = learnOwnerInterval(s.interval(), s.ownerLastTs, ts, s.candLastTs) | s.intervalMs&candStaleFlag
 			s.ownerLastTs = ts
 		}
 		if stale && ts >= previousTs {
@@ -540,7 +530,20 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, h Hori
 	}
 
 	if later(min(ts, h.now), s.ownerLastTs, t.timeout(s.interval())) {
-		*s = newOwnerState(r, ts, s.interval(), h, stale)
+		old := *s
+		interval := old.interval()
+		if old.cand == r && old.intervalMs&candStaleFlag == 0 {
+			// After an interval increase, replicas that scrape further apart than the old timeout take the series
+			// over from each other with every sample, so the interval is only learned from the standby's own samples.
+			interval = learnOwnerInterval(interval, old.candLastTs, min(ts, h.now), old.ownerLastTs)
+		}
+		*s = newOwnerState(r, ts, interval, h, stale)
+		if old.intervalMs&(handoverFlag|staleFlag) == 0 {
+			// The old owner stays standby, so that its next sample is learned from if it takes the series back. It is
+			// behind by more than the timeout, so the new owner's stale marker isn't handed over to it unless it writes
+			// again.
+			s.cand, s.candLastTs = old.owner, min(old.ownerLastTs, h.now)
+		}
 		return true, Failover
 	}
 
@@ -647,6 +650,20 @@ func learnInterval(cur uint32, delta int64) uint32 {
 	}
 	target := min(delta, 2*int64(cur))
 	return cur + uint32(max((target-int64(cur))/8, 1))
+}
+
+// learnOwnerInterval learns the interval from the owner's samples at lastTs and ts, where otherLastTs is the newest
+// sample of another replica. The interval doesn't grow to a value that the other replica undercuts by writing within
+// its last half, which bounds it to twice the other replica's spacing. A preferred replica that took the series over
+// could otherwise stretch the failover timeout with sparse samples, until one sample per maximum timeout keeps the
+// series. After a real interval change the standby writes once per gap, so the new interval is learned unless the
+// standby scrapes less than half of it before the owner.
+func learnOwnerInterval(cur uint32, lastTs, ts, otherLastTs int64) uint32 {
+	interval := learnInterval(cur, ts-lastTs)
+	if cur != 0 && interval > cur && otherLastTs > ts-int64(interval/2) {
+		return cur
+	}
+	return interval
 }
 
 // GC removes the state of series whose newest sample is older than the state TTL, as well as standby replicas whose

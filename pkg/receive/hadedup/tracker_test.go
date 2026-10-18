@@ -117,6 +117,18 @@ func TestTrackerAccept(t *testing.T) {
 			expectedFailovers: 1,
 		},
 		{
+			name: "stale marker after a failover is not handed over to the timed out owner",
+			steps: []step{
+				{replica: b, ts: 0, accept: true, ownerChanged: true},
+				{replica: b, ts: 15000, accept: true},
+				{replica: a, ts: 40000, accept: true, ownerChanged: true},
+				{replica: a, ts: 55000, accept: true},
+				{replica: a, ts: 70000, stale: true, accept: true},
+			},
+			expectedOwner:     a,
+			expectedFailovers: 1,
+		},
+		{
 			name: "default timeout until an interval is learned",
 			steps: []step{
 				{replica: a, ts: 0, accept: true, ownerChanged: true},
@@ -992,6 +1004,46 @@ func TestTrackerLearnsLongerIntervalWithStandby(t *testing.T) {
 			}
 			st := trackedState(tr, 1)
 			require.GreaterOrEqual(t, st.interval(), uint32(55000))
+		})
+	}
+}
+
+func TestTrackerLearnsLongerIntervalAfterFailovers(t *testing.T) {
+	t.Parallel()
+
+	// Both replicas change their scrape interval from 15s to 60s, and the standby scrapes later than the failover
+	// timeout of the old interval after the owner. It takes the series over, and the preferred replica takes it back
+	// with its next sample, until the new interval is learned.
+	for _, offset := range []int64{25000, 30000, 45000, 50000, 55000} {
+		t.Run(fmt.Sprintf("offset %ds", offset/1000), func(t *testing.T) {
+			t.Parallel()
+
+			now := time.UnixMilli(testNow)
+			tr := newTestTracker(testConfig(), &now)
+			a, _ := tr.Replica("prometheus-0")
+			b, _ := tr.Replica("prometheus-1")
+			accept := func(r uint16, ts int64) (bool, Change) {
+				now = time.UnixMilli(ts)
+				return tr.Accept(1, r, ts, tr.Horizon(), false)
+			}
+
+			ts := testNow
+			for range 120 {
+				accept(a, ts)
+				accept(b, ts+5000)
+				ts += 15000
+			}
+			for i := range 120 {
+				acceptedA, changeA := accept(a, ts)
+				acceptedB, changeB := accept(b, ts+offset)
+				if i >= 60 {
+					require.True(t, acceptedA, "scrape %d", i)
+					require.Equal(t, NoChange, changeA, "scrape %d", i)
+					require.False(t, acceptedB, "scrape %d", i)
+					require.Equal(t, NoChange, changeB, "scrape %d", i)
+				}
+				ts += 60000
+			}
 		})
 	}
 }
