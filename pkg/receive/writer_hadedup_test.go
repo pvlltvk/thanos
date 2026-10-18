@@ -1026,6 +1026,36 @@ thanos_receive_ha_dedup_passthrough_total{reason="replica_value_too_long",tenant
 	}
 }
 
+func TestWriterHADedupOnlyReplicaLabel(t *testing.T) {
+	t.Parallel()
+
+	ts := time.Now().Add(-time.Hour).UnixMilli()
+	lbls := []labelpb.ZLabel{{Name: testHADedupReplicaLabel, Value: "prometheus-0"}}
+
+	for _, capnp := range []bool{false, true} {
+		t.Run(fmt.Sprintf("capnp=%v", capnp), func(t *testing.T) {
+			t.Parallel()
+
+			m := newHADedupMultiTSDB(t, prometheus.NewRegistry(), labels.FromStrings("replica", "01"), WithHADedup(testHADedupConfig()))
+			writeHADedupRequests(t, m, capnp, []haDedupWrite{
+				{series: []prompb.TimeSeries{{Labels: lbls, Samples: []prompb.Sample{{Value: 1, Timestamp: ts}}}}},
+			})
+
+			app, err := m.TenantAppendable(tenancy.DefaultTenant)
+			require.NoError(t, err)
+			q, err := app.(*ReadyStorage).Querier(math.MinInt64, math.MaxInt64)
+			require.NoError(t, err)
+			defer func() { require.NoError(t, q.Close()) }()
+
+			ss := q.Select(context.Background(), false, nil, labels.MustNewMatcher(labels.MatchEqual, testHADedupReplicaLabel, "prometheus-0"))
+			require.True(t, ss.Next())
+			require.Equal(t, `{prometheus_replica="prometheus-0"}`, ss.At().Labels().String())
+			require.False(t, ss.Next())
+			require.NoError(t, ss.Err())
+		})
+	}
+}
+
 func TestWriterHADedupExemplarsOfUnknownReplica(t *testing.T) {
 	t.Parallel()
 

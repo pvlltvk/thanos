@@ -84,6 +84,10 @@ func (w *haDedupWriter) prepare(lbls []labelpb.ZLabel, inPlace bool) ([]labelpb.
 		w.counts.NoLabel++
 		return lbls, haDedupSeries{}
 	}
+	if len(lbls) == 1 {
+		// Without the replica label, the series would have no labels and be rejected.
+		return lbls, haDedupSeries{}
+	}
 	value := lbls[i].Value
 	if len(value) > hadedup.MaxReplicaValueLength {
 		w.counts.ReplicaValueTooLong++
