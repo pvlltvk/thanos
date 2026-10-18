@@ -391,7 +391,7 @@ Timestamps in the future:
 - Timestamps from the future of other replicas and of new owners are recorded at most at the current time. A replica that gets a series through a stale marker of the owner therefore loses it again after the failover timeout if it doesn't write the series.
 - An owner whose clock runs ahead delays the takeover of its series after it stops by its clock offset, at most by `--receive.ha-dedup.max-failover-timeout`. Its own samples from the future are stored as they are without deduplication.
 - The preferred replica takes series over from a live owner only with samples that are not ahead of the ingestor's clock. If its clock runs ahead by more than its remote write delay, it takes series over only after their owner stops.
-- Deduplication can't tell a writer that sets a made-up replica value from a real replica: while it writes current samples, it takes part in the ownership decisions like one, and takes over the series of live owners if its value sorts before theirs.
+- Deduplication can't tell a writer that sets a made-up replica value from a real replica: while it writes current samples, it takes part in the ownership decisions like one, and takes over the series of live owners if its value sorts before theirs. The real replicas' samples of these series are then dropped while their requests succeed, as long as the writer sends a sample within every failover timeout: the real replicas' samples keep the learned interval from growing beyond twice their spacing. Let only trusted writers write to a deduplicated tenant, and alert on a high share of dropped samples.
 - Still set `--tsdb.too-far-in-future.time-window` on ingestors, e.g. to `5m`: without it, samples from the future are stored and can make later samples of their series be rejected as out of order. Receive logs a warning on startup if the window is not set. Keep the window at most `--receive.ha-dedup.max-failover-timeout`: the end of a series on a replica is recorded at most that far ahead of the ingestor's clock, so if a replica whose clock runs further ahead ends a series and its own writes arrive out of order, its earlier sample can make it standby again, and the owner's stale marker is then dropped and the series stays visible until the query lookback ends. Receive logs a warning on startup if the window is larger.
 
 Behaviour to be aware of:
@@ -417,6 +417,9 @@ Example alerts:
 ```yaml
 # Fewer dropped samples than expected for a pair of replicas: a replica is missing or not deduplicated.
 - expr: sum by (tenant) (rate(thanos_receive_ha_dedup_samples_total{outcome="dropped"}[30m])) / sum by (tenant) (rate(thanos_receive_ha_dedup_samples_total[30m])) < 0.3
+  for: 30m
+# More dropped samples than expected for a pair of replicas: a writer with a made-up replica value holds series.
+- expr: sum by (tenant) (rate(thanos_receive_ha_dedup_samples_total{outcome="dropped"}[30m])) / sum by (tenant) (rate(thanos_receive_ha_dedup_samples_total[30m])) > 0.6
   for: 30m
 # Series change their owner more than once per hour: replicas with lag spikes or long sample intervals.
 - expr: sum by (tenant) (increase(thanos_receive_ha_dedup_failovers_total[1h])) / sum by (tenant) (thanos_receive_ha_dedup_tracked_series) > 1

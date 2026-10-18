@@ -510,7 +510,17 @@ func (t *Tracker) decide(s *seriesState, exists bool, r uint16, ts int64, h Hori
 			// other replicas from taking over until then. The delta to it isn't an interval either.
 			s.ownerLastTs = max(s.ownerLastTs, h.max)
 		case ts > s.ownerLastTs:
-			s.intervalMs = learnInterval(s.interval(), ts-s.ownerLastTs) | s.intervalMs&candStaleFlag
+			cur := s.interval()
+			interval := learnInterval(cur, ts-s.ownerLastTs)
+			if cur != 0 && interval > cur && s.candLastTs > ts-int64(interval/2) {
+				// The interval doesn't grow to a value that a standby undercuts by writing within its last half,
+				// which bounds it to twice the standby's spacing. A preferred replica that took the series over
+				// could otherwise stretch the failover timeout with sparse samples, until one sample per maximum
+				// timeout keeps the series. After a real interval change the standby writes once per gap, so the
+				// new interval is learned unless the standby scrapes less than half of it before the owner.
+				interval = cur
+			}
+			s.intervalMs = interval | s.intervalMs&candStaleFlag
 			s.ownerLastTs = ts
 		}
 		if stale && ts >= previousTs {

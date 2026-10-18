@@ -915,6 +915,87 @@ func TestTrackerCopiesConverge(t *testing.T) {
 	}
 }
 
+func TestTrackerPreferredReplicaCannotStretchInterval(t *testing.T) {
+	t.Parallel()
+
+	// A writer with a made-up replica value that sorts first takes the series over, and then sends each sample just
+	// before a real replica would fail over. Its gaps must not grow the learned interval beyond the real replicas'.
+	for _, tcase := range []struct {
+		name    string
+		offsets []int64
+	}{
+		{name: "one real replica", offsets: []int64{0}},
+		{name: "two real replicas", offsets: []int64{0, 5000}},
+	} {
+		t.Run(tcase.name, func(t *testing.T) {
+			t.Parallel()
+
+			now := time.UnixMilli(testNow)
+			tr := newTestTracker(testConfig(), &now)
+			accept := func(replica string, ts int64) bool {
+				r, ok := tr.Replica(replica)
+				require.True(t, ok)
+				now = time.UnixMilli(ts)
+				accepted, _ := tr.Accept(1, r, ts, tr.Horizon(), false)
+				return accepted
+			}
+			interval := func() uint32 {
+				st := trackedState(tr, 1)
+				return st.interval()
+			}
+
+			var lastMadeUp int64
+			for scrape := testNow; scrape < testNow+6*time.Hour.Milliseconds(); scrape += 15000 {
+				for i, offset := range tcase.offsets {
+					ts := scrape + offset
+					if ts >= testNow+time.Minute.Milliseconds() && (lastMadeUp == 0 || later(ts, lastMadeUp, tr.timeout(interval()))) {
+						lastMadeUp = ts - 1
+						require.True(t, accept("!", lastMadeUp))
+					}
+					accept(fmt.Sprintf("prometheus-%d", i), ts)
+				}
+			}
+			require.LessOrEqual(t, interval(), uint32(30000))
+		})
+	}
+}
+
+func TestTrackerLearnsLongerIntervalWithStandby(t *testing.T) {
+	t.Parallel()
+
+	// Both replicas change their scrape interval from 15s to 60s. The standby scrapes after the owner, within the
+	// failover timeout of the old interval.
+	for _, offset := range []int64{2000, 10000, 20000} {
+		t.Run(fmt.Sprintf("offset %ds", offset/1000), func(t *testing.T) {
+			t.Parallel()
+
+			now := time.UnixMilli(testNow)
+			tr := newTestTracker(testConfig(), &now)
+			a, _ := tr.Replica("prometheus-0")
+			b, _ := tr.Replica("prometheus-1")
+			accept := func(r uint16, ts int64) (bool, Change) {
+				now = time.UnixMilli(ts)
+				return tr.Accept(1, r, ts, tr.Horizon(), false)
+			}
+
+			ts := testNow
+			for _, interval := range []int64{15000, 60000} {
+				for range 120 {
+					accepted, change := accept(a, ts)
+					require.True(t, accepted)
+					require.Equal(t, ts == testNow, change != NoChange)
+					accepted, change = accept(b, ts+offset)
+					require.False(t, accepted)
+					require.Equal(t, NoChange, change)
+					ts += interval
+				}
+			}
+			st := trackedState(tr, 1)
+			require.GreaterOrEqual(t, st.interval(), uint32(55000))
+		})
+	}
+}
+
 func TestLater(t *testing.T) {
 	t.Parallel()
 
