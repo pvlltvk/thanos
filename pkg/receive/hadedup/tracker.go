@@ -39,11 +39,13 @@ const (
 	candStaleFlag = 1 << 29
 	maxIntervalMs = candStaleFlag - 1
 
-	// MaxReplicasLimit is the maximum allowed value of Config.MaxReplicas.
-	MaxReplicasLimit = noReplica
+	// MaxReplicasLimit is the maximum allowed value of Config.MaxReplicas. Every new replica value copies the list of
+	// values, so filling the table takes quadratic time and allocations, which a single request of distinct values
+	// can cause.
+	MaxReplicasLimit = 4096
 	// MaxReplicaValueLength is the maximum length of a replica label value. Replica values are host or pod names,
 	// which are at most 63 bytes as DNS labels, so this leaves room for composite values while bounding the replica
-	// table to 8 MiB per tenant at MaxReplicasLimit. Series with longer values are written without deduplication.
+	// table to 512 KiB per tenant at MaxReplicasLimit. Series with longer values are written without deduplication.
 	MaxReplicaValueLength = 128
 )
 
