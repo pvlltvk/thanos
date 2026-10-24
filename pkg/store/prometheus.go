@@ -196,7 +196,8 @@ func (p *PrometheusStore) Series(r *storepb.SeriesRequest, seriesSrv storepb.Sto
 			return err
 		}
 		var b labels.Builder
-		for _, lbm := range labelMaps {
+		for i, lbm := range labelMaps {
+			labelMaps[i] = nil
 			b.Reset(labels.EmptyLabels())
 			for k, v := range lbm {
 				b.Set(k, v)
@@ -278,11 +279,13 @@ func (p *PrometheusStore) handleSampledPrometheusResponse(
 	span.SetTag("series_count", len(resp.Results[0].Timeseries))
 
 	var builder labels.Builder
-	for _, e := range resp.Results[0].Timeseries {
+	for i, e := range resp.Results[0].Timeseries {
+		resp.Results[0].Timeseries[i] = nil
 		// https://github.com/prometheus/prometheus/blob/3f6f5d3357e232abe53f1775f893fdf8f842712c/storage/remote/read_handler.go#L166
 		// MergeLabels() prefers local labels over external labels but we prefer
 		// external labels hence we need to do this:
 		lset := transformPrometheusLabels(&builder, labelpb.ZLabelsToPromLabels(e.Labels), extLset, extLsetToRemove)
+		builder.Reset(labels.EmptyLabels())
 		if len(e.Samples) == 0 {
 			// As found in https://github.com/thanos-io/thanos/issues/381
 			// Prometheus can give us completely empty time series. Ignore these with log until we figure out that
@@ -300,6 +303,7 @@ func (p *PrometheusStore) handleSampledPrometheusResponse(
 		if err != nil {
 			return err
 		}
+		e.Samples = nil
 
 		if err := s.Send(storepb.NewSeriesResponse(&storepb.Series{
 			Labels: labelpb.ZLabelsFromPromLabels(lset),

@@ -90,11 +90,17 @@ func (r *resortingServer) Flush() error {
 	if r.notSend {
 		return nil
 	}
-	for _, response := range r.series {
+	defer func() {
+		clear(r.series)
+		r.series = nil
+	}()
+	for i, response := range r.series {
 		if err := r.Store_SeriesServer.Send(storepb.NewSeriesResponse(response)); err != nil {
 			return err
 		}
+		r.series[i] = nil
 	}
+	r.series = nil
 
 	// If the underlying server is also flushable, flush it
 	if fs, ok := r.Store_SeriesServer.(flushableServer); ok {
