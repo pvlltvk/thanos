@@ -757,7 +757,6 @@ func (c *Client) get2xxResultWithGRPCErrors(ctx context.Context, spanName string
 	}
 
 	var m struct {
-		Data   any    `json:"data"`
 		Status string `json:"status"`
 		Error  string `json:"error"`
 	}

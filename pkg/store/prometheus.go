@@ -277,11 +277,12 @@ func (p *PrometheusStore) handleSampledPrometheusResponse(
 	defer span.Finish()
 	span.SetTag("series_count", len(resp.Results[0].Timeseries))
 
+	var builder labels.Builder
 	for _, e := range resp.Results[0].Timeseries {
 		// https://github.com/prometheus/prometheus/blob/3f6f5d3357e232abe53f1775f893fdf8f842712c/storage/remote/read_handler.go#L166
 		// MergeLabels() prefers local labels over external labels but we prefer
 		// external labels hence we need to do this:
-		lset := rmLabels(labelpb.ExtendSortedLabels(labelpb.ZLabelsToPromLabels(e.Labels), extLset), extLsetToRemove)
+		lset := transformPrometheusLabels(&builder, labelpb.ZLabelsToPromLabels(e.Labels), extLset, extLsetToRemove)
 		if len(e.Samples) == 0 {
 			// As found in https://github.com/thanos-io/thanos/issues/381
 			// Prometheus can give us completely empty time series. Ignore these with log until we figure out that
@@ -341,6 +342,7 @@ func (p *PrometheusStore) handleStreamedPrometheusResponse(
 	stream := remote.NewChunkedReader(bodySizer, config.DefaultChunkedReadLimit, *data)
 	hasher := hashPool.Get().(hash.Hash64)
 	defer hashPool.Put(hasher)
+	var builder labels.Builder
 	for {
 		res := &prompb.ChunkedReadResponse{}
 		err := stream.NextProto(res)
@@ -360,7 +362,7 @@ func (p *PrometheusStore) handleStreamedPrometheusResponse(
 			// MergeLabels() prefers local labels over external labels but we prefer
 			// external labels hence we need to do this:
 			// https://github.com/prometheus/prometheus/blob/3f6f5d3357e232abe53f1775f893fdf8f842712c/storage/remote/codec.go#L210.
-			completeLabelset := rmLabels(labelpb.ExtendSortedLabels(labelpb.ZLabelsToPromLabels(series.Labels), extLset), extLsetToRemove)
+			completeLabelset := transformPrometheusLabels(&builder, labelpb.ZLabelsToPromLabels(series.Labels), extLset, extLsetToRemove)
 			if !shardMatcher.MatchesLabels(completeLabelset) {
 				continue
 			}
@@ -408,6 +410,21 @@ func (p *PrometheusStore) handleStreamedPrometheusResponse(
 	level.Debug(p.logger).Log("msg", "handled ReadRequest_STREAMED_XOR_CHUNKS request.", "frames", framesNum)
 
 	return s.Flush()
+}
+
+func transformPrometheusLabels(builder *labels.Builder, lset, externalLabels labels.Labels, labelsToRemove map[string]struct{}) labels.Labels {
+	builder.Reset(lset)
+	externalLabels.Range(func(l labels.Label) {
+		builder.Set(l.Name, l.Value)
+	})
+	for name := range labelsToRemove {
+		builder.Del(name)
+	}
+	lset = builder.Labels()
+	if externalLabels.IsEmpty() && len(labelsToRemove) == 0 {
+		return lset.Copy()
+	}
+	return lset
 }
 
 type BytesCounter struct {
