@@ -50,19 +50,19 @@ func TestLimitedServerFlush(t *testing.T) {
 
 	t.Run("forwards", func(t *testing.T) {
 		upstream := &flushableTestSeriesServer{}
-		limited := &limitedPrometheusServer{limitedServer: newLimitedServer(upstream, NewLimiter(0, nil), NewLimiter(0, nil))}
-		testutil.Ok(t, limited.Flush())
+		buffer := newTestSeriesBuffer(upstream, 0, false)
+		testutil.Ok(t, buffer.Flush())
 		testutil.Equals(t, 1, upstream.flushes)
 	})
 	t.Run("propagates error", func(t *testing.T) {
 		wantErr := errors.New("flush failed")
 		upstream := &flushableTestSeriesServer{flushErr: wantErr}
-		limited := &limitedPrometheusServer{limitedServer: newLimitedServer(upstream, NewLimiter(0, nil), NewLimiter(0, nil))}
-		testutil.Equals(t, wantErr, limited.Flush())
+		buffer := newTestSeriesBuffer(upstream, 0, false)
+		testutil.Equals(t, wantErr, buffer.Flush())
 	})
 	t.Run("non-flushable server is a no-op", func(t *testing.T) {
-		limited := &limitedPrometheusServer{limitedServer: newLimitedServer(newStoreSeriesServer(context.Background()), NewLimiter(0, nil), NewLimiter(0, nil))}
-		testutil.Ok(t, limited.Flush())
+		buffer := newTestSeriesBuffer(newStoreSeriesServer(context.Background()), 0, false)
+		testutil.Ok(t, buffer.Flush())
 	})
 }
 
@@ -88,6 +88,8 @@ func (s *flushableTestSeriesServer) Flush() error {
 	s.flushes++
 	return s.flushErr
 }
+
+func (s *flushableTestSeriesServer) Context() context.Context { return context.Background() }
 
 func TestLimitedStoreServer_TSDBSortingAndBatching(t *testing.T) {
 	db, err := e2eutil.NewTSDB()

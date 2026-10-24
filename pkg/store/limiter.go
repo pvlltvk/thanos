@@ -187,12 +187,23 @@ func (i *limitedServer) Send(response *storepb.SeriesResponse) error {
 		return i.Store_SeriesServer.Send(response)
 	}
 
-	if err := i.seriesLimiter.Reserve(seriesCount); err != nil {
-		return errors.Wrapf(err, "failed to send series")
-	}
-	if err := i.samplesLimiter.Reserve(chunksCount * MaxSamplesPerChunk); err != nil {
-		return errors.Wrapf(err, "failed to send samples")
+	if err := reserveSeriesAndSamples(i.seriesLimiter, i.samplesLimiter, seriesCount, chunksCount); err != nil {
+		return err
 	}
 
 	return i.Store_SeriesServer.Send(response)
+}
+
+func reserveSeriesAndSamples(seriesLimiter SeriesLimiter, samplesLimiter ChunksLimiter, seriesCount, chunksCount uint64) error {
+	if seriesLimiter != nil {
+		if err := seriesLimiter.Reserve(seriesCount); err != nil {
+			return errors.Wrapf(err, "failed to send series")
+		}
+	}
+	if samplesLimiter != nil {
+		if err := samplesLimiter.Reserve(chunksCount * MaxSamplesPerChunk); err != nil {
+			return errors.Wrapf(err, "failed to send samples")
+		}
+	}
+	return nil
 }
