@@ -16,6 +16,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -982,4 +983,259 @@ func (c *Client) TSDBStatusInGRPC(ctx context.Context, base *url.URL, limit int,
 		return nil, errors.New("empty data field in TSDB status response")
 	}
 	return v.Data, nil
+}
+
+// SeriesInGRPCStream delivers provisional series to each and resets them for each data field.
+// Callers must discard the provisional result on error; validation errors take precedence over callback errors.
+// Repeated data fields replace earlier rows instead of merging their label maps.
+func (c *Client) SeriesInGRPCStream(ctx context.Context, base *url.URL, matchers []*labels.Matcher, startTime, endTime int64, limit int, reset func() error, each func(map[string]string) error) error {
+	u := *base
+	u.Path = path.Join(u.Path, "/api/v1/series")
+	q := u.Query()
+	q.Add("match[]", storepb.PromMatchersToString(matchers...))
+	q.Add("start", formatTime(timestamp.Time(startTime)))
+	q.Add("end", formatTime(timestamp.Time(endTime)))
+	if limit > 0 {
+		q.Add("limit", strconv.Itoa(limit))
+	}
+	u.RawQuery = q.Encode()
+
+	span, ctx := tracing.StartSpan(ctx, "/prom_series HTTP[client]")
+	defer span.Finish()
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	if err != nil {
+		return seriesStreamGRPCError(0, errors.Wrap(err, "create GET request"))
+	}
+	if c.userAgent != "" {
+		req.Header.Set("User-Agent", c.userAgent)
+	}
+	resp, err := c.Do(req.WithContext(ctx))
+	if err != nil {
+		return seriesStreamGRPCError(0, errors.Wrapf(err, "perform GET request against %s", u.String()))
+	}
+	if resp.StatusCode/100 != 2 {
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			err = errors.Wrap(readErr, "read body")
+		} else {
+			err = errors.Errorf("expected 2xx response, got %d. Body: %v", resp.StatusCode, string(body))
+		}
+		runutil.ExhaustCloseWithErrCapture(&err, resp.Body, "%s: close body", req.URL.String())
+		return seriesStreamGRPCError(resp.StatusCode, err)
+	}
+	if reset == nil {
+		reset = func() error { return nil }
+	}
+	if each == nil {
+		each = func(map[string]string) error { return nil }
+	}
+	reader := &seriesStreamReader{Reader: resp.Body}
+	decoder := json.NewDecoder(reader)
+	decoder.UseNumber()
+	response := seriesStreamDecoder{decoder: decoder, reset: reset, each: each}
+	var parseErr error
+	if resp.StatusCode != http.StatusNoContent {
+		parseErr = response.decode()
+	}
+	_, _ = io.Copy(io.Discard, reader)
+	if reader.err != nil {
+		err = errors.Wrap(reader.err, "read body")
+	}
+	runutil.ExhaustCloseWithErrCapture(&err, resp.Body, "%s: close body", req.URL.String())
+	if err != nil {
+		return seriesStreamGRPCError(resp.StatusCode, err)
+	}
+	if resp.StatusCode == http.StatusNoContent {
+		return nil
+	}
+	if parseErr != nil {
+		return seriesStreamGRPCError(resp.StatusCode, parseErr)
+	}
+	if response.envelopeErr != nil {
+		return seriesStreamGRPCError(resp.StatusCode, response.envelopeErr)
+	}
+	if response.status != SUCCESS {
+		return status.Error(codes.Internal, response.failure)
+	}
+	if response.dataErr != nil {
+		return seriesStreamGRPCError(resp.StatusCode, response.dataErr)
+	}
+	return response.callbackErr
+}
+
+type seriesStreamReader struct {
+	io.Reader
+	err error
+}
+
+func (r *seriesStreamReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if err != nil && err != io.EOF && r.err == nil {
+		r.err = err
+	}
+	return n, err
+}
+
+type seriesStreamDecoder struct {
+	decoder     *json.Decoder
+	reset       func() error
+	each        func(map[string]string) error
+	status      string
+	failure     string
+	envelopeErr error
+	dataErr     error
+	callbackErr error
+}
+
+func (s *seriesStreamDecoder) decode() error {
+	token, err := s.decoder.Token()
+	if err != nil {
+		return err
+	}
+	if token == json.Delim('{') {
+		for s.decoder.More() {
+			key, err := s.decoder.Token()
+			if err != nil {
+				return err
+			}
+			switch {
+			case strings.EqualFold(key.(string), "status"):
+				err = s.decoder.Decode(&s.status)
+				if !s.saveTypeError(err, &s.envelopeErr) {
+					return err
+				}
+			case strings.EqualFold(key.(string), "error"):
+				err = s.decoder.Decode(&s.failure)
+				if !s.saveTypeError(err, &s.envelopeErr) {
+					return err
+				}
+			case strings.EqualFold(key.(string), "data"):
+				if err = s.decodeData(); err != nil {
+					return err
+				}
+			default:
+				value, err := s.decoder.Token()
+				if err != nil {
+					return err
+				}
+				if err = s.skipValue(value); err != nil {
+					return err
+				}
+			}
+		}
+		if _, err = s.decoder.Token(); err != nil {
+			return err
+		}
+	} else if token != nil {
+		s.envelopeErr = seriesStreamTypeError(token, reflect.TypeOf(struct {
+			Status string
+			Error  string
+		}{}))
+		if err = s.skipValue(token); err != nil {
+			return err
+		}
+	}
+	if _, err = s.decoder.Token(); err != io.EOF {
+		if err != nil {
+			return err
+		}
+		return errors.New("invalid character after top-level JSON value")
+	}
+	return nil
+}
+
+func (s *seriesStreamDecoder) decodeData() error {
+	token, err := s.decoder.Token()
+	if err != nil {
+		return err
+	}
+	if token == nil {
+		s.callbackErr = s.reset()
+		return nil
+	}
+	if token != json.Delim('[') {
+		if s.dataErr == nil {
+			s.dataErr = seriesStreamTypeError(token, reflect.TypeOf([]map[string]string{}))
+		}
+		return s.skipValue(token)
+	}
+	s.callbackErr = s.reset()
+	for s.decoder.More() {
+		var row map[string]string
+		err = s.decoder.Decode(&row)
+		if !s.saveTypeError(err, &s.dataErr) {
+			return err
+		}
+		if err == nil && s.dataErr == nil && s.callbackErr == nil {
+			s.callbackErr = s.each(row)
+		}
+	}
+	_, err = s.decoder.Token()
+	return err
+}
+
+func (s *seriesStreamDecoder) saveTypeError(err error, destination *error) bool {
+	if err == nil {
+		return true
+	}
+	var typeErr *json.UnmarshalTypeError
+	if !errors.As(err, &typeErr) {
+		return false
+	}
+	if *destination == nil {
+		*destination = err
+	}
+	return true
+}
+
+func (s *seriesStreamDecoder) skipValue(token any) error {
+	if token != json.Delim('{') && token != json.Delim('[') {
+		return nil
+	}
+	depth := 1
+	for depth > 0 {
+		token, err := s.decoder.Token()
+		if err != nil {
+			return err
+		}
+		switch token {
+		case json.Delim('{'), json.Delim('['):
+			depth++
+			if depth >= 10000 {
+				return errors.New("invalid character: exceeded max depth")
+			}
+		case json.Delim('}'), json.Delim(']'):
+			depth--
+		}
+	}
+	return nil
+}
+
+func seriesStreamTypeError(token any, destination reflect.Type) error {
+	var value string
+	switch token.(type) {
+	case json.Delim:
+		if token == json.Delim('{') {
+			value = "object"
+		} else {
+			value = "array"
+		}
+	case json.Number:
+		value = "number"
+	case bool:
+		value = "bool"
+	case string:
+		value = "string"
+	default:
+		value = "null"
+	}
+	return &json.UnmarshalTypeError{Value: value, Type: destination}
+}
+
+func seriesStreamGRPCError(code int, err error) error {
+	grpcCode, exists := statusToCode[code]
+	if !exists {
+		grpcCode = codes.Internal
+	}
+	return status.Error(grpcCode, err.Error())
 }

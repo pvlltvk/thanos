@@ -173,25 +173,21 @@ func (p *PrometheusStore) Series(r *storepb.SeriesRequest, seriesSrv storepb.Sto
 
 	if r.SkipChunks {
 		finalExtLset := rmLabels(extLset.Copy(), extLsetToRemove)
-		labelMaps, err := p.client.SeriesInGRPC(s.Context(), p.base, matchers, r.MinTime, r.MaxTime, int(r.Limit))
-		if err != nil {
-			return err
-		}
 		var b labels.Builder
-		for i, lbm := range labelMaps {
-			labelMaps[i] = nil
+		err := p.client.SeriesInGRPCStream(s.Context(), p.base, matchers, r.MinTime, r.MaxTime, int(r.Limit), s.reset, func(lbm map[string]string) error {
 			b.Reset(labels.EmptyLabels())
 			for k, v := range lbm {
 				b.Set(k, v)
 			}
-			// external labels should take precedence
 			finalExtLset.Range(func(l labels.Label) {
 				b.Set(l.Name, l.Value)
 			})
 			lset := labelpb.ZLabelsFromPromLabels(b.Labels())
-			if err = s.add(lset, nil); err != nil {
-				return err
-			}
+			b.Reset(labels.EmptyLabels())
+			return s.add(lset, nil)
+		})
+		if err := s.finishMetadata(err); err != nil {
+			return err
 		}
 		return s.Flush()
 	}
