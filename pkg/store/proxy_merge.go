@@ -96,12 +96,12 @@ func (d *responseDeduplicator) Next() bool {
 		return true
 	}
 
-	d.buffRespI = 0
-	d.bufferedResp = d.bufferedResp[:0]
-	d.bufferedSameSeries = d.bufferedSameSeries[:0]
 	if !d.ok && d.prev == nil {
 		return false
 	}
+	d.buffRespI = 0
+	d.bufferedResp = d.bufferedResp[:0]
+	d.bufferedSameSeries = d.bufferedSameSeries[:0]
 
 	var s *storepb.SeriesResponse
 	for {
@@ -146,7 +146,6 @@ func (d *responseDeduplicator) Next() bool {
 
 func (d *responseDeduplicator) chainSeriesAndRemIdenticalChunks(series []*storepb.SeriesResponse) *storepb.SeriesResponse {
 	defer clear(series)
-	clear(d.chunkDedupMap)
 	defer clear(d.chunkDedupMap)
 
 	for _, s := range series {

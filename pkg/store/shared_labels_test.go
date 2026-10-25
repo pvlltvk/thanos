@@ -70,6 +70,7 @@ func TestSharedStoreLabelTransform(t *testing.T) {
 	}
 }
 
+// Model caller preprocessing to isolate the helper; separate handler/client tests cover production callers.
 func sharedLabelTransform(builder *labels.Builder, caller string, local, external labels.Labels, remove map[string]struct{}) labels.Labels {
 	switch caller {
 	case "tsdb":
