@@ -272,9 +272,13 @@ func (p *PrometheusStore) handleSampledPrometheusResponse(
 	defer span.Finish()
 	span.SetTag("series_count", len(resp.Results[0].Timeseries))
 
+	return p.sendSampledResponse(s, resp.Results[0].Timeseries, extLset, extLsetToRemove)
+}
+
+func (p *PrometheusStore) sendSampledResponse(s *prometheusSeriesBuffer, entries []*prompb.TimeSeries, extLset labels.Labels, extLsetToRemove map[string]struct{}) error {
 	var builder labels.Builder
-	for i, e := range resp.Results[0].Timeseries {
-		resp.Results[0].Timeseries[i] = nil
+	for i, e := range entries {
+		entries[i] = nil
 		// https://github.com/prometheus/prometheus/blob/3f6f5d3357e232abe53f1775f893fdf8f842712c/storage/remote/read_handler.go#L166
 		// MergeLabels() prefers local labels over external labels but we prefer
 		// external labels hence we need to do this:
@@ -303,7 +307,7 @@ func (p *PrometheusStore) handleSampledPrometheusResponse(
 			return err
 		}
 	}
-	level.Debug(p.logger).Log("msg", "handled ReadRequest_SAMPLED request.", "series", len(resp.Results[0].Timeseries))
+	level.Debug(p.logger).Log("msg", "handled ReadRequest_SAMPLED request.", "series", len(entries))
 	return s.Flush()
 }
 

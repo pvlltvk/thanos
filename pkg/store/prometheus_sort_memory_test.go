@@ -191,7 +191,11 @@ func TestPrometheusStore_Series_SortMemoryProfile(t *testing.T) {
 		}
 		body := &memoryProbeBody{Reader: bytes.NewReader(fixture), eof: make(chan struct{}), continueRead: inputGate}
 		bodies <- body
-		return body
+		// Hide bytes.Reader.WriteTo so io.Copy also passes through the EOF checkpoint.
+		return struct {
+			io.Reader
+			io.Closer
+		}{Reader: body, Closer: body}
 	})
 	warm := runSortMemoryRequests(p, req, requests, 0)
 	for _, result := range warm {

@@ -5,6 +5,7 @@ package main
 
 import (
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/alecthomas/kingpin/v2"
@@ -48,6 +49,21 @@ func TestSidecarSeriesSortFlags(t *testing.T) {
 			testutil.Equals(t, tc.threshold, conf.seriesSortThreshold)
 			testutil.Equals(t, tc.maxBytes, conf.seriesSortMaxBytes)
 			testutil.Equals(t, tc.directory, conf.seriesSortDirectory)
+		})
+	}
+}
+
+func TestSidecarSeriesSortNegativeUnits(t *testing.T) {
+	for _, flag := range []string{"--store.series-sort-spill-threshold=-1B", "--store.series-sort-max-spill-size=-1MB"} {
+		t.Run(flag, func(t *testing.T) {
+			app := kingpin.New("test", "test")
+			var conf sidecarConfig
+			conf.registerFlag(app)
+			_, err := app.Parse([]string{flag})
+			testutil.Ok(t, err)
+			_, err = store.NewPrometheusStore(nil, prometheus.NewRegistry(), nil, &url.URL{}, component.Sidecar, nil, nil, nil,
+				store.WithPrometheusStoreSorting(conf.seriesSortThreshold, conf.seriesSortDirectory, conf.seriesSortMaxBytes))
+			testutil.Assert(t, err != nil && strings.Contains(err.Error(), "must not be negative"), "unexpected validation result: %v", err)
 		})
 	}
 }

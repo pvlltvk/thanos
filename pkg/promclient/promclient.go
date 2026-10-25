@@ -1032,7 +1032,7 @@ func (c *Client) SeriesInGRPCStream(ctx context.Context, base *url.URL, matchers
 	reader := &seriesStreamReader{Reader: resp.Body}
 	decoder := json.NewDecoder(reader)
 	decoder.UseNumber()
-	response := seriesStreamDecoder{decoder: decoder, reset: reset, each: each}
+	response := seriesStreamDecoder{decoder: decoder, reader: reader, reset: reset, each: each}
 	var parseErr error
 	if resp.StatusCode != http.StatusNoContent {
 		parseErr = response.decode()
@@ -1049,6 +1049,9 @@ func (c *Client) SeriesInGRPCStream(ctx context.Context, base *url.URL, matchers
 		return nil
 	}
 	if parseErr != nil {
+		if parseErr == io.EOF || parseErr == io.ErrUnexpectedEOF {
+			parseErr = errors.New("unexpected end of JSON input")
+		}
 		return seriesStreamGRPCError(resp.StatusCode, parseErr)
 	}
 	if response.envelopeErr != nil {
@@ -1078,6 +1081,7 @@ func (r *seriesStreamReader) Read(p []byte) (int, error) {
 
 type seriesStreamDecoder struct {
 	decoder     *json.Decoder
+	reader      io.Reader
 	reset       func() error
 	each        func(map[string]string) error
 	status      string
@@ -1101,12 +1105,12 @@ func (s *seriesStreamDecoder) decode() error {
 			switch {
 			case strings.EqualFold(key.(string), "status"):
 				err = s.decoder.Decode(&s.status)
-				if !s.saveTypeError(err, &s.envelopeErr) {
+				if !s.saveTypeError(err, &s.envelopeErr, "status") {
 					return err
 				}
 			case strings.EqualFold(key.(string), "error"):
 				err = s.decoder.Decode(&s.failure)
-				if !s.saveTypeError(err, &s.envelopeErr) {
+				if !s.saveTypeError(err, &s.envelopeErr, "error") {
 					return err
 				}
 			case strings.EqualFold(key.(string), "data"):
@@ -1128,20 +1132,29 @@ func (s *seriesStreamDecoder) decode() error {
 		}
 	} else if token != nil {
 		s.envelopeErr = seriesStreamTypeError(token, reflect.TypeOf(struct {
-			Status string
-			Error  string
+			Status string `json:"status"`
+			Error  string `json:"error"`
 		}{}))
 		if err = s.skipValue(token); err != nil {
 			return err
 		}
 	}
-	if _, err = s.decoder.Token(); err != io.EOF {
+	trailing := io.MultiReader(s.decoder.Buffered(), s.reader)
+	var next [512]byte
+	for {
+		n, err := trailing.Read(next[:])
+		for _, c := range next[:n] {
+			if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
+				return errors.Errorf("invalid character %q after top-level value", rune(c))
+			}
+		}
 		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
 			return err
 		}
-		return errors.New("invalid character after top-level JSON value")
 	}
-	return nil
 }
 
 func (s *seriesStreamDecoder) decodeData() error {
@@ -1156,6 +1169,7 @@ func (s *seriesStreamDecoder) decodeData() error {
 	if token != json.Delim('[') {
 		if s.dataErr == nil {
 			s.dataErr = seriesStreamTypeError(token, reflect.TypeOf([]map[string]string{}))
+			s.dataErr.(*json.UnmarshalTypeError).Field = "data"
 		}
 		return s.skipValue(token)
 	}
@@ -1163,7 +1177,7 @@ func (s *seriesStreamDecoder) decodeData() error {
 	for s.decoder.More() {
 		var row map[string]string
 		err = s.decoder.Decode(&row)
-		if !s.saveTypeError(err, &s.dataErr) {
+		if !s.saveTypeError(err, &s.dataErr, "data") {
 			return err
 		}
 		if err == nil && s.dataErr == nil && s.callbackErr == nil {
@@ -1174,7 +1188,7 @@ func (s *seriesStreamDecoder) decodeData() error {
 	return err
 }
 
-func (s *seriesStreamDecoder) saveTypeError(err error, destination *error) bool {
+func (s *seriesStreamDecoder) saveTypeError(err error, destination *error, field string) bool {
 	if err == nil {
 		return true
 	}
@@ -1183,6 +1197,7 @@ func (s *seriesStreamDecoder) saveTypeError(err error, destination *error) bool 
 		return false
 	}
 	if *destination == nil {
+		typeErr.Field = field
 		*destination = err
 	}
 	return true

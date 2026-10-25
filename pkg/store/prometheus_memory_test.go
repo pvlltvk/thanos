@@ -291,8 +291,8 @@ func memorySeriesFixture(b testing.TB, mode string, seriesCount, chunksPerSeries
 }
 
 func TestPrometheusStore_Series_MemoryProfile(t *testing.T) {
-	if testing.Short() {
-		t.Skip("process memory probe is intentionally opt-in to longer test suites")
+	if testing.Short() || os.Getenv("THANOS_MEMORY_PROFILE") != "1" {
+		t.Skip("isolated memory measurement requires THANOS_MEMORY_PROFILE=1")
 	}
 	latencyMode := os.Getenv("THANOS_MEMORY_LATENCY") == "1"
 	seriesCount := 1000

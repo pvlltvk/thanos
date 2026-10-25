@@ -45,7 +45,7 @@ func TestLimiter(t *testing.T) {
 	testutil.Equals(t, float64(1), prom_testutil.ToFloat64(c))
 }
 
-func TestLimitedServerFlush(t *testing.T) {
+func TestPrometheusSeriesBufferFlushForwarding(t *testing.T) {
 	t.Parallel()
 
 	t.Run("forwards", func(t *testing.T) {

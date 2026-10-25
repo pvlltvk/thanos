@@ -18,6 +18,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/model/labels"
+	"google.golang.org/grpc/status"
 
 	"github.com/thanos-io/thanos/pkg/errutil"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
@@ -100,6 +101,7 @@ func (s *prometheusExternalSorter) createRun(pass, index, count uint64) (_ io.Re
 	if err != nil {
 		return nil, err
 	}
+	file = &prometheusSortWriter{ReadWriteCloser: file, writer: bufio.NewWriterSize(file, 64*1024), ctx: s.ctx}
 	var header [16]byte
 	copy(header[:], prometheusSortMagic)
 	binary.LittleEndian.PutUint64(header[8:], count)
@@ -279,7 +281,10 @@ func (s *prometheusExternalSorter) mergeRuns(start, count uint64, outputIndex ui
 	}
 	heads := prometheusSortHeap(append([]*prometheusSortReader(nil), readers...))
 	heap.Init(&heads)
-	copyBuffer := make([]byte, 32*1024)
+	var copyBuffer []byte
+	if output != nil {
+		copyBuffer = make([]byte, 32*1024)
+	}
 	for len(heads) > 0 {
 		r := heap.Pop(&heads).(*prometheusSortReader)
 		record := r.record
@@ -382,13 +387,12 @@ func (s *prometheusExternalSorter) merge(emit func(prometheusSeries) error) erro
 }
 
 func (s *prometheusExternalSorter) Close() error {
-	if s.requestDir != "" {
-		if err := s.ops.removeAll(s.requestDir); err != nil {
-			return err
-		}
-	}
+	dir := s.requestDir
 	s.requestDir = ""
 	s.pass, s.runs, s.records, s.bytes, s.maxKey, s.maxPayload = 0, 0, 0, 0, 0, 0
+	if dir != "" {
+		return errors.Wrapf(s.ops.removeAll(dir), "remove series sort directory %s", dir)
+	}
 	return nil
 }
 
@@ -396,9 +400,42 @@ func (s *prometheusExternalSorter) reset() error { return s.Close() }
 
 func closePrometheusSeriesResource(err *error, closer io.Closer) {
 	if closeErr := closer.Close(); closeErr != nil {
+		primary, hasStatus := status.FromError(*err)
 		var errs errutil.MultiError
 		errs.Add(*err)
 		errs.Add(errors.Wrap(closeErr, "close Prometheus series resource"))
 		*err = errs.Err()
+		if hasStatus && primary != nil {
+			proto := primary.Proto()
+			proto.Message = (*err).Error()
+			*err = &prometheusSeriesCloseError{error: *err, status: status.FromProto(proto)}
+		}
 	}
+}
+
+type prometheusSeriesCloseError struct {
+	error
+	status *status.Status
+}
+
+func (e *prometheusSeriesCloseError) GRPCStatus() *status.Status { return e.status }
+func (e *prometheusSeriesCloseError) Unwrap() error              { return e.error }
+
+type prometheusSortWriter struct {
+	io.ReadWriteCloser
+	writer *bufio.Writer
+	ctx    context.Context
+}
+
+func (w *prometheusSortWriter) Write(p []byte) (int, error) { return w.writer.Write(p) }
+
+func (w *prometheusSortWriter) Close() (err error) {
+	defer closePrometheusSeriesResource(&err, w.ReadWriteCloser)
+	if err = w.ctx.Err(); err != nil {
+		return err
+	}
+	if err = w.writer.Flush(); err != nil {
+		return err
+	}
+	return w.ctx.Err()
 }

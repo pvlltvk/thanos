@@ -181,10 +181,9 @@ func (b *prometheusSeriesBuffer) Close() error {
 		upstream.series = nil
 	}
 	if b.sorter != nil {
-		if err := b.sorter.Close(); err != nil {
-			return err
-		}
+		sorter := b.sorter
 		b.sorter = nil
+		return sorter.Close()
 	}
 	return nil
 }
