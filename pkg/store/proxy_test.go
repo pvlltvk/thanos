@@ -2552,7 +2552,7 @@ func TestDedupRespHeap_Deduplication(t *testing.T) {
 					closeSeries:       func() {},
 					cl:                nopClientSendCloser{},
 					wg:                &sync.WaitGroup{},
-					bufferedResponses: tcase.responses,
+					bufferedResponses: append([]*storepb.SeriesResponse(nil), tcase.responses...),
 				},
 			))
 			tcase.testFn(tcase.responses, h)
