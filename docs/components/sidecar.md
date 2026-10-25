@@ -31,7 +31,28 @@ Use `--store.limits.request-series` and `--store.limits.request-samples` to limi
 
 Sidecar checks these limits before retaining responses for sorting. If a limit is exceeded, the request fails without sending the buffered series. For streamed remote reads, Sidecar stops reading and closes the upstream response body. Rejected requests increment `thanos_store_selects_dropped_total` with reason `series` or `chunks`.
 
-These limits reduce retained results for rejected requests, but do not impose a hard memory limit. Successful and unlimited requests still buffer their results for sorting. A decoded frame or a large chunk can consume memory before the check, and metadata and sampled fallback responses are fully decoded before their series are checked. Concurrent requests have separate budgets.
+These limits reduce retained results for rejected requests, but do not impose a hard memory limit. Successful and unlimited requests still buffer their results for sorting. A decoded frame or a large chunk can consume memory before the check. Metadata rows are parsed incrementally, but the full response is validated before returning a limit failure. Sampled fallback responses are fully decoded before their series are checked. Concurrent requests have separate budgets.
+
+## Series sorting memory
+
+Sidecar retains final labels and raw chunks for sorting, then builds outgoing StoreAPI chunks as it sends each series. Metadata is parsed one row at a time. These changes reduce intermediate allocations and retained descriptors while preserving complete sorted results; chunk payloads can still dominate memory for large queries.
+
+To move large sorted results to disk, set `--store.series-sort-spill-threshold` to a positive byte size and `--store.series-sort-spill-dir` to an existing writable directory. The default threshold is `0`, which disables disk sorting. Requests below the threshold create no temporary files. For example:
+
+```bash
+thanos sidecar \
+  --store.series-sort-spill-threshold=64MB \
+  --store.series-sort-spill-dir=/var/lib/thanos/series-sort \
+  --store.series-sort-max-spill-size=4GB
+```
+
+The threshold applies to each request's retained sorting records, including labels, chunk descriptors and payloads. It is a buffering target, not a heap or RSS limit: the current decoded frame, the largest record, output batches, merge buffers and runtime overhead need additional memory. Concurrent requests have separate targets. Disk I/O also uses the operating system's page cache and can increase container memory usage.
+
+`--store.series-sort-max-spill-size` limits each request's live temporary file bytes, including merge input and output files held at the same time. Its default `0` leaves disk usage unlimited. Use a dedicated directory on a filesystem with an appropriate quota for a process-wide disk ceiling. Budget exhaustion or an I/O error fails the request. Upstream and count-limit failures send no buffered series; errors while merging or sending can occur after some series have been sent.
+
+Disk sorting uses private request directories and a bounded merge fan-in. Files are removed on normal completion, errors and cancellation. A process crash, OOM kill or SIGKILL can leave request directories behind. After stopping all Sidecars using the directory, remove only known stale `thanos-series-sort-*` request directories; Sidecar does not automatically sweep a shared directory.
+
+Measure memory and latency with representative queries before enabling disk sorting. Sorting writes and reads temporary data, so completion and time to first response can increase with disk load, payload size and concurrent requests. This option remains disabled by default.
 
 ## Reloader Configuration
 
@@ -253,6 +274,19 @@ Flags:
                                  NOTE: For efficiency the limit is internally
                                  implemented as 'chunks limit' considering each
                                  chunk contains a maximum of 120 samples.
+      --store.series-sort-spill-threshold=0
+                                 Per-request retained series sorting buffer
+                                 target in bytes. 0 disables disk sorting.
+                                 Frames, the largest record, output batches and
+                                 merge buffers can exceed this target.
+      --store.series-sort-spill-dir=""
+                                 Directory for private per-request series
+                                 sorting files. Required when disk sorting is
+                                 enabled; use an existing writable directory.
+      --store.series-sort-max-spill-size=0
+                                 Maximum live temporary sorting file bytes per
+                                 request, including simultaneous merge inputs
+                                 and outputs. 0 means unlimited.
       --min-time=0000-01-01T00:00:00Z
                                  Start of time range limit to serve. Thanos
                                  sidecar will serve only metrics, which happened

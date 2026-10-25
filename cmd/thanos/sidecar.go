@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/alecthomas/units"
 	extflag "github.com/efficientgo/tools/extkingpin"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -315,7 +316,9 @@ func runSidecar(
 	{
 		c := promclient.NewWithTracingClient(logger, httpClient, clientconfig.ThanosUserAgent)
 
-		promStore, err := store.NewPrometheusStore(logger, reg, c, conf.prometheus.url, component.Sidecar, m.Labels, m.Timestamps, m.Version, store.WithPrometheusStoreLimits(conf.storeRateLimits))
+		promStore, err := store.NewPrometheusStore(logger, reg, c, conf.prometheus.url, component.Sidecar, m.Labels, m.Timestamps, m.Version,
+			store.WithPrometheusStoreLimits(conf.storeRateLimits),
+			store.WithPrometheusStoreSorting(conf.seriesSortThreshold, conf.seriesSortDirectory, conf.seriesSortMaxBytes))
 		if err != nil {
 			return errors.Wrap(err, "create Prometheus store")
 		}
@@ -617,16 +620,19 @@ func (s *promMetadata) Version() string {
 }
 
 type sidecarConfig struct {
-	http            httpConfig
-	grpc            grpcConfig
-	prometheus      prometheusConfig
-	tsdb            tsdbConfig
-	reloader        reloaderConfig
-	reqLogConfig    *extflag.PathOrContent
-	objStore        extflag.PathOrContent
-	shipper         shipperConfig
-	limitMinTime    thanosmodel.TimeOrDurationValue
-	storeRateLimits store.SeriesSelectLimits
+	http                httpConfig
+	grpc                grpcConfig
+	prometheus          prometheusConfig
+	tsdb                tsdbConfig
+	reloader            reloaderConfig
+	reqLogConfig        *extflag.PathOrContent
+	objStore            extflag.PathOrContent
+	shipper             shipperConfig
+	limitMinTime        thanosmodel.TimeOrDurationValue
+	storeRateLimits     store.SeriesSelectLimits
+	seriesSortThreshold units.Base2Bytes
+	seriesSortDirectory string
+	seriesSortMaxBytes  units.Base2Bytes
 }
 
 func (sc *sidecarConfig) registerFlag(cmd extkingpin.FlagClause) {
@@ -639,6 +645,9 @@ func (sc *sidecarConfig) registerFlag(cmd extkingpin.FlagClause) {
 	sc.objStore = *extkingpin.RegisterCommonObjStoreFlags(cmd, "", false)
 	sc.shipper.registerFlag(cmd)
 	sc.storeRateLimits.RegisterFlags(cmd)
+	cmd.Flag("store.series-sort-spill-threshold", "Per-request retained series sorting buffer target in bytes. 0 disables disk sorting. Frames, the largest record, output batches and merge buffers can exceed this target.").Default("0").BytesVar(&sc.seriesSortThreshold)
+	cmd.Flag("store.series-sort-spill-dir", "Directory for private per-request series sorting files. Required when disk sorting is enabled; use an existing writable directory.").Default("").StringVar(&sc.seriesSortDirectory)
+	cmd.Flag("store.series-sort-max-spill-size", "Maximum live temporary sorting file bytes per request, including simultaneous merge inputs and outputs. 0 means unlimited.").Default("0").BytesVar(&sc.seriesSortMaxBytes)
 	cmd.Flag("min-time", "Start of time range limit to serve. Thanos sidecar will serve only metrics, which happened later than this value. Option can be a constant time in RFC3339 format or time duration relative to current time, such as -1d or 2h45m. Valid duration units are ms, s, m, h, d, w, y.").
 		Default("0000-01-01T00:00:00Z").SetValue(&sc.limitMinTime)
 }

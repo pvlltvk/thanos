@@ -12,6 +12,7 @@ We use *breaking :warning:* to mark changes that are not backward compatible (re
 
 ### Added
 
+- Sidecar: Add optional disk sorting with `--store.series-sort-spill-threshold`, `--store.series-sort-spill-dir` and `--store.series-sort-max-spill-size` to reduce retained memory for large StoreAPI queries. Disabled by default.
 - [#9059](https://github.com/thanos-io/thanos/issues/9059) Store: Add `thanos_bucket_store_chunk_pool_used_bytes` and `thanos_bucket_store_chunk_pool_max_bytes` gauges for the chunk pool.
 - [#8356](https://github.com/thanos-io/thanos/pull/8356): receive: Add retry-after backoff with jitter via header field to active-series-limiting (429) and quorum-unavailable (503) responses
 - [#8882](https://github.com/thanos-io/thanos/pull/8882) Receive: implement multi-tenant writes; greatly improves throughput when using the split tenant label functionality.
@@ -36,6 +37,7 @@ We use *breaking :warning:* to mark changes that are not backward compatible (re
 
 ### Changed
 
+- Sidecar: Reduce successful query allocations and retained sorting descriptors; parse series metadata incrementally and release processed results promptly.
 - Sidecar: Enforce `--store.limits.request-series` and `--store.limits.request-samples` before buffering results. Over-limit requests return no partial data series.
 - [#6099](https://github.com/thanos-io/thanos/issues/6099): Tracing: drop the noisiest INTERNAL spans (`proxy.series`, `proxy.label_names`, `proxy.label_values`, `bucket_store_block_series`, `send_rules_response`, `send_rule_group_response`) so distributed traces stay usable; gRPC CLIENT/SERVER spans remain.
 - [#8907](https://github.com/thanos-io/thanos/pull/8907): UI: Migrate the React app (`pkg/ui/react-app`) from npm to pnpm; contributors now need pnpm 11+ instead of npm to build the Web UI.
