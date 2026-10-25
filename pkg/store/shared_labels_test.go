@@ -82,7 +82,7 @@ func sharedLabelTransform(builder *labels.Builder, caller string, local, externa
 			return local.Copy()
 		}
 	}
-	return transformPrometheusLabels(builder, local, external, remove)
+	return transformStoreLabels(builder, local, external, remove)
 }
 
 func TestSharedStoreTSDBLabels(t *testing.T) {

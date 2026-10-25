@@ -282,7 +282,7 @@ func (p *PrometheusStore) sendSampledResponse(s *prometheusSeriesBuffer, entries
 		// https://github.com/prometheus/prometheus/blob/3f6f5d3357e232abe53f1775f893fdf8f842712c/storage/remote/read_handler.go#L166
 		// MergeLabels() prefers local labels over external labels but we prefer
 		// external labels hence we need to do this:
-		lset := transformPrometheusLabels(&builder, labelpb.ZLabelsToPromLabels(e.Labels), extLset, extLsetToRemove)
+		lset := transformStoreLabels(&builder, labelpb.ZLabelsToPromLabels(e.Labels), extLset, extLsetToRemove)
 		builder.Reset(labels.EmptyLabels())
 		if len(e.Samples) == 0 {
 			// As found in https://github.com/thanos-io/thanos/issues/381
@@ -358,7 +358,7 @@ func (p *PrometheusStore) handleStreamedPrometheusResponse(
 			// MergeLabels() prefers local labels over external labels but we prefer
 			// external labels hence we need to do this:
 			// https://github.com/prometheus/prometheus/blob/3f6f5d3357e232abe53f1775f893fdf8f842712c/storage/remote/codec.go#L210.
-			completeLabelset := transformPrometheusLabels(&builder, labelpb.ZLabelsToPromLabels(series.Labels), extLset, extLsetToRemove)
+			completeLabelset := transformStoreLabels(&builder, labelpb.ZLabelsToPromLabels(series.Labels), extLset, extLsetToRemove)
 			if !shardMatcher.MatchesLabels(completeLabelset) {
 				continue
 			}
@@ -385,21 +385,6 @@ func (p *PrometheusStore) handleStreamedPrometheusResponse(
 	level.Debug(p.logger).Log("msg", "handled ReadRequest_STREAMED_XOR_CHUNKS request.", "frames", framesNum)
 
 	return s.Flush()
-}
-
-func transformPrometheusLabels(builder *labels.Builder, lset, externalLabels labels.Labels, labelsToRemove map[string]struct{}) labels.Labels {
-	builder.Reset(lset)
-	externalLabels.Range(func(l labels.Label) {
-		builder.Set(l.Name, l.Value)
-	})
-	for name := range labelsToRemove {
-		builder.Del(name)
-	}
-	lset = builder.Labels()
-	if externalLabels.IsEmpty() && len(labelsToRemove) == 0 {
-		return lset.Copy()
-	}
-	return lset
 }
 
 type BytesCounter struct {

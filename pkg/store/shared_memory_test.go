@@ -79,7 +79,7 @@ func sharedMemoryLabelDigest(inputs []labels.Labels, external labels.Labels, rem
 				result = rmLabels(result, remove)
 			}
 		case "reused":
-			result = transformPrometheusLabels(builder, input, external, remove)
+			result = transformStoreLabels(builder, input, external, remove)
 		}
 		result.Range(func(l labels.Label) {
 			digest += xxhash.Sum64String(l.Name) ^ xxhash.Sum64String(l.Value)

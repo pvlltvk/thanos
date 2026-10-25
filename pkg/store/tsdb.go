@@ -311,6 +311,7 @@ func (s *TSDBStore) Series(r *storepb.SeriesRequest, seriesSrv storepb.Store_Ser
 		extLsetToRemove[lbl] = struct{}{}
 	}
 	finalExtLset := rmLabels(s.extLsetAsLabelSets[0].Copy(), extLsetToRemove)
+	var labelBuilder labels.Builder
 
 	// Stream at most one series per frame; series may be split over multiple frames according to maxBytesInFrame.
 	ctx := srv.Context()
@@ -322,7 +323,8 @@ func (s *TSDBStore) Series(r *storepb.SeriesRequest, seriesSrv storepb.Store_Ser
 		}
 		series := set.At()
 
-		completeLabelset := labelpb.ExtendSortedLabels(rmLabels(series.Labels(), extLsetToRemove), finalExtLset)
+		completeLabelset := transformStoreLabels(&labelBuilder, series.Labels(), finalExtLset, extLsetToRemove)
+		labelBuilder.Reset(labels.EmptyLabels())
 		if !shardMatcher.MatchesLabels(completeLabelset) {
 			continue
 		}

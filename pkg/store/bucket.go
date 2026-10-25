@@ -1104,10 +1104,21 @@ type blockSeriesClient struct {
 	chkMetas         []chunks.Meta
 	lset             labels.Labels
 	b                *labels.Builder
+	labelBuilder     labels.Builder
 	symbolizedLset   []symbolizedLabel
 	entries          []seriesEntry
 	hasMorePostings  bool
 	batchSize        int
+}
+
+func (b *blockSeriesClient) seriesLabels() labels.Labels {
+	// A non-nil removal map trims empty values; the copy-only path preserves them.
+	if b.extLset.IsEmpty() && b.extLsetToRemove == nil {
+		return b.lset.Copy()
+	}
+	lset := transformStoreLabels(&b.labelBuilder, b.lset, b.extLset, b.extLsetToRemove)
+	b.labelBuilder.Reset(labels.EmptyLabels())
+	return lset
 }
 
 func newBlockSeriesClient(
@@ -1358,10 +1369,7 @@ OUTER:
 			continue
 		}
 
-		completeLabelset := labelpb.ExtendSortedLabels(b.lset, b.extLset)
-		if b.extLsetToRemove != nil {
-			completeLabelset = rmLabels(completeLabelset, b.extLsetToRemove)
-		}
+		completeLabelset := b.seriesLabels()
 
 		if !b.shardMatcher.MatchesLabels(completeLabelset) {
 			continue
