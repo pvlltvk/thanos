@@ -1122,7 +1122,7 @@ func (s *seriesStreamDecoder) decode() error {
 				if err != nil {
 					return err
 				}
-				if err = s.skipValue(value); err != nil {
+				if err = s.skipValue(value, 1); err != nil {
 					return err
 				}
 			}
@@ -1135,7 +1135,7 @@ func (s *seriesStreamDecoder) decode() error {
 			Status string `json:"status"`
 			Error  string `json:"error"`
 		}{}))
-		if err = s.skipValue(token); err != nil {
+		if err = s.skipValue(token, 0); err != nil {
 			return err
 		}
 	}
@@ -1171,7 +1171,7 @@ func (s *seriesStreamDecoder) decodeData() error {
 			s.dataErr = seriesStreamTypeError(token, reflect.TypeOf([]map[string]string{}))
 			s.dataErr.(*json.UnmarshalTypeError).Field = "data"
 		}
-		return s.skipValue(token)
+		return s.skipValue(token, 1)
 	}
 	s.callbackErr = s.reset()
 	for s.decoder.More() {
@@ -1203,7 +1203,7 @@ func (s *seriesStreamDecoder) saveTypeError(err error, destination *error, field
 	return true
 }
 
-func (s *seriesStreamDecoder) skipValue(token any) error {
+func (s *seriesStreamDecoder) skipValue(token any, parentDepth int) error {
 	if token != json.Delim('{') && token != json.Delim('[') {
 		return nil
 	}
@@ -1216,8 +1216,8 @@ func (s *seriesStreamDecoder) skipValue(token any) error {
 		switch token {
 		case json.Delim('{'), json.Delim('['):
 			depth++
-			if depth >= 10000 {
-				return errors.New("invalid character: exceeded max depth")
+			if depth+parentDepth > 10000 {
+				return errors.Errorf("invalid character %q exceeded max depth", rune(token.(json.Delim)))
 			}
 		case json.Delim('}'), json.Delim(']'):
 			depth--
