@@ -88,18 +88,20 @@ func NewResponseDeduplicator(h seriesStream) *responseDeduplicator {
 }
 
 func (d *responseDeduplicator) Next() bool {
+	if d.buffRespI < len(d.bufferedResp) {
+		d.bufferedResp[d.buffRespI] = nil
+	}
 	if d.buffRespI+1 < len(d.bufferedResp) {
 		d.buffRespI++
 		return true
 	}
 
-	if !d.ok && d.prev == nil {
-		return false
-	}
-
 	d.buffRespI = 0
 	d.bufferedResp = d.bufferedResp[:0]
 	d.bufferedSameSeries = d.bufferedSameSeries[:0]
+	if !d.ok && d.prev == nil {
+		return false
+	}
 
 	var s *storepb.SeriesResponse
 	for {
@@ -143,7 +145,9 @@ func (d *responseDeduplicator) Next() bool {
 }
 
 func (d *responseDeduplicator) chainSeriesAndRemIdenticalChunks(series []*storepb.SeriesResponse) *storepb.SeriesResponse {
+	defer clear(series)
 	clear(d.chunkDedupMap)
+	defer clear(d.chunkDedupMap)
 
 	for _, s := range series {
 		for _, chk := range s.GetSeries().Chunks {
@@ -289,6 +293,7 @@ func (rb *ringBuffer) pop() *storepb.SeriesResponse {
 	defer rb.bufferSlotEvent.Signal()
 
 	resp := rb.bufferedResponses[rb.ringHead]
+	rb.bufferedResponses[rb.ringHead] = nil
 	rb.ringHead = (rb.ringHead + 1) % rb.fixedBufferSize
 	return resp
 }
@@ -865,6 +870,9 @@ func (l *eagerRespSet) At() *storepb.SeriesResponse {
 func (l *eagerRespSet) Next() bool {
 	l.wg.Wait()
 
+	if l.i > 0 && l.i <= len(l.bufferedResponses) {
+		l.bufferedResponses[l.i-1] = nil
+	}
 	l.i++
 
 	return l.i <= len(l.bufferedResponses)
