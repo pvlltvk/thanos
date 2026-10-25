@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/alecthomas/units"
 	"github.com/blang/semver/v4"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -62,9 +63,21 @@ type PrometheusStore struct {
 	newSeriesLimiter      SeriesLimiterFactory
 	newSamplesLimiter     ChunksLimiterFactory
 	failedRequestsCounter *prometheus.CounterVec
+	seriesSortThreshold   units.Base2Bytes
+	seriesSortDirectory   string
+	seriesSortMaxBytes    units.Base2Bytes
 }
 
 type PrometheusStoreOption func(s *PrometheusStore)
+
+// WithPrometheusStoreSorting configures optional per-request external sorting.
+func WithPrometheusStoreSorting(spillThreshold units.Base2Bytes, spillDir string, maxSpillSize units.Base2Bytes) PrometheusStoreOption {
+	return func(s *PrometheusStore) {
+		s.seriesSortThreshold = spillThreshold
+		s.seriesSortDirectory = spillDir
+		s.seriesSortMaxBytes = maxSpillSize
+	}
+}
 
 // WithPrometheusStoreLimits enforces limits before results are buffered for sorting.
 // Without this option, the store applies no request limits.
@@ -111,17 +124,21 @@ func NewPrometheusStore(
 			b := make([]byte, 0, initialBufSize)
 			return &b
 		}},
-		framesRead: promauto.With(reg).NewHistogram(
-			prometheus.HistogramOpts{
-				Name:    "prometheus_store_received_frames",
-				Help:    "Number of frames received per streamed response.",
-				Buckets: prometheus.ExponentialBuckets(10, 10, 5),
-			},
-		),
 	}
 	for _, option := range options {
 		option(p)
 	}
+	if p.seriesSortThreshold < 0 || p.seriesSortMaxBytes < 0 {
+		return nil, errors.New("series sort spill sizes must not be negative")
+	}
+	if p.seriesSortThreshold > 0 && p.seriesSortDirectory == "" {
+		return nil, errors.New("series sort spill directory is required when spilling is enabled")
+	}
+	p.framesRead = promauto.With(reg).NewHistogram(prometheus.HistogramOpts{
+		Name:    "prometheus_store_received_frames",
+		Help:    "Number of frames received per streamed response.",
+		Buckets: prometheus.ExponentialBuckets(10, 10, 5),
+	})
 	if p.newSeriesLimiter != nil {
 		p.failedRequestsCounter = newSelectsDroppedCounter(reg)
 	}
@@ -143,9 +160,9 @@ func (p *PrometheusStore) putBuffer(b *[]byte) {
 }
 
 // Series returns all series for a requested time range and label matcher.
-func (p *PrometheusStore) Series(r *storepb.SeriesRequest, seriesSrv storepb.Store_SeriesServer) error {
+func (p *PrometheusStore) Series(r *storepb.SeriesRequest, seriesSrv storepb.Store_SeriesServer) (err error) {
 	s := p.newSeriesBuffer(seriesSrv, int(r.ResponseBatchSize), r.SkipChunks)
-	defer runutil.CloseWithLogOnErr(p.logger, s, "Prometheus series buffer")
+	defer closePrometheusSeriesResource(&err, s)
 
 	extLset := p.externalLabelsFn()
 

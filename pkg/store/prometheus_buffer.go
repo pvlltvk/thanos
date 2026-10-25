@@ -4,14 +4,13 @@
 package store
 
 import (
-	"cmp"
 	"context"
 	"hash"
 	"slices"
+	"unsafe"
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/prometheus/model/labels"
 
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
@@ -44,6 +43,8 @@ type prometheusSeriesBuffer struct {
 	calculateChecksums bool
 	metadata           bool
 	limitCounters      *[2]prometheusDeferredCounter
+	sorter             *prometheusExternalSorter
+	retainedBytes      uint64
 	err                error
 }
 
@@ -68,36 +69,65 @@ func (b *prometheusSeriesBuffer) add(lset []labelpb.ZLabel, chunks []prompb.Chun
 	if b.err = reserveSeriesAndSamples(b.seriesLimiter, b.samplesLimiter, 1, uint64(len(chunks))); b.err != nil {
 		return b.err
 	}
-	b.series = append(b.series, prometheusSeries{labels: lset, chunks: chunks, sequence: b.nextSequence})
+	record := prometheusSeries{labels: lset, chunks: chunks, sequence: b.nextSequence}
+	var size uint64
+	if b.store.seriesSortThreshold > 0 {
+		size = uint64(unsafe.Sizeof(record)) + uint64(cap(lset))*uint64(unsafe.Sizeof(labelpb.ZLabel{})) + uint64(cap(chunks))*uint64(unsafe.Sizeof(prompb.Chunk{}))
+		for _, label := range lset {
+			size += uint64(len(label.Name)) + uint64(len(label.Value))
+		}
+		for _, chunk := range chunks {
+			size += uint64(cap(chunk.Data))
+		}
+		if len(b.series) > 0 && size+b.retainedBytes > uint64(b.store.seriesSortThreshold) {
+			if b.err = b.spill(); b.err != nil {
+				return b.err
+			}
+		}
+	}
+	b.series = append(b.series, record)
+	b.retainedBytes += size
 	b.nextSequence++
+	if b.store.seriesSortThreshold > 0 && b.retainedBytes >= uint64(b.store.seriesSortThreshold) {
+		b.err = b.spill()
+	}
+	return b.err
+}
+
+func (b *prometheusSeriesBuffer) spill() error {
+	if len(b.series) == 0 {
+		return nil
+	}
+	if b.sorter == nil {
+		b.sorter = newPrometheusExternalSorter(b.Context(), b.store.seriesSortDirectory, int64(b.store.seriesSortMaxBytes))
+	}
+	if err := b.sorter.writeRun(b.series); err != nil {
+		return err
+	}
+	clear(b.series)
+	b.series = nil
+	b.retainedBytes = 0
 	return nil
 }
 
-func (b *prometheusSeriesBuffer) Flush() error {
+func (b *prometheusSeriesBuffer) Flush() (err error) {
+	defer closePrometheusSeriesResource(&err, b)
 	if b.err != nil {
 		return b.err
 	}
-	defer b.Close()
 	if b.err = b.Context().Err(); b.err != nil {
 		return b.err
 	}
-	slices.SortFunc(b.series, func(a, b prometheusSeries) int {
-		if c := labels.Compare(labelpb.ZLabelsToPromLabels(a.labels), labelpb.ZLabelsToPromLabels(b.labels)); c != 0 {
-			return c
-		}
-		return cmp.Compare(a.sequence, b.sequence)
-	})
 	var hasher hash.Hash64
 	defer func() {
 		if hasher != nil {
 			hashPool.Put(hasher)
 		}
 	}()
-	for i := range b.series {
-		if b.err = b.Context().Err(); b.err != nil {
-			return b.err
+	emit := func(record prometheusSeries) error {
+		if err := b.Context().Err(); err != nil {
+			return err
 		}
-		record := &b.series[i]
 		series := &storepb.Series{Labels: record.labels}
 		if len(record.chunks) > 0 {
 			series.Chunks = make([]storepb.AggrChunk, len(record.chunks))
@@ -116,9 +146,24 @@ func (b *prometheusSeriesBuffer) Flush() error {
 				},
 			}
 		}
-		*record = prometheusSeries{}
-		if b.err = b.upstream.Send(storepb.NewSeriesResponse(series)); b.err != nil {
+		return b.upstream.Send(storepb.NewSeriesResponse(series))
+	}
+	if b.sorter != nil {
+		if b.err = b.spill(); b.err != nil {
 			return b.err
+		}
+		b.err = b.sorter.merge(emit)
+		if b.err != nil {
+			return b.err
+		}
+	} else {
+		slices.SortFunc(b.series, comparePrometheusSeries)
+		for i := range b.series {
+			record := b.series[i]
+			b.series[i] = prometheusSeries{}
+			if b.err = emit(record); b.err != nil {
+				return b.err
+			}
 		}
 	}
 	b.series = nil
@@ -131,8 +176,15 @@ func (b *prometheusSeriesBuffer) Flush() error {
 func (b *prometheusSeriesBuffer) Close() error {
 	clear(b.series)
 	b.series = nil
+	b.retainedBytes = 0
 	if upstream, ok := b.upstream.(*batchableServer); ok {
 		upstream.series = nil
+	}
+	if b.sorter != nil {
+		if err := b.sorter.Close(); err != nil {
+			return err
+		}
+		b.sorter = nil
 	}
 	return nil
 }
