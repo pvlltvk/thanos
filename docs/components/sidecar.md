@@ -37,7 +37,7 @@ These limits reduce retained results for rejected requests, but do not impose a 
 
 Sidecar retains final labels and raw chunks for sorting, then builds outgoing StoreAPI chunks as it sends each series. Metadata is parsed one row at a time. These changes reduce intermediate allocations and retained descriptors while preserving complete sorted results; chunk payloads can still dominate memory for large queries.
 
-To move large sorted results to disk, set `--store.series-sort-spill-threshold` to a positive byte size and `--store.series-sort-spill-dir` to an existing writable directory. The default threshold is `0`, which disables disk sorting. Requests below the threshold create no temporary files. For example:
+To move large sorted results to disk, set `--store.series-sort-spill-threshold` to a byte size of at least `1MB` and `--store.series-sort-spill-dir` to an existing writable directory. The default threshold is `0`, which disables disk sorting. Sidecar refuses to start with a smaller positive threshold, which would turn almost every series into its own temporary file. Requests below the threshold create no temporary files. For example:
 
 ```bash
 thanos sidecar \
@@ -51,6 +51,8 @@ Sizes require a unit suffix, such as `64MB` or `4GB`, except for `0`. Directory 
 The threshold applies to each request's retained sorting records, including labels, chunk descriptors and payloads. It is a buffering target, not a heap or RSS limit: the current decoded frame, the largest record, output batches, merge buffers and runtime overhead need additional memory. Concurrent requests have separate targets. Disk I/O also uses the operating system's page cache and can increase container memory usage.
 
 `--store.series-sort-max-spill-size` limits each request's live temporary file bytes, including merge input and output files held at the same time. Its default `0` leaves disk usage unlimited. Use a dedicated directory on a filesystem with an appropriate quota for a process-wide disk ceiling. Budget exhaustion or an I/O error fails the request. Upstream and count-limit failures send no buffered series; errors while merging or sending can occur after some series have been sent.
+
+When disk sorting is enabled, `prometheus_store_series_sort_spilled_requests_total` counts requests that spilled at least one run and `prometheus_store_series_sort_spilled_bytes_total` counts bytes written to temporary files, including merge outputs. `prometheus_store_series_sort_failed_requests_total` counts requests that failed while sorting on disk, with reason `spill_size` for an exhausted `--store.series-sort-max-spill-size` budget and `io` for other failures, including cleanup failures. Requests cancelled by the client are not counted as failures.
 
 Disk sorting uses private request directories and a bounded merge fan-in. Files are removed on normal completion, errors and cancellation. A process crash, OOM kill, SIGKILL or cleanup I/O failure can leave request directories behind. Cleanup failures are returned with the request error. After stopping all Sidecars using the directory, remove only known stale `thanos-series-sort-*` request directories; Sidecar does not automatically sweep a shared directory.
 
@@ -279,9 +281,10 @@ Flags:
       --store.series-sort-spill-threshold=0
                                  Per-request retained series sorting buffer
                                  target as a size with units, e.g. 64MB.
-                                 0 disables disk sorting. Frames, the largest
-                                 record, output batches and merge buffers can
-                                 exceed this target.
+                                 0 disables disk sorting, other values must
+                                 be at least 1MB. Frames, the largest record,
+                                 output batches and merge buffers can exceed
+                                 this target.
       --store.series-sort-spill-dir=""
                                  Directory for private per-request series
                                  sorting files. Required when disk sorting is

@@ -44,6 +44,8 @@ type prometheusSeriesBuffer struct {
 	metadata           bool
 	limitCounters      *[2]prometheusDeferredCounter
 	sorter             *prometheusExternalSorter
+	sortSpilled        bool
+	sortFailed         bool
 	retainedBytes      uint64
 	err                error
 }
@@ -102,6 +104,7 @@ func (b *prometheusSeriesBuffer) spill() error {
 		b.sorter = newPrometheusExternalSorter(b.Context(), b.store.seriesSortDirectory, int64(b.store.seriesSortMaxBytes))
 	}
 	if err := b.sorter.writeRun(b.series); err != nil {
+		b.countSortFailure(err)
 		return err
 	}
 	clear(b.series)
@@ -152,8 +155,15 @@ func (b *prometheusSeriesBuffer) Flush() (err error) {
 		if b.err = b.spill(); b.err != nil {
 			return b.err
 		}
-		b.err = b.sorter.merge(emit)
+		var sendErr error
+		b.err = b.sorter.merge(func(record prometheusSeries) error {
+			sendErr = emit(record)
+			return sendErr
+		})
 		if b.err != nil {
+			if sendErr == nil {
+				b.countSortFailure(b.err)
+			}
 			return b.err
 		}
 	} else {
@@ -183,9 +193,32 @@ func (b *prometheusSeriesBuffer) Close() error {
 	if b.sorter != nil {
 		sorter := b.sorter
 		b.sorter = nil
-		return sorter.Close()
+		if b.store.seriesSortSpilledRequests != nil {
+			if sorter.runs > 0 && !b.sortSpilled {
+				b.sortSpilled = true
+				b.store.seriesSortSpilledRequests.Inc()
+			}
+			b.store.seriesSortSpilledBytes.Add(float64(sorter.written))
+		}
+		err := sorter.Close()
+		if err != nil {
+			b.countSortFailure(err)
+		}
+		return err
 	}
 	return nil
+}
+
+func (b *prometheusSeriesBuffer) countSortFailure(err error) {
+	if b.sortFailed || b.store.seriesSortFailedRequests == nil || errors.Is(err, b.Context().Err()) {
+		return
+	}
+	b.sortFailed = true
+	reason := "io"
+	if errors.Is(err, errPrometheusSortSpillLimit) {
+		reason = "spill_size"
+	}
+	b.store.seriesSortFailedRequests.WithLabelValues(reason).Inc()
 }
 
 func (b *prometheusSeriesBuffer) reset() error {

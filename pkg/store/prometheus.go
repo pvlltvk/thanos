@@ -66,6 +66,10 @@ type PrometheusStore struct {
 	seriesSortThreshold   units.Base2Bytes
 	seriesSortDirectory   string
 	seriesSortMaxBytes    units.Base2Bytes
+
+	seriesSortSpilledRequests prometheus.Counter
+	seriesSortSpilledBytes    prometheus.Counter
+	seriesSortFailedRequests  *prometheus.CounterVec
 }
 
 type PrometheusStoreOption func(s *PrometheusStore)
@@ -141,6 +145,20 @@ func NewPrometheusStore(
 	})
 	if p.newSeriesLimiter != nil {
 		p.failedRequestsCounter = newSelectsDroppedCounter(reg)
+	}
+	if p.seriesSortThreshold > 0 {
+		p.seriesSortSpilledRequests = promauto.With(reg).NewCounter(prometheus.CounterOpts{
+			Name: "prometheus_store_series_sort_spilled_requests_total",
+			Help: "Number of Series requests that spilled at least one sort run to disk.",
+		})
+		p.seriesSortSpilledBytes = promauto.With(reg).NewCounter(prometheus.CounterOpts{
+			Name: "prometheus_store_series_sort_spilled_bytes_total",
+			Help: "Number of bytes written to series sort run files.",
+		})
+		p.seriesSortFailedRequests = promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Name: "prometheus_store_series_sort_failed_requests_total",
+			Help: "Number of Series requests that failed while sorting on disk.",
+		}, []string{"reason"})
 	}
 	return p, nil
 }

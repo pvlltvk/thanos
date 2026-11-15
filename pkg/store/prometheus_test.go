@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alecthomas/units"
 	"github.com/cespare/xxhash/v2"
 	"github.com/go-kit/log"
 	"github.com/gogo/protobuf/proto"
@@ -24,6 +25,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/timestamp"
@@ -883,6 +885,82 @@ func testPrometheusStoreSeriesE2e(t *testing.T, prefix string) {
 		testutil.NotOk(t, err)
 		testutil.Equals(t, []string(nil), srv.Warnings)
 		testutil.Equals(t, "rpc error: code = InvalidArgument desc = no matchers specified (excluding external labels)", err.Error())
+	}
+}
+
+func TestPrometheusStore_Series_DiskSorting_e2e(t *testing.T) {
+	t.Parallel()
+
+	p, err := e2eutil.NewPrometheus()
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, p.Stop()) }()
+
+	baseT := timestamp.FromTime(time.Now()) / 1000 * 1000
+
+	// region is an external label too; its internal values make Prometheus return the series
+	// in the reverse of the order they have once the external value replaces them.
+	const numSeries = 100
+	a := p.Appender()
+	for i := range numSeries {
+		lset := labels.FromStrings("a", "b", "region", fmt.Sprintf("local-%03d", numSeries-i), "series", fmt.Sprintf("%03d", i))
+		for j := range int64(3) {
+			_, err = a.Append(0, lset, baseT+100*(j+1), float64(i)+float64(j))
+			testutil.Ok(t, err)
+		}
+	}
+	testutil.Ok(t, a.Commit())
+
+	ctx := t.Context()
+
+	testutil.Ok(t, p.Start(ctx, log.NewNopLogger()))
+
+	u, err := url.Parse(fmt.Sprintf("http://%s", p.Addr()))
+	testutil.Ok(t, err)
+
+	newStore := func(options ...PrometheusStoreOption) *PrometheusStore {
+		proxy, err := NewPrometheusStore(nil, prometheus.NewRegistry(), promclient.NewDefaultClient(), u, component.Sidecar,
+			func() labels.Labels { return labels.FromStrings("region", "eu-west", "replica", "a") },
+			func() (int64, int64) { return 0, math.MaxInt64 },
+			nil, options...)
+		testutil.Ok(t, err)
+		return proxy
+	}
+
+	for _, skipChunks := range []bool{false, true} {
+		t.Run(fmt.Sprintf("skip_chunks_%t", skipChunks), func(t *testing.T) {
+			req := &storepb.SeriesRequest{
+				MinTime: baseT + 100,
+				MaxTime: baseT + 300,
+				Matchers: []storepb.LabelMatcher{
+					{Type: storepb.LabelMatcher_EQ, Name: "a", Value: "b"},
+				},
+				SkipChunks:           skipChunks,
+				WithoutReplicaLabels: []string{"replica"},
+			}
+
+			want := newStoreSeriesServer(ctx)
+			testutil.Ok(t, newStore().Series(req, want))
+			testutil.Equals(t, numSeries, len(want.SeriesSet))
+			testutil.Equals(t, []labelpb.ZLabel{
+				{Name: "a", Value: "b"},
+				{Name: "region", Value: "eu-west"},
+				{Name: "series", Value: "000"},
+			}, want.SeriesSet[0].Labels)
+
+			dir := t.TempDir()
+			proxy := newStore(WithPrometheusStoreSorting(units.KiB, dir, 0))
+			runs := 0
+			got := &spillTestServer{storeSeriesServer: newStoreSeriesServer(ctx), onSend: func() {
+				runs = max(runs, len(sortRunFiles(t, dir)))
+			}}
+			testutil.Ok(t, proxy.Series(req, got))
+			testutil.Equals(t, want.SeriesSet, got.SeriesSet)
+			testutil.Equals(t, []string(nil), got.Warnings)
+			testutil.Assert(t, runs > 1, "request was merged from %d sort runs", runs)
+			testutil.Equals(t, 1.0, promtest.ToFloat64(proxy.seriesSortSpilledRequests))
+			testutil.Equals(t, 0, promtest.CollectAndCount(proxy.seriesSortFailedRequests))
+			assertSpillDirectoryEmpty(t, dir)
+		})
 	}
 }
 

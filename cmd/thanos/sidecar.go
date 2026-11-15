@@ -64,6 +64,9 @@ func registerSidecar(app *extkingpin.App) {
 	conf := &sidecarConfig{}
 	conf.registerFlag(cmd)
 	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, _ bool) error {
+		if err := conf.validateSeriesSort(); err != nil {
+			return err
+		}
 
 		grpcLogOpts, logFilterMethods, err := logging.ParsegRPCOptions(conf.reqLogConfig)
 
@@ -635,6 +638,15 @@ type sidecarConfig struct {
 	seriesSortMaxBytes  units.Base2Bytes
 }
 
+const minSeriesSortThreshold = units.MiB
+
+func (sc *sidecarConfig) validateSeriesSort() error {
+	if sc.seriesSortThreshold > 0 && sc.seriesSortThreshold < minSeriesSortThreshold {
+		return errors.Errorf("--store.series-sort-spill-threshold must be 0 or at least %s, got %s", minSeriesSortThreshold, sc.seriesSortThreshold)
+	}
+	return nil
+}
+
 func (sc *sidecarConfig) registerFlag(cmd extkingpin.FlagClause) {
 	sc.http.registerFlag(cmd)
 	sc.grpc.registerFlag(cmd)
@@ -645,7 +657,7 @@ func (sc *sidecarConfig) registerFlag(cmd extkingpin.FlagClause) {
 	sc.objStore = *extkingpin.RegisterCommonObjStoreFlags(cmd, "", false)
 	sc.shipper.registerFlag(cmd)
 	sc.storeRateLimits.RegisterFlags(cmd)
-	cmd.Flag("store.series-sort-spill-threshold", "Per-request retained series sorting buffer target as a size with units, e.g. 64MB. 0 disables disk sorting. Frames, the largest record, output batches and merge buffers can exceed this target.").Default("0").BytesVar(&sc.seriesSortThreshold)
+	cmd.Flag("store.series-sort-spill-threshold", "Per-request retained series sorting buffer target as a size with units, e.g. 64MB. 0 disables disk sorting, other values must be at least 1MB. Frames, the largest record, output batches and merge buffers can exceed this target.").Default("0").BytesVar(&sc.seriesSortThreshold)
 	cmd.Flag("store.series-sort-spill-dir", "Directory for private per-request series sorting files. Required when disk sorting is enabled; use an existing writable directory.").Default("").StringVar(&sc.seriesSortDirectory)
 	cmd.Flag("store.series-sort-max-spill-size", "Maximum live temporary sorting file size per request, e.g. 4GB, including simultaneous merge inputs and outputs. 0 means unlimited.").Default("0").BytesVar(&sc.seriesSortMaxBytes)
 	cmd.Flag("min-time", "Start of time range limit to serve. Thanos sidecar will serve only metrics, which happened later than this value. Option can be a constant time in RFC3339 format or time duration relative to current time, such as -1d or 2h45m. Valid duration units are ms, s, m, h, d, w, y.").

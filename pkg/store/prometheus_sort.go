@@ -28,6 +28,8 @@ import (
 const prometheusSortMergeFanIn = 16
 const prometheusSortMagic = "THSORT01"
 
+var errPrometheusSortSpillLimit = errors.New("series sort spill size limit exceeded")
+
 type prometheusSortFileOps struct {
 	openFile  func(string, int, os.FileMode) (io.ReadWriteCloser, error)
 	mkdirTemp func(string, string) (string, error)
@@ -42,7 +44,7 @@ type prometheusExternalSorter struct {
 	ops                 prometheusSortFileOps
 	requestDir          string
 	pass, runs, records uint64
-	bytes               int64
+	bytes, written      int64
 	maxKey, maxPayload  uint64
 }
 
@@ -74,10 +76,11 @@ func (s *prometheusExternalSorter) write(w io.Writer, data []byte) error {
 		return err
 	}
 	if int64(len(data)) > int64(^uint64(0)>>1)-s.bytes || s.maxBytes > 0 && int64(len(data)) > s.maxBytes-s.bytes {
-		return errors.New("series sort spill size limit exceeded")
+		return errPrometheusSortSpillLimit
 	}
 	n, err := w.Write(data)
 	s.bytes += int64(n)
+	s.written += int64(n)
 	if err != nil {
 		return err
 	}
@@ -173,22 +176,28 @@ func (s *prometheusExternalSorter) read(r *prometheusSortReader, data []byte) er
 	}
 	n, err := io.ReadFull(r.reader, data)
 	r.bytesRead += int64(n)
+	// A run that ends where data is expected is corrupt; a bare io.EOF would read as a clean end of stream upstream.
+	if errors.Is(err, io.EOF) {
+		err = io.ErrUnexpectedEOF
+	}
 	if err != nil {
-		return err
+		return errors.Wrap(err, "read series sort run")
 	}
 	return s.ctx.Err()
 }
 
 func (s *prometheusExternalSorter) next(r *prometheusSortReader) error {
 	if r.remaining == 0 {
-		var trailing [1]byte
-		err := s.read(r, trailing[:])
-		if err == io.EOF {
+		if err := s.ctx.Err(); err != nil {
+			return err
+		}
+		_, err := r.reader.ReadByte()
+		if errors.Is(err, io.EOF) {
 			r.key, r.record = nil, prometheusSeries{}
 			return nil
 		}
 		if err != nil {
-			return err
+			return errors.Wrap(err, "read series sort run")
 		}
 		return errors.New("trailing data in series sort run")
 	}
@@ -389,7 +398,7 @@ func (s *prometheusExternalSorter) merge(emit func(prometheusSeries) error) erro
 func (s *prometheusExternalSorter) Close() error {
 	dir := s.requestDir
 	s.requestDir = ""
-	s.pass, s.runs, s.records, s.bytes, s.maxKey, s.maxPayload = 0, 0, 0, 0, 0, 0
+	s.pass, s.runs, s.records, s.bytes, s.written, s.maxKey, s.maxPayload = 0, 0, 0, 0, 0, 0, 0
 	if dir != "" {
 		return errors.Wrapf(s.ops.removeAll(dir), "remove series sort directory %s", dir)
 	}

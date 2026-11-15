@@ -53,6 +53,44 @@ func TestSharedStoreResponseRelease(t *testing.T) {
 		}
 	})
 
+	t.Run("lazy response set", func(t *testing.T) {
+		first := storepb.NewSeriesResponse(&storepb.Series{})
+		second := storepb.NewSeriesResponse(&storepb.Series{})
+		mu := &sync.Mutex{}
+		set := &lazyRespSet{
+			bufferedResponsesMtx: mu,
+			dataOrFinishEvent:    sync.NewCond(mu),
+			rb:                   newRingBuffer(2, mu),
+			noMoreData:           true,
+		}
+		mu.Lock()
+		for _, response := range []*storepb.SeriesResponse{first, second} {
+			if !set.rb.append(response) {
+				t.Fatal("append failed")
+			}
+		}
+		mu.Unlock()
+
+		if !set.Next() || set.At() != first || set.At() != first {
+			t.Fatal("first response was not stable across repeated At calls")
+		}
+		if set.rb.bufferedResponses[0] != nil {
+			t.Fatal("advancing lazy response set retained the current response in its ring slot")
+		}
+		if !set.Next() || set.At() != second {
+			t.Fatal("second response was not returned")
+		}
+		if set.rb.bufferedResponses[1] != nil {
+			t.Fatal("advancing lazy response set retained the second response in its ring slot")
+		}
+		if set.Next() {
+			t.Fatal("unexpected response after final response")
+		}
+		if set.At() != nil {
+			t.Fatal("terminal advancement retained the final response")
+		}
+	})
+
 	t.Run("ring buffer releases popped slots across wraparound", func(t *testing.T) {
 		var mu sync.Mutex
 		rb := newRingBuffer(2, &mu)

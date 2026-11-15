@@ -247,6 +247,28 @@ func TestPrometheusSeriesSorter(t *testing.T) {
 		})
 	}
 
+	t.Run("truncated run never reports a clean end of file", func(t *testing.T) {
+		dir := t.TempDir()
+		for size := int64(0); ; size++ {
+			sorter := newPrometheusExternalSorter(context.Background(), dir, 0)
+			testutil.Ok(t, sorter.writeRun([]prometheusSeries{sortTestRecord("a", 0), sortTestRecord("b", 1)}))
+			files := sortRunFiles(t, dir)
+			testutil.Equals(t, 1, len(files))
+			info, err := os.Stat(files[0])
+			testutil.Ok(t, err)
+			testutil.Ok(t, os.Truncate(files[0], size))
+			err = sorter.merge(func(prometheusSeries) error { return nil })
+			testutil.Assert(t, !errors.Is(err, io.EOF), "run truncated to %d bytes reported a clean end of file: %v", size, err)
+			testutil.Ok(t, sorter.Close())
+			assertSortDirectoryEmpty(t, dir)
+			if size == info.Size() {
+				testutil.Ok(t, err)
+				break
+			}
+			testutil.Assert(t, errors.Is(err, io.ErrUnexpectedEOF) && strings.Contains(err.Error(), "read series sort run"), "run truncated to %d bytes returned %v", size, err)
+		}
+	})
+
 	for _, phase := range []string{"before write", "during write", "during read", "callback", "callback error"} {
 		t.Run("cleans up cancellation or error "+phase, func(t *testing.T) {
 			dir := t.TempDir()
@@ -281,6 +303,46 @@ func TestPrometheusSeriesSorter(t *testing.T) {
 				})
 			}
 			testutil.Assert(t, errors.Is(err, wantErr), "lost %s error: %v", phase, err)
+			testutil.Ok(t, sorter.Close())
+			testutil.Equals(t, 0, tracker.open)
+			assertSortDirectoryEmpty(t, dir)
+		})
+	}
+
+	for _, operation := range []string{"create", "write", "read", "close", "remove", "cancel"} {
+		t.Run("intermediate merge pass propagates "+operation+" and cleans up", func(t *testing.T) {
+			dir := t.TempDir()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			sorter := newPrometheusExternalSorter(ctx, dir, 0)
+			tracker := trackSortFiles(sorter)
+			for i := 0; i < prometheusSortMergeFanIn+1; i++ {
+				testutil.Ok(t, sorter.writeRun([]prometheusSeries{sortTestRecord(fmt.Sprintf("%02d", i), uint64(i))}))
+			}
+			injected := errors.New("injected " + operation + " failure")
+			wantErr := injected
+			if operation == "cancel" {
+				wantErr = context.Canceled
+			}
+			originalOpen := sorter.ops.openFile
+			sorter.ops.openFile = func(name string, flags int, mode os.FileMode) (io.ReadWriteCloser, error) {
+				if operation == "create" && flags&os.O_CREATE != 0 {
+					return nil, injected
+				}
+				file, err := originalOpen(name, flags, mode)
+				if err != nil {
+					return nil, err
+				}
+				if operation == "cancel" && flags&os.O_CREATE != 0 {
+					cancel()
+				}
+				return &sortFaultFile{ReadWriteCloser: file, operation: operation, err: injected}, nil
+			}
+			if operation == "remove" {
+				sorter.ops.remove = func(string) error { return injected }
+			}
+			err := sorter.merge(func(prometheusSeries) error { t.Fatal("failed intermediate pass emitted data"); return nil })
+			testutil.Assert(t, errors.Is(err, wantErr), "lost %s error: %v", operation, err)
 			testutil.Ok(t, sorter.Close())
 			testutil.Equals(t, 0, tracker.open)
 			assertSortDirectoryEmpty(t, dir)

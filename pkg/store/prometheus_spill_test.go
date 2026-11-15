@@ -25,6 +25,7 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
 	"github.com/prometheus/client_golang/prometheus"
+	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 
@@ -210,6 +211,87 @@ func TestPrometheusStore_Series_MemorySpill(t *testing.T) {
 		testutil.Assert(t, err != nil, "one-byte disk budget accepted oversized run")
 		testutil.Equals(t, 0, len(srv.SeriesSet))
 		assertSpillDirectoryEmpty(t, dir)
+	})
+
+	t.Run("truncated run is not reported as end of stream", func(t *testing.T) {
+		dir := t.TempDir()
+		fixture := spillTestFixture(t, "streamed", 8, false)
+		body := &spillTestBody{data: fixture.data, atEOF: func() {
+			files := sortRunFiles(t, dir)
+			testutil.Assert(t, len(files) > 0, "no run was spilled before the merge")
+			testutil.Ok(t, os.Truncate(files[0], 0))
+		}}
+		store, err := newSpillTestStore(prometheus.NewRegistry(), roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{fixture.contentType}}, Body: body}, nil
+		}), WithPrometheusStoreSorting(1, dir, 0))
+		testutil.Ok(t, err)
+		srv := newStoreSeriesServer(context.Background())
+		err = store.Series(compactRequest(false), srv)
+		testutil.Assert(t, err != nil && !errors.Is(err, io.EOF) && strings.Contains(err.Error(), "read series sort run"), "unexpected truncation error: %v", err)
+		testutil.Equals(t, 0, len(srv.SeriesSet))
+		assertSpillDirectoryEmpty(t, dir)
+	})
+
+	t.Run("sorter failures in add and Flush are counted and clean up", func(t *testing.T) {
+		injected := errors.New("injected sort failure")
+		sendErr := errors.New("spill downstream stopped")
+		for _, tc := range []struct {
+			name            string
+			budget          units.Base2Bytes
+			fault           string
+			sendErr         error
+			addErr, wantErr error
+			sends           int
+			spilled         float64
+			reason          string
+		}{
+			{name: "spilled request", sends: 2, spilled: 1},
+			{name: "spill size limit in add", budget: 1, addErr: errPrometheusSortSpillLimit, wantErr: errPrometheusSortSpillLimit, reason: "spill_size"},
+			{name: "write failure in add", fault: "write", addErr: injected, wantErr: injected, spilled: 1, reason: "io"},
+			{name: "read failure in merge", fault: "read", wantErr: injected, spilled: 1, reason: "io"},
+			{name: "cancellation in merge", fault: "cancel", wantErr: context.Canceled, spilled: 1},
+			{name: "send failure", sendErr: sendErr, wantErr: sendErr, sends: 1, spilled: 1},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				dir := t.TempDir()
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				store, err := newSpillTestStore(prometheus.NewRegistry(), nil, WithPrometheusStoreSorting(1, dir, tc.budget))
+				testutil.Ok(t, err)
+				srv := &spillTestServer{storeSeriesServer: newStoreSeriesServer(ctx), sendErr: tc.sendErr}
+				buffer := store.newSeriesBuffer(srv, 0, false)
+				first, second := sortTestRecord("b", 0), sortTestRecord("a", 1)
+				err = buffer.add(first.labels, first.chunks)
+				if err == nil {
+					open := buffer.sorter.ops.openFile
+					buffer.sorter.ops.openFile = func(name string, flags int, mode os.FileMode) (io.ReadWriteCloser, error) {
+						file, err := open(name, flags, mode)
+						if err != nil {
+							return nil, err
+						}
+						if tc.fault == "cancel" {
+							return &sortCancelFile{ReadWriteCloser: file, cancel: cancel, onRead: true}, nil
+						}
+						return &sortFaultFile{ReadWriteCloser: file, operation: tc.fault, err: injected}, nil
+					}
+					err = buffer.add(second.labels, second.chunks)
+				}
+				testutil.Assert(t, errors.Is(err, tc.addErr), "add returned %v, want %v", err, tc.addErr)
+				err = buffer.Flush()
+				testutil.Assert(t, errors.Is(err, tc.wantErr), "Flush returned %v, want %v", err, tc.wantErr)
+				testutil.Equals(t, tc.sends, srv.sends)
+				testutil.Equals(t, tc.spilled, promtest.ToFloat64(store.seriesSortSpilledRequests))
+				testutil.Equals(t, tc.spilled > 0, promtest.ToFloat64(store.seriesSortSpilledBytes) > 0)
+				for _, reason := range []string{"spill_size", "io"} {
+					want := 0.0
+					if tc.reason == reason {
+						want = 1
+					}
+					testutil.Equals(t, want, promtest.ToFloat64(store.seriesSortFailedRequests.WithLabelValues(reason)))
+				}
+				assertSpillDirectoryEmpty(t, dir)
+			})
+		}
 	})
 
 	t.Run("send failure and cancellation clean up", func(t *testing.T) {
