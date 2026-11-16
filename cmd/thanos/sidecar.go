@@ -321,7 +321,8 @@ func runSidecar(
 
 		promStore, err := store.NewPrometheusStore(logger, reg, c, conf.prometheus.url, component.Sidecar, m.Labels, m.Timestamps, m.Version,
 			store.WithPrometheusStoreLimits(conf.storeRateLimits),
-			store.WithPrometheusStoreSorting(conf.seriesSortThreshold, conf.seriesSortDirectory, conf.seriesSortMaxBytes))
+			store.WithPrometheusStoreSorting(conf.seriesSortThreshold, conf.seriesSortDirectory, conf.seriesSortMaxBytes),
+			store.WithPrometheusStoreStreamingSort(conf.seriesSortStreaming))
 		if err != nil {
 			return errors.Wrap(err, "create Prometheus store")
 		}
@@ -636,6 +637,7 @@ type sidecarConfig struct {
 	seriesSortThreshold units.Base2Bytes
 	seriesSortDirectory string
 	seriesSortMaxBytes  units.Base2Bytes
+	seriesSortStreaming bool
 }
 
 const minSeriesSortThreshold = units.MiB
@@ -660,6 +662,7 @@ func (sc *sidecarConfig) registerFlag(cmd extkingpin.FlagClause) {
 	cmd.Flag("store.series-sort-spill-threshold", "Per-request retained series sorting buffer target as a size with units, e.g. 64MB. 0 disables disk sorting, other values must be at least 1MB. Frames, the largest record, output batches and merge buffers can exceed this target.").Default("0").BytesVar(&sc.seriesSortThreshold)
 	cmd.Flag("store.series-sort-spill-dir", "Directory for private per-request series sorting files. Required when disk sorting is enabled; use an existing writable directory.").Default("").StringVar(&sc.seriesSortDirectory)
 	cmd.Flag("store.series-sort-max-spill-size", "Maximum live temporary sorting file size per request, e.g. 4GB, including simultaneous merge inputs and outputs. 0 means unlimited.").Default("0").BytesVar(&sc.seriesSortMaxBytes)
+	cmd.Flag("store.series-sort-streaming", "EXPERIMENTAL: sort streamed remote read responses while forwarding them instead of buffering each response. A request fails when Prometheus does not return series sorted by their own labels or when a series has its own value for an external or replica label. Takes precedence over disk sorting for streamed responses.").Default("false").Hidden().BoolVar(&sc.seriesSortStreaming)
 	cmd.Flag("min-time", "Start of time range limit to serve. Thanos sidecar will serve only metrics, which happened later than this value. Option can be a constant time in RFC3339 format or time duration relative to current time, such as -1d or 2h45m. Valid duration units are ms, s, m, h, d, w, y.").
 		Default("0000-01-01T00:00:00Z").SetValue(&sc.limitMinTime)
 }

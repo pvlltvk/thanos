@@ -58,6 +58,14 @@ Disk sorting uses private request directories and a bounded merge fan-in. Files 
 
 Measure memory and latency with representative queries before enabling disk sorting. Sorting writes and reads temporary data, so completion and time to first response can increase with disk load, payload size and concurrent requests. This option remains disabled by default.
 
+## Experimental streaming series sort
+
+The hidden flag `--store.series-sort-streaming` makes Sidecar sort streamed remote read responses while forwarding them: a series is sent as soon as no later series can sort before it, so only a few series are held back instead of the whole response. It applies to streamed responses only, which then no longer use disk sorting; sampled fallback responses and metadata requests are buffered as before.
+
+This only works when Prometheus returns the series sorted by their own labels, and when no series has its own, different value for an external label or an own label named like a replica label removed for the request. A request that breaks one of these rules fails with `FailedPrecondition`, possibly after part of the result has been sent.
+
+`prometheus_store_series_sort_unstreamable_total` counts such requests with reason `unsorted`, `external_label` or `replica_label`. It is also maintained while the flag is off, when these requests still succeed and Sidecar logs an example at most once per minute, so check that it stays at zero before enabling streaming sort.
+
 ## Reloader Configuration
 
 Thanos can watch changes in Prometheus configuration and refresh Prometheus configuration if `--web.enable-lifecycle` enabled.

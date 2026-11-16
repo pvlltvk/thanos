@@ -46,8 +46,12 @@ type prometheusSeriesBuffer struct {
 	sorter             *prometheusExternalSorter
 	sortSpilled        bool
 	sortFailed         bool
+	sortUnstreamable   bool
 	retainedBytes      uint64
 	err                error
+	hasher             hash.Hash64
+	prevLocal, local   []labelpb.ZLabel
+	maxHeld            int
 }
 
 func (p *PrometheusStore) newSeriesBuffer(srv storepb.Store_SeriesServer, batchSize int, metadata bool) *prometheusSeriesBuffer {
@@ -121,43 +125,13 @@ func (b *prometheusSeriesBuffer) Flush() (err error) {
 	if b.err = b.Context().Err(); b.err != nil {
 		return b.err
 	}
-	var hasher hash.Hash64
-	defer func() {
-		if hasher != nil {
-			hashPool.Put(hasher)
-		}
-	}()
-	emit := func(record prometheusSeries) error {
-		if err := b.Context().Err(); err != nil {
-			return err
-		}
-		series := &storepb.Series{Labels: record.labels}
-		if len(record.chunks) > 0 {
-			series.Chunks = make([]storepb.AggrChunk, len(record.chunks))
-			if b.calculateChecksums && hasher == nil {
-				hasher = hashPool.Get().(hash.Hash64)
-			}
-		}
-		for j, chunk := range record.chunks {
-			series.Chunks[j] = storepb.AggrChunk{
-				MinTime: chunk.MinTimeMs,
-				MaxTime: chunk.MaxTimeMs,
-				Raw: &storepb.Chunk{
-					Type: storepb.Chunk_Encoding(chunk.Type - 1),
-					Data: chunk.Data,
-					Hash: hashChunk(hasher, chunk.Data, b.calculateChecksums),
-				},
-			}
-		}
-		return b.upstream.Send(storepb.NewSeriesResponse(series))
-	}
 	if b.sorter != nil {
 		if b.err = b.spill(); b.err != nil {
 			return b.err
 		}
 		var sendErr error
 		b.err = b.sorter.merge(func(record prometheusSeries) error {
-			sendErr = emit(record)
+			sendErr = b.emit(record)
 			return sendErr
 		})
 		if b.err != nil {
@@ -166,15 +140,8 @@ func (b *prometheusSeriesBuffer) Flush() (err error) {
 			}
 			return b.err
 		}
-	} else {
-		slices.SortFunc(b.series, comparePrometheusSeries)
-		for i := range b.series {
-			record := b.series[i]
-			b.series[i] = prometheusSeries{}
-			if b.err = emit(record); b.err != nil {
-				return b.err
-			}
-		}
+	} else if b.err = b.emitSorted(b.series); b.err != nil {
+		return b.err
 	}
 	b.series = nil
 	if upstream, ok := b.upstream.(flushableServer); ok {
@@ -183,7 +150,49 @@ func (b *prometheusSeriesBuffer) Flush() (err error) {
 	return b.err
 }
 
+func (b *prometheusSeriesBuffer) emitSorted(records []prometheusSeries) error {
+	slices.SortFunc(records, comparePrometheusSeries)
+	for i := range records {
+		record := records[i]
+		records[i] = prometheusSeries{}
+		if err := b.emit(record); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *prometheusSeriesBuffer) emit(record prometheusSeries) error {
+	if err := b.Context().Err(); err != nil {
+		return err
+	}
+	series := &storepb.Series{Labels: record.labels}
+	if len(record.chunks) > 0 {
+		series.Chunks = make([]storepb.AggrChunk, len(record.chunks))
+		if b.calculateChecksums && b.hasher == nil {
+			b.hasher = hashPool.Get().(hash.Hash64)
+		}
+	}
+	for j, chunk := range record.chunks {
+		series.Chunks[j] = storepb.AggrChunk{
+			MinTime: chunk.MinTimeMs,
+			MaxTime: chunk.MaxTimeMs,
+			Raw: &storepb.Chunk{
+				Type: storepb.Chunk_Encoding(chunk.Type - 1),
+				Data: chunk.Data,
+				Hash: hashChunk(b.hasher, chunk.Data, b.calculateChecksums),
+			},
+		}
+	}
+	return b.upstream.Send(storepb.NewSeriesResponse(series))
+}
+
 func (b *prometheusSeriesBuffer) Close() error {
+	if b.hasher != nil {
+		hashPool.Put(b.hasher)
+		b.hasher = nil
+	}
+	b.prevLocal, b.local = nil, nil
 	clear(b.series)
 	b.series = nil
 	b.retainedBytes = 0

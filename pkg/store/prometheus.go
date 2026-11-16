@@ -29,6 +29,7 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage/remote"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	"go.uber.org/atomic"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -66,10 +67,14 @@ type PrometheusStore struct {
 	seriesSortThreshold   units.Base2Bytes
 	seriesSortDirectory   string
 	seriesSortMaxBytes    units.Base2Bytes
+	seriesSortStreaming   bool
 
 	seriesSortSpilledRequests prometheus.Counter
 	seriesSortSpilledBytes    prometheus.Counter
 	seriesSortFailedRequests  *prometheus.CounterVec
+
+	seriesSortUnstreamable         *prometheus.CounterVec
+	seriesSortUnstreamableWarnedAt atomic.Int64
 }
 
 type PrometheusStoreOption func(s *PrometheusStore)
@@ -80,6 +85,15 @@ func WithPrometheusStoreSorting(spillThreshold units.Base2Bytes, spillDir string
 		s.seriesSortThreshold = spillThreshold
 		s.seriesSortDirectory = spillDir
 		s.seriesSortMaxBytes = maxSpillSize
+	}
+}
+
+// WithPrometheusStoreStreamingSort makes streamed remote read responses hold back only the
+// series a later one can still sort before, instead of sorting the whole response.
+// Responses that do not meet its ordering requirements fail. Experimental.
+func WithPrometheusStoreStreamingSort(enabled bool) PrometheusStoreOption {
+	return func(s *PrometheusStore) {
+		s.seriesSortStreaming = enabled
 	}
 }
 
@@ -159,6 +173,13 @@ func NewPrometheusStore(
 			Name: "prometheus_store_series_sort_failed_requests_total",
 			Help: "Number of Series requests that failed while sorting on disk.",
 		}, []string{"reason"})
+	}
+	p.seriesSortUnstreamable = promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+		Name: "prometheus_store_series_sort_unstreamable_total",
+		Help: "Number of Series requests whose streamed response cannot be sorted in streaming mode. Such requests fail when streaming sort is enabled.",
+	}, []string{"reason"})
+	for _, reason := range []string{streamingSortExternalLabel, streamingSortReplicaLabel, streamingSortUnsorted} {
+		p.seriesSortUnstreamable.WithLabelValues(reason)
 	}
 	return p, nil
 }
@@ -390,7 +411,12 @@ func (p *PrometheusStore) handleStreamedPrometheusResponse(
 
 			lbls := labelpb.ZLabelsFromPromLabels(completeLabelset)
 			labelpb.ReAllocZLabelsStrings(&lbls)
-			if err := s.add(lbls, series.Chunks); err != nil {
+			if p.seriesSortStreaming {
+				err = s.addSorted(series.Labels, lbls, series.Chunks, extLset, extLsetToRemove)
+			} else if err = s.add(lbls, series.Chunks); err == nil {
+				s.checkStreamingSort(series.Labels, lbls, extLset, extLsetToRemove)
+			}
+			if err != nil {
 				return err
 			}
 		}
@@ -401,6 +427,10 @@ func (p *PrometheusStore) handleStreamedPrometheusResponse(
 	querySpan.SetTag("processed.samples", seriesStats.Samples)
 	querySpan.SetTag("processed.bytes", bodySizer.BytesCount())
 	level.Debug(p.logger).Log("msg", "handled ReadRequest_STREAMED_XOR_CHUNKS request.", "frames", framesNum)
+	if p.seriesSortStreaming {
+		querySpan.SetTag("processed.held_series", s.maxHeld)
+		level.Debug(p.logger).Log("msg", "streamed series were sorted without buffering the response.", "max_held_series", s.maxHeld)
+	}
 
 	return s.Flush()
 }
